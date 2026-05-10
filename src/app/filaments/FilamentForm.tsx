@@ -1,8 +1,10 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import CollapsibleSection from "@/components/CollapsibleSection";
+import FormToc, { FormTocMobileButton, type TocEntry } from "@/components/FormToc";
 
 interface BedTypeTempEntry {
   /** Client-only stable row id for React keys. Stripped before API submission. */
@@ -748,8 +750,36 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
       ? t("form.updateFilament")
       : t("form.createFilament");
 
+  // Sidebar TOC entries — must mirror what's actually rendered, otherwise
+  // clicking an entry scrolls to a missing element and leaves the highlight
+  // stuck on an unreachable item (codex PR #214 P2). Two gating signals:
+  //   - `showAdvanced` hides shrinkage / fan / retraction / multi-material /
+  //     material-properties / material-tags
+  //   - `form.compatibleNozzles.length === 0` hides calibrations
+  // Identity fields (name / parent / vendor / type / color / cost) sit above
+  // the first TOC entry as always-visible primary content.
+  const hasCompatibleNozzles = form.compatibleNozzles.length > 0;
+  const tocEntries: TocEntry[] = useMemo(() => {
+    const all: { id: string; label: string; show: boolean }[] = [
+      { id: "spool-weight", label: t("form.section.spoolWeight"), show: true },
+      { id: "temperatures", label: t("form.section.temperatures"), show: true },
+      { id: "shrinkage", label: t("form.section.shrinkage"), show: showAdvanced },
+      { id: "fan", label: t("form.section.fan"), show: showAdvanced },
+      { id: "retraction", label: t("form.section.retraction"), show: showAdvanced },
+      { id: "multi-material", label: t("form.section.multiMaterial"), show: showAdvanced },
+      { id: "material-properties", label: t("form.section.materialProperties"), show: showAdvanced },
+      { id: "material-tags", label: t("form.section.materialTags"), show: showAdvanced },
+      { id: "compatible-nozzles", label: t("form.section.compatibleNozzles"), show: true },
+      { id: "calibrations", label: t("form.section.calibrations"), show: hasCompatibleNozzles },
+      { id: "presets", label: t("form.section.presets"), show: true },
+      { id: "gcode", label: t("form.section.gcode"), show: true },
+    ];
+    return all.filter((e) => e.show).map(({ id, label }) => ({ id, label }));
+  }, [t, showAdvanced, hasCompatibleNozzles]);
+
   return (
-    <form onSubmit={handleSubmit} className="space-y-4">
+    <div className="lg:flex lg:gap-6 lg:items-start">
+    <form onSubmit={handleSubmit} className="space-y-4 flex-1 min-w-0">
       {fetchErrors.length > 0 && (
         <div className="px-3 py-2 bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800 rounded text-sm text-yellow-700 dark:text-yellow-300">
           {t("form.fetchError", { items: fetchErrors.join(", ") })}
@@ -1138,8 +1168,11 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         </div>
       </div>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.spoolWeight")}</legend>
+      <CollapsibleSection
+        id="spool-weight"
+        title={t("form.section.spoolWeight")}
+        defaultOpen
+      >
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
             <label className={labelClass}>{t("form.netFilament")}</label>
@@ -1198,7 +1231,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             <p className="text-xs text-gray-400 mt-1">{t("form.lowStockThresholdHint")}</p>
           </div>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
       {/* EM, PA, and Max Vol. Speed are nozzle-specific — they belong in the
           Calibrations section below, not here at the top level. */}
@@ -1227,8 +1260,11 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         </div>
       </div>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.temperatures")}</legend>
+      <CollapsibleSection
+        id="temperatures"
+        title={t("form.section.temperatures")}
+        defaultOpen
+      >
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label className={labelClass}>{t("form.nozzleTemp")}</label>
@@ -1391,7 +1427,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         <button type="button" className="mt-2 text-xs text-blue-600 hover:underline" onClick={() => {
           setForm({ ...form, bedTypeTemps: [...form.bedTypeTemps, { _uid: makeUid(), bedType: "", temperature: "", firstLayerTemperature: "" }] });
         }}>{t("form.addBedType")}</button>
-      </fieldset>
+      </CollapsibleSection>
 
       <div>
         <button
@@ -1406,8 +1442,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
       </div>
 
       {showAdvanced && (<>
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.shrinkage")}</legend>
+      <CollapsibleSection id="shrinkage" title={t("form.section.shrinkage")}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label className={labelClass}>{t("form.shrinkageXY")}</label>
@@ -1430,10 +1465,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             />
           </div>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.fan")}</legend>
+      <CollapsibleSection id="fan" title={t("form.section.fan")}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label className={labelClass}>{t("form.fanMinSpeed")}</label>
@@ -1507,10 +1541,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             onChange={(e) => setForm({ ...form, activateAirFiltration: e.target.checked })} className="w-4 h-4" />
           <label htmlFor="airFiltration" className="text-sm font-medium">{t("form.activateAirFiltration")}</label>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.retraction")}</legend>
+      <CollapsibleSection id="retraction" title={t("form.section.retraction")}>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
             <label className={labelClass}>{t("form.retractLength")}</label>
@@ -1555,10 +1588,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             onChange={(e) => setForm({ ...form, wipe: e.target.checked })} className="w-4 h-4" />
           <label htmlFor="wipe" className="text-sm font-medium">{t("form.enableWipe")}</label>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.multiMaterial")}</legend>
+      <CollapsibleSection id="multi-material" title={t("form.section.multiMaterial")}>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
           <div>
             <label className={labelClass}>{t("form.loadingSpeed")}</label>
@@ -1597,10 +1629,12 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             placeholder={t("form.placeholder.rammingParameters")}
           />
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.materialProperties")}</legend>
+      <CollapsibleSection
+        id="material-properties"
+        title={t("form.section.materialProperties")}
+      >
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
         <div>
           <label className={labelClass}>{t("form.glassTempTransition")}</label>
@@ -1627,7 +1661,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           />
         </div>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
       <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
         <div>
@@ -1696,8 +1730,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         </div>
       </div>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.materialTags")}</legend>
+      <CollapsibleSection id="material-tags" title={t("form.section.materialTags")}>
         <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
           {([
             [4, t("form.tag.abrasive")],
@@ -1743,11 +1776,14 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             </label>
           ))}
         </div>
-      </fieldset>
+      </CollapsibleSection>
       </>)}
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.compatibleNozzles")}</legend>
+      <CollapsibleSection
+        id="compatible-nozzles"
+        title={t("form.section.compatibleNozzles")}
+        defaultOpen
+      >
         {nozzlesLoading ? (
           <p className="text-sm text-gray-400">{t("form.loadingNozzles")}</p>
         ) : nozzles.length > 0 && (
@@ -1807,11 +1843,14 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             ))}
           </div>
         )}
-      </fieldset>
+      </CollapsibleSection>
 
       {form.compatibleNozzles.length > 0 && (
-        <fieldset className="border border-gray-300 rounded p-4">
-          <legend className="text-sm font-medium px-2">{t("form.section.calibrations")}</legend>
+        <CollapsibleSection
+          id="calibrations"
+          title={t("form.section.calibrations")}
+          defaultOpen
+        >
           <p className="text-xs text-gray-500 mb-3">
             {t("form.calibrationsHint")}
             {printers.length > 0 && ` ${t("form.calibrationsPrinterHint")}`}
@@ -2101,14 +2140,14 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               );
             })}
           </div>
-        </fieldset>
+        </CollapsibleSection>
       )}
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">
-          {t("form.section.presets")}
-          <span className="text-gray-400 font-normal ml-1">({t("form.presetsHint")})</span>
-        </legend>
+      <CollapsibleSection
+        id="presets"
+        title={t("form.section.presets")}
+        subtitle={t("form.presetsHint")}
+      >
         <p className="text-xs text-gray-500 mb-3">
           {t("form.presetsDescription")}
         </p>
@@ -2201,7 +2240,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         >
           {t("form.addPreset")}
         </button>
-      </fieldset>
+      </CollapsibleSection>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
@@ -2253,8 +2292,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         )}
       </div>
 
-      <fieldset className="border border-gray-300 rounded p-4">
-        <legend className="text-sm font-medium px-2">{t("form.section.gcode")}</legend>
+      <CollapsibleSection id="gcode" title={t("form.section.gcode")}>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label className={labelClass}>{t("form.startGcode")}</label>
@@ -2273,7 +2311,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             />
           </div>
         </div>
-      </fieldset>
+      </CollapsibleSection>
 
       <div>
         <label className={labelClass}>{t("form.notes")}</label>
@@ -2294,5 +2332,12 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         {submitLabel}
       </button>
     </form>
+    {/* Desktop sidebar TOC: 200px wide, sticky, sits to the right of the form.
+     *  Mobile: replaced by the floating jump button below. */}
+    <aside className="lg:w-48 lg:flex-shrink-0 hidden lg:block">
+      <FormToc entries={tocEntries} />
+    </aside>
+    <FormTocMobileButton entries={tocEntries} />
+    </div>
   );
 }
