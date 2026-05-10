@@ -172,6 +172,19 @@ export interface IFilament extends Document {
   parentId: mongoose.Types.ObjectId | null;
   settings: Record<string, string | null>;
   _deletedAt: Date | null;
+  /**
+   * Trash-tombstone flag for "delete forever". When true, the document is a
+   * permanent purge marker — the trash UI hides it, the regular list hides
+   * it (because `_deletedAt` is also set), and the hybrid sync engine
+   * propagates the flag to the peer so the row stays gone on both sides.
+   *
+   * We can't physically `deleteOne` the row because the sync engine pairs
+   * docs by `syncId` and treats "remote has it, local doesn't" as a fresh
+   * insert from remote — that resurrected the very rows the user just
+   * "permanently" deleted. Keeping a tombstone with `_purged: true` avoids
+   * the resurrection without coordinating online deletion across peers.
+   */
+  _purged: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -305,6 +318,7 @@ const FilamentSchema = new Schema<IFilament>(
     parentId: { type: Schema.Types.ObjectId, ref: "Filament", default: null, index: true },
     settings: { type: Schema.Types.Mixed, default: {} },
     _deletedAt: { type: Date, default: null },
+    _purged: { type: Boolean, default: false, index: true },
   },
   { timestamps: true }
 );

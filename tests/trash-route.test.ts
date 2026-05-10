@@ -108,7 +108,7 @@ describe("Filament trash workflow", () => {
     expect(stillTrashed._deletedAt).not.toBeNull();
   });
 
-  it("permanent delete only works on trashed filaments", async () => {
+  it("permanent delete only works on trashed filaments and leaves a tombstone", async () => {
     const live = await Filament.create({
       name: "Still active",
       vendor: "T",
@@ -124,8 +124,50 @@ describe("Filament trash workflow", () => {
     const ok = await permanentDelete(String(live._id));
     expect(ok.status).toBe(200);
 
-    const gone = await Filament.findById(live._id);
-    expect(gone).toBeNull();
+    // Important: the row is NOT physically deleted. The hybrid sync engine
+    // pairs docs across peers by syncId and treats "missing on one side"
+    // as a fresh insert from the other — so a hard delete would get
+    // resurrected from the trashed peer on the next sync. Instead we keep
+    // a `_purged: true` tombstone that sync propagates to the peer.
+    const tombstone = await Filament.findById(live._id);
+    expect(tombstone).not.toBeNull();
+    expect(tombstone._purged).toBe(true);
+    expect(tombstone._deletedAt).not.toBeNull();
+  });
+
+  it("a `_purged` tombstone does not appear in the trash listing", async () => {
+    const f = await Filament.create({ name: "Hidden tombstone", vendor: "T", type: "PLA" });
+    await softDelete(String(f._id));
+    await permanentDelete(String(f._id));
+
+    const res = await listTrash();
+    const items = await res.json();
+    expect(items.find((i: { _id: string }) => i._id === String(f._id))).toBeUndefined();
+  });
+
+  it("restore refuses (404) on a `_purged` tombstone", async () => {
+    const f = await Filament.create({ name: "Cannot resurrect", vendor: "T", type: "PLA" });
+    await softDelete(String(f._id));
+    await permanentDelete(String(f._id));
+
+    const res = await restoreFilament(
+      new NextRequest(`http://localhost/api/filaments/${f._id}/restore`, {
+        method: "POST",
+      }),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it("permanent-delete on an already-purged filament is rejected (idempotent 400)", async () => {
+    const f = await Filament.create({ name: "Already purged", vendor: "T", type: "PLA" });
+    await softDelete(String(f._id));
+    const first = await permanentDelete(String(f._id));
+    expect(first.status).toBe(200);
+    // Second call should return the same "not in trash" error since the
+    // tombstone is no longer considered "in the trash".
+    const second = await permanentDelete(String(f._id));
+    expect(second.status).toBe(400);
   });
 
   it("permanent delete of a parent refuses if trashed variants point at it", async () => {
@@ -153,7 +195,10 @@ describe("Filament trash workflow", () => {
     const body = await res.json();
     expect(body.error).toMatch(/variants in the trash/i);
 
-    // Permanently delete the variant first → parent purge then succeeds
+    // Permanently delete the variant first → parent purge then succeeds.
+    // After variant purge the variant is a `_purged` tombstone, which the
+    // parent's variant-count check skips (we don't count tombstones as
+    // "still in the trash").
     const variantPurge = await permanentDelete(String(variant._id));
     expect(variantPurge.status).toBe(200);
     const parentPurge = await permanentDelete(String(parent._id));

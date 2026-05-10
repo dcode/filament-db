@@ -15,7 +15,13 @@ import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
 export async function GET() {
   try {
     await dbConnect();
-    const trashed = await Filament.find({ _deletedAt: { $ne: null } })
+    // `_purged: true` is the "delete forever" tombstone — the row is kept
+    // on disk so the hybrid sync engine can propagate the purge to peers,
+    // but it should never appear in the trash UI again.
+    const trashed = await Filament.find({
+      _deletedAt: { $ne: null },
+      _purged: { $ne: true },
+    })
       .select("name vendor type color cost _deletedAt parentId")
       .sort({ _deletedAt: -1 })
       .lean();

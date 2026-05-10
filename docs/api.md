@@ -104,15 +104,18 @@ Soft-delete a filament by ID (sets `_deletedAt` timestamp). The filament is hidd
 
 #### Permanent delete: `DELETE /api/filaments/:id?permanent=true`
 
-Append `?permanent=true` to hard-delete a filament from MongoDB. **Only allowed when the filament is already soft-deleted** (i.e. it lives in the trash). Returns `{ message: "Permanently deleted" }`.
+Append `?permanent=true` to mark a filament as permanently purged. **Only allowed when the filament is already soft-deleted** (i.e. it lives in the trash). Returns `{ message: "Permanently deleted" }`.
+
+This sets `_purged: true` on the document rather than physically removing the row. The hybrid sync engine (`electron/sync-service.ts`) pairs documents across peers by `syncId` and treats "missing on one side, present on the other" as a fresh insert from the other side — a `deleteOne` would therefore get resurrected from the trashed peer on the next sync. The `_purged` tombstone propagates across peers, hides the row from every UI surface (including the trash listing and restore route), and stays in place so the row never reappears. Tombstones are small and not garbage-collected today.
 
 Refusal cases:
 - `400` — filament is not in the trash. Soft-delete it first.
-- `400` — the filament is itself a parent and trashed variants still reference it. Permanently delete those variants first to avoid dangling refs.
+- `400` — the filament is itself a parent and non-purged trashed variants still reference it. Permanently delete those variants first to avoid dangling refs.
+- `400` — filament is already purged (idempotent).
 
 ### GET /api/filaments/trash
 
-Returns soft-deleted filaments sorted newest first, with a lightweight projection: `_id`, `name`, `vendor`, `type`, `color`, `cost`, `parentId`, `_deletedAt`. Powers the `/trash` UI page.
+Returns soft-deleted filaments sorted newest first, with a lightweight projection: `_id`, `name`, `vendor`, `type`, `color`, `cost`, `parentId`, `_deletedAt`. Powers the `/trash` UI page. **Excludes** `_purged: true` tombstones — those are kept on disk only for sync propagation and never reappear in any user surface.
 
 ```json
 [

@@ -352,7 +352,11 @@ export async function DELETE(
       // Permanent delete is only allowed once a filament is already in the
       // trash, so an accidental DELETE?permanent=true on an active filament
       // doesn't bypass the soft-delete safety net.
-      const trashed = await Filament.findOne({ _id: id, _deletedAt: { $ne: null } })
+      const trashed = await Filament.findOne({
+        _id: id,
+        _deletedAt: { $ne: null },
+        _purged: { $ne: true },
+      })
         .select("_id")
         .lean();
       if (!trashed) {
@@ -364,15 +368,30 @@ export async function DELETE(
       // Variant guard still applies — although a parent in trash can't
       // have active variants (the original soft-delete refused), it could
       // theoretically have other trashed variants pointing at it.
-      // Permanently deleting the parent would orphan them, so block.
-      const variantCount = await Filament.countDocuments({ parentId: id });
+      // Permanently deleting the parent would orphan them, so block. Only
+      // count variants that are themselves still in the trash and not yet
+      // purged — already-purged variant tombstones are dead weight.
+      const variantCount = await Filament.countDocuments({
+        parentId: id,
+        _purged: { $ne: true },
+      });
       if (variantCount > 0) {
         return errorResponse(
           "Cannot permanently delete a filament that still has variants in the trash. Permanently delete those first.",
           400,
         );
       }
-      await Filament.deleteOne({ _id: id });
+      // Don't physically `deleteOne` here. The hybrid sync engine pairs
+      // docs across peers by syncId and treats "missing on one side" as a
+      // fresh insert from the other side — so a hard delete on one peer
+      // would get resurrected from the trash on the next sync cycle (codex
+      // PR #213 #discussion). Instead, set the `_purged` tombstone flag;
+      // the sync engine propagates it to the peer, both sides hide the row
+      // from every UI surface, and the row stays gone for good.
+      await Filament.updateOne(
+        { _id: id },
+        { $set: { _purged: true, _deletedAt: new Date() } },
+      );
       return NextResponse.json({ message: "Permanently deleted" });
     }
 

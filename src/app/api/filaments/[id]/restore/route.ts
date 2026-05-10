@@ -22,7 +22,13 @@ export async function POST(
     await dbConnect();
     const { id } = await params;
 
-    const trashed = await Filament.findOne({ _id: id, _deletedAt: { $ne: null } });
+    // Match the same filter the trash listing uses — a `_purged` row is a
+    // "delete forever" tombstone and shouldn't be revivable from the API.
+    const trashed = await Filament.findOne({
+      _id: id,
+      _deletedAt: { $ne: null },
+      _purged: { $ne: true },
+    });
     if (!trashed) {
       return errorResponse("Filament not in trash", 404);
     }
