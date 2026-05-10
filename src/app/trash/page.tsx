@@ -1,0 +1,218 @@
+"use client";
+
+import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
+import { useToast } from "@/components/Toast";
+import { useTranslation } from "@/i18n/TranslationProvider";
+
+interface TrashedFilament {
+  _id: string;
+  name: string;
+  vendor: string;
+  type: string;
+  color: string;
+  cost: number | null;
+  parentId: string | null;
+  _deletedAt: string;
+}
+
+export default function TrashPage() {
+  const { t } = useTranslation();
+  const { toast } = useToast();
+  const [items, setItems] = useState<TrashedFilament[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState<Set<string>>(new Set());
+
+  const fetchTrash = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      try {
+        const res = await fetch("/api/filaments/trash", { signal });
+        if (!res.ok) {
+          toast(t("trash.loadError"), "error");
+          setLoading(false);
+          return;
+        }
+        const data = await res.json();
+        setItems(data);
+        setLoading(false);
+      } catch (err) {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        toast(t("trash.loadError"), "error");
+        setLoading(false);
+      }
+    },
+    [toast, t],
+  );
+
+  useEffect(() => {
+    const ac = new AbortController();
+    fetchTrash(ac.signal); // eslint-disable-line react-hooks/set-state-in-effect -- mount fetch
+    return () => ac.abort();
+  }, [fetchTrash]);
+
+  const markBusy = (id: string, on: boolean) => {
+    setBusy((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const handleRestore = async (item: TrashedFilament) => {
+    markBusy(item._id, true);
+    try {
+      const res = await fetch(`/api/filaments/${item._id}/restore`, {
+        method: "POST",
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast(body?.error || t("trash.restoreError"), "error");
+        return;
+      }
+      toast(t("trash.restored", { name: item.name }));
+      fetchTrash();
+    } finally {
+      markBusy(item._id, false);
+    }
+  };
+
+  const handlePermanentDelete = async (item: TrashedFilament) => {
+    if (!confirm(t("trash.permanentConfirm", { name: item.name }))) return;
+    markBusy(item._id, true);
+    try {
+      const res = await fetch(`/api/filaments/${item._id}?permanent=true`, {
+        method: "DELETE",
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        toast(body?.error || t("trash.permanentError"), "error");
+        return;
+      }
+      toast(t("trash.permanentDeleted", { name: item.name }));
+      fetchTrash();
+    } finally {
+      markBusy(item._id, false);
+    }
+  };
+
+  const handleEmptyTrash = async () => {
+    if (items.length === 0) return;
+    if (!confirm(t("trash.emptyConfirm", { count: items.length }))) return;
+    let ok = 0;
+    const errors: string[] = [];
+    // Permanent delete each one sequentially. Variants must be purged before
+    // their parents, so do trashed-variants-first.
+    const ordered = [...items].sort((a, b) => {
+      // items with a parentId go first (variants before parents)
+      if (a.parentId && !b.parentId) return -1;
+      if (!a.parentId && b.parentId) return 1;
+      return 0;
+    });
+    for (const item of ordered) {
+      const res = await fetch(`/api/filaments/${item._id}?permanent=true`, {
+        method: "DELETE",
+      });
+      if (res.ok) {
+        ok++;
+      } else {
+        const body = await res.json().catch(() => null);
+        errors.push(body?.error || item.name);
+      }
+    }
+    toast(t("trash.emptyDone", { count: ok }));
+    if (errors.length > 0) {
+      toast(errors.slice(0, 3).join("; "), "error");
+    }
+    fetchTrash();
+  };
+
+  return (
+    <main className="max-w-4xl mx-auto px-4 py-8">
+      <div className="mb-4">
+        <Link href="/" className="text-blue-600 hover:underline text-sm">
+          &larr; {t("trash.backToFilaments")}
+        </Link>
+      </div>
+
+      <div className="flex items-start justify-between mb-6">
+        <div>
+          <h1 className="text-3xl font-bold">{t("trash.title")}</h1>
+          <p className="text-sm text-gray-500 mt-1">{t("trash.subtitle")}</p>
+        </div>
+        {items.length > 0 && (
+          <button
+            type="button"
+            onClick={handleEmptyTrash}
+            className="px-3 py-1.5 text-sm bg-red-700 text-white rounded hover:bg-red-600"
+          >
+            {t("trash.emptyAll", { count: items.length })}
+          </button>
+        )}
+      </div>
+
+      {loading ? (
+        <p className="text-sm text-gray-500">{t("common.loading")}</p>
+      ) : items.length === 0 ? (
+        <div className="text-center py-12">
+          <p className="text-sm text-gray-500 mb-3">{t("trash.empty")}</p>
+          <Link
+            href="/"
+            className="text-blue-600 hover:underline text-sm"
+          >
+            {t("trash.backToFilaments")}
+          </Link>
+        </div>
+      ) : (
+        <ul className="border border-gray-200 dark:border-gray-700 rounded divide-y divide-gray-100 dark:divide-gray-800">
+          {items.map((item) => {
+            const isBusy = busy.has(item._id);
+            const deleted = new Date(item._deletedAt);
+            return (
+              <li
+                key={item._id}
+                className="px-3 py-2 flex items-center gap-3 text-sm"
+              >
+                <span
+                  className="inline-block w-5 h-5 rounded-full border border-gray-300 flex-shrink-0"
+                  style={{ backgroundColor: item.color }}
+                  aria-hidden="true"
+                />
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium truncate">{item.name}</p>
+                  <p className="text-xs text-gray-500">
+                    {item.vendor} · {item.type}
+                    {item.parentId && ` · ${t("trash.variantBadge")}`}
+                    <span className="ml-2">
+                      {t("trash.deletedAt", {
+                        date: deleted.toLocaleDateString(),
+                        time: deleted.toLocaleTimeString(),
+                      })}
+                    </span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => handleRestore(item)}
+                  disabled={isBusy}
+                  className="px-3 py-1 text-xs rounded border border-blue-500 text-blue-600 dark:text-blue-300 hover:bg-blue-50 dark:hover:bg-blue-900/30 disabled:opacity-50"
+                >
+                  {t("trash.restore")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handlePermanentDelete(item)}
+                  disabled={isBusy}
+                  className="px-3 py-1 text-xs rounded bg-red-700 text-white hover:bg-red-600 disabled:opacity-50"
+                >
+                  {t("trash.permanentDelete")}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </main>
+  );
+}

@@ -862,6 +862,12 @@ export default function Home() {
           >
             {t("common.clear")}
           </button>
+          <span className="ml-auto text-xs text-red-200">
+            {t("filaments.bulk.deleteHint")}{" "}
+            <Link href="/trash" className="underline hover:text-white">
+              {t("filaments.bulk.openTrash")}
+            </Link>
+          </span>
         </div>
       )}
       </div>{/* end sticky header */}

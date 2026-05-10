@@ -336,14 +336,47 @@ export async function POST(
 }
 
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     await dbConnect();
     const { id } = await params;
 
-    // Prevent deleting a parent that has variants
+    // ?permanent=true deletes the document for real. Used by the trash UI
+    // for "Permanently delete" — the regular flow soft-deletes so users can
+    // recover from a misclick.
+    const permanent = request.nextUrl.searchParams.get("permanent") === "true";
+
+    if (permanent) {
+      // Permanent delete is only allowed once a filament is already in the
+      // trash, so an accidental DELETE?permanent=true on an active filament
+      // doesn't bypass the soft-delete safety net.
+      const trashed = await Filament.findOne({ _id: id, _deletedAt: { $ne: null } })
+        .select("_id")
+        .lean();
+      if (!trashed) {
+        return errorResponse(
+          "Permanent delete requires the filament to be in the trash. Soft-delete it first.",
+          400,
+        );
+      }
+      // Variant guard still applies — although a parent in trash can't
+      // have active variants (the original soft-delete refused), it could
+      // theoretically have other trashed variants pointing at it.
+      // Permanently deleting the parent would orphan them, so block.
+      const variantCount = await Filament.countDocuments({ parentId: id });
+      if (variantCount > 0) {
+        return errorResponse(
+          "Cannot permanently delete a filament that still has variants in the trash. Permanently delete those first.",
+          400,
+        );
+      }
+      await Filament.deleteOne({ _id: id });
+      return NextResponse.json({ message: "Permanently deleted" });
+    }
+
+    // Soft delete — the default path.
     if (await hasVariants(Filament, id)) {
       return errorResponse(
         "Cannot delete a filament that has color variants. Delete the variants first.",
