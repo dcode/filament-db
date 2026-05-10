@@ -128,7 +128,7 @@ filament-db/
 │   │   ├── api/print-history/  # Print job ledger (v1.11)
 │   │   ├── api/analytics/      # Usage analytics aggregation (v1.11)
 │   │   ├── api/share/          # Public shared catalogs (v1.11)
-│   │   ├── api/spools/         # Bulk spool CSV import (v1.11)
+│   │   ├── api/spools/         # Bulk spool CSV import + export (v1.11)
 │   │   ├── api/prusament/      # Prusament spool scraping and import
 │   │   ├── api/openprinttag/   # OpenPrintTag database browser and import
 │   │   ├── api/tds/            # AI-powered TDS extraction (Gemini/Claude/OpenAI)
@@ -140,6 +140,8 @@ filament-db/
 │   │   ├── analytics/          # Usage analytics charts (v1.11)
 │   │   ├── share/              # Published catalogs list + public view (v1.11)
 │   │   ├── compare/            # Filament comparison view (v1.11)
+│   │   ├── trash/              # Soft-deleted filament recovery (v1.14+)
+│   │   ├── import-export/      # All bulk import/export actions in one page (v1.14+)
 │   │   ├── filaments/          # Filament pages (list, detail, edit, new)
 │   │   ├── openprinttag/       # OpenPrintTag community database browser
 │   │   ├── nozzles/            # Nozzle pages (list, edit, new)

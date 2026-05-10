@@ -12,7 +12,9 @@
 | `POST` | `/api/filaments` | Create a new filament |
 | `GET` | `/api/filaments/:id` | Get a single filament by ID (populates nozzles, calibrations, variants) |
 | `PUT` | `/api/filaments/:id` | Update a filament by ID |
-| `DELETE` | `/api/filaments/:id` | Soft-delete a filament (blocked if it has variants) |
+| `DELETE` | `/api/filaments/:id` | Soft-delete a filament (blocked if it has variants). Append `?permanent=true` to hard-delete from the trash. |
+| `GET` | `/api/filaments/trash` | List soft-deleted filaments (powers the `/trash` UI) |
+| `POST` | `/api/filaments/:id/restore` | Restore a soft-deleted filament from the trash (returns 409 on name collision) |
 | `GET` | `/api/filaments/export` | Download all filaments as a PrusaSlicer INI file |
 | `GET` | `/api/filaments/export-csv` | Download all filaments as a CSV file |
 | `GET` | `/api/filaments/export-xlsx` | Download all filaments as an XLSX spreadsheet |
@@ -96,9 +98,53 @@ Update a filament. Send a JSON body with the fields to update. Supports partial 
 
 ### DELETE /api/filaments/:id
 
-Soft-delete a filament by ID (sets `_deletedAt` timestamp). The filament is hidden from all queries but retained for sync propagation in hybrid mode. Returns `{ message: "Deleted" }`.
+Soft-delete a filament by ID (sets `_deletedAt` timestamp). The filament is hidden from all queries but retained for sync propagation in hybrid mode and recovery via the trash workflow. Returns `{ message: "Deleted" }`.
 
 **Cannot delete a filament that has color variants.** Returns 400: `"Cannot delete a filament that has color variants. Delete the variants first."`.
+
+#### Permanent delete: `DELETE /api/filaments/:id?permanent=true`
+
+Append `?permanent=true` to mark a filament as permanently purged. **Only allowed when the filament is already soft-deleted** (i.e. it lives in the trash). Returns `{ message: "Permanently deleted" }`.
+
+This sets `_purged: true` on the document rather than physically removing the row. The hybrid sync engine (`electron/sync-service.ts`) pairs documents across peers by `syncId` and treats "missing on one side, present on the other" as a fresh insert from the other side — a `deleteOne` would therefore get resurrected from the trashed peer on the next sync. The `_purged` tombstone propagates across peers, hides the row from every UI surface (including the trash listing and restore route), and stays in place so the row never reappears. Tombstones are small and not garbage-collected today.
+
+Refusal cases:
+- `400` — filament is not in the trash. Soft-delete it first.
+- `400` — the filament is itself a parent and non-purged trashed variants still reference it. Permanently delete those variants first to avoid dangling refs.
+- `400` — filament is already purged (idempotent).
+
+### GET /api/filaments/trash
+
+Returns soft-deleted filaments sorted newest first, with a lightweight projection: `_id`, `name`, `vendor`, `type`, `color`, `cost`, `parentId`, `_deletedAt`. Powers the `/trash` UI page. **Excludes** `_purged: true` tombstones — those are kept on disk only for sync propagation and never reappear in any user surface.
+
+```json
+[
+  {
+    "_id": "67abc...",
+    "name": "PLA Galaxy Black",
+    "vendor": "Prusa",
+    "type": "PLA",
+    "color": "#1a1a1a",
+    "cost": 31.99,
+    "parentId": null,
+    "_deletedAt": "2026-05-09T18:24:11.123Z"
+  }
+]
+```
+
+### POST /api/filaments/:id/restore
+
+Un-soft-delete a filament — clears `_deletedAt` so the filament reappears in the regular list. Returns `{ message: "Restored", _id: "67abc..." }`.
+
+Refusal:
+- `404` — the filament is not in the trash (already active or not found).
+- `409` — another active filament has reused the trashed one's name. The partial unique index on `name` only covers non-deleted documents, so restoring would otherwise crash with a Mongo duplicate-key error. Rename one of them first.
+
+```json
+{
+  "error": "Cannot restore: another active filament named \"PLA Galaxy Black\" already exists. Rename one of them first."
+}
+```
 
 ### GET /api/filaments/export
 
@@ -1037,6 +1083,12 @@ Each row is processed independently; per-row errors are reported in the response
 ```
 
 A single request is capped at 10,000 rows by `parseCsv`; beyond that the request is rejected with 400.
+
+### GET /api/spools/export-csv
+
+Mirror of `GET /api/filaments/export-csv` for spool inventory. Streams every active spool from every active filament as a single CSV with one row per spool. Columns include `filament`, `vendor`, `label`, `totalWeight`, `lotNumber`, `purchaseDate`, `openedDate`, `location`, and `retired`. Soft-deleted filaments and retired-only spools are excluded by default. Suitable for round-tripping through `POST /api/spools/import` when migrating between instances.
+
+Response headers: `Content-Type: text/csv` and `Content-Disposition: attachment; filename="spools-YYYY-MM-DD.csv"`.
 
 ---
 

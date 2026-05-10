@@ -473,4 +473,180 @@ describe("SyncService — v1.12 sync expansion", () => {
       expect(remoteRow?._deletedAt).not.toBeNull();
     });
   });
+
+  // ── _purged tombstone propagation ─────────────────────────────────────
+  //
+  // Codex flagged a P1 on PR #213: the original "permanently delete from
+  // trash" path called `Filament.deleteOne`, but syncCollection pairs docs
+  // by `syncId` and treats "remote has it, local doesn't" as a fresh
+  // insert from remote. So a hard delete on one peer was getting
+  // resurrected from the other side on the next sync cycle. The fix is a
+  // `_purged: boolean` tombstone that the sync engine knows to propagate.
+
+  describe("_purged tombstone propagation", () => {
+    it("propagates a local _purged tombstone to the remote peer", async () => {
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+      const t0 = new Date("2026-05-01T00:00:00Z");
+      const purgedAt = new Date("2026-05-09T00:00:00Z");
+      const syncId = "filament-purge-1";
+
+      // Local: trashed and then permanently purged
+      await localDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purged Locally",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "ffffffffff",
+        syncId,
+        _deletedAt: purgedAt,
+        _purged: true,
+        createdAt: t0,
+        updatedAt: t0,
+      });
+      // Remote: still in the trash (not yet purged)
+      await remoteDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purged Locally",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "eeeeeeeeee",
+        syncId,
+        _deletedAt: new Date("2026-05-08T00:00:00Z"),
+        _purged: false,
+        createdAt: t0,
+        updatedAt: t0,
+      });
+
+      sync = makeSync();
+      await sync.sync();
+
+      const remoteRow = await remoteDb.collection("filaments").findOne({ syncId });
+      expect(remoteRow?._purged).toBe(true);
+    });
+
+    it("propagates a remote _purged tombstone to the local peer", async () => {
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+      const t0 = new Date("2026-05-01T00:00:00Z");
+      const syncId = "filament-purge-2";
+
+      await localDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purged Remotely",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "ffffffffff",
+        syncId,
+        _deletedAt: new Date("2026-05-08T00:00:00Z"),
+        _purged: false,
+        createdAt: t0,
+        updatedAt: t0,
+      });
+      await remoteDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purged Remotely",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "eeeeeeeeee",
+        syncId,
+        _deletedAt: new Date("2026-05-09T00:00:00Z"),
+        _purged: true,
+        createdAt: t0,
+        updatedAt: t0,
+      });
+
+      sync = makeSync();
+      await sync.sync();
+
+      const localRow = await localDb.collection("filaments").findOne({ syncId });
+      expect(localRow?._purged).toBe(true);
+    });
+
+    it("leaves both sides alone when both are already purged", async () => {
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+      const t0 = new Date("2026-05-01T00:00:00Z");
+      const syncId = "filament-purge-3";
+
+      const tombstone = {
+        name: "Both Purged",
+        vendor: "T",
+        type: "PLA",
+        syncId,
+        _deletedAt: t0,
+        _purged: true,
+        createdAt: t0,
+        updatedAt: t0,
+      };
+      await localDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        instanceId: "1111111111",
+        ...tombstone,
+      });
+      await remoteDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        instanceId: "2222222222",
+        ...tombstone,
+      });
+
+      sync = makeSync();
+      const results = await sync.sync();
+      const filamentResult = results.find((r) => r.collection === "filaments");
+      // Neither side changed — no pushes/pulls/updates/deletes for this row
+      expect(filamentResult).toBeDefined();
+      // (other rows in the collection might bump these counters, so just
+      // verify the rows are still purged on both sides rather than asserting
+      // exact zeros)
+      const localRow = await localDb.collection("filaments").findOne({ syncId });
+      const remoteRow = await remoteDb.collection("filaments").findOne({ syncId });
+      expect(localRow?._purged).toBe(true);
+      expect(remoteRow?._purged).toBe(true);
+    });
+
+    it("a _purged tombstone wins over a remote update made after the local purge", async () => {
+      // Edge case: user purges on local, then on remote (offline at the
+      // time) someone edits the still-trashed filament — bumps updatedAt
+      // past the purge timestamp. Last-write-wins on plain conflicts would
+      // resurrect it. Purge is a stronger one-way signal and should win.
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+      const t0 = new Date("2026-05-01T00:00:00Z");
+      const purgedAt = new Date("2026-05-08T00:00:00Z");
+      const remoteEditAt = new Date("2026-05-09T00:00:00Z");
+      const syncId = "filament-purge-4";
+
+      await localDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purge Wins",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "1111111111",
+        syncId,
+        _deletedAt: purgedAt,
+        _purged: true,
+        createdAt: t0,
+        updatedAt: purgedAt,
+      });
+      await remoteDb.collection("filaments").insertOne({
+        _id: new ObjectId(),
+        name: "Purge Wins",
+        vendor: "T",
+        type: "PLA",
+        instanceId: "2222222222",
+        syncId,
+        _deletedAt: new Date("2026-05-07T00:00:00Z"),
+        _purged: false,
+        // Bumped after the purge but the purge still wins
+        createdAt: t0,
+        updatedAt: remoteEditAt,
+      });
+
+      sync = makeSync();
+      await sync.sync();
+
+      const remoteRow = await remoteDb.collection("filaments").findOne({ syncId });
+      expect(remoteRow?._purged).toBe(true);
+    });
+  });
 });

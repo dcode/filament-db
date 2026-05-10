@@ -419,9 +419,35 @@ export class SyncService extends EventEmitter {
         // Both exist: handle conflicts
         const localDeleted = localDoc._deletedAt != null;
         const remoteDeleted = remoteDoc._deletedAt != null;
+        const localPurged = localDoc._purged === true;
+        const remotePurged = remoteDoc._purged === true;
+
+        // `_purged` is the "delete forever" tombstone (see Filament model
+        // doc comment). It's a one-way flag — once set on either peer, it
+        // wins over any other state, including a remote update that
+        // happened after the local purge. Without this branch, a hard
+        // delete on one peer was getting resurrected from the other side
+        // on the next sync cycle (#213).
+        if (localPurged || remotePurged) {
+          if (localPurged && !remotePurged) {
+            await remoteCol.updateOne(
+              { _id: remoteDoc._id },
+              { $set: { _purged: true, _deletedAt: localDoc._deletedAt ?? new Date() } },
+            );
+            result.deleted++;
+          } else if (!localPurged && remotePurged) {
+            await localCol.updateOne(
+              { _id: localDoc._id },
+              { $set: { _purged: true, _deletedAt: remoteDoc._deletedAt ?? new Date() } },
+            );
+            result.deleted++;
+          }
+          // else: both already purged — nothing to do
+          continue;
+        }
 
         if (localDeleted && remoteDeleted) {
-          // Both deleted — nothing to do
+          // Both soft-deleted (in trash) — nothing to do
           continue;
         }
 

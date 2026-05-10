@@ -249,3 +249,183 @@ describe("snapshot route — bedTypes round-trip", () => {
     expect(restored.calibrations[0].bedType.toString()).toBe(bedType._id.toString());
   });
 });
+
+/**
+ * v3 snapshot also added Location and PrintHistory. The bedType test above
+ * verifies the export side picks up the new collections via
+ * snapshot.version >= 2; these tests verify the full round-trip for
+ * Location and PrintHistory specifically — without them, a regression
+ * that silently drops either collection from the restore code path would
+ * not surface until a user actually tried to recover from a snapshot and
+ * found their inventory locations or print history were gone.
+ */
+describe("snapshot route — Location + PrintHistory round-trip", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Nozzle: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Printer: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Location: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let PrintHistory: any;
+
+  beforeEach(async () => {
+    delete mongoose.models.Filament;
+    delete mongoose.models.Nozzle;
+    delete mongoose.models.Printer;
+    delete mongoose.models.BedType;
+    delete mongoose.models.Location;
+    delete mongoose.models.PrintHistory;
+    Filament = (await import("@/models/Filament")).default;
+    Nozzle = (await import("@/models/Nozzle")).default;
+    Printer = (await import("@/models/Printer")).default;
+    // BedType registered for side effect (rehydration of calibrations.bedType
+    // refs); this suite doesn't use the handle directly.
+    await import("@/models/BedType");
+    Location = (await import("@/models/Location")).default;
+    PrintHistory = (await import("@/models/PrintHistory")).default;
+  });
+
+  it("GET includes locations and printHistory in the snapshot payload", async () => {
+    await Location.create({ name: "Drybox 1", kind: "drybox", humidity: 18 });
+    await Location.create({ name: "Garage shelf", kind: "shelf" });
+
+    const res = await GET();
+    const snapshot = await res.json();
+
+    expect(snapshot.version).toBeGreaterThanOrEqual(3);
+    expect(Array.isArray(snapshot.collections.locations)).toBe(true);
+    expect(snapshot.collections.locations).toHaveLength(2);
+    expect(Array.isArray(snapshot.collections.printHistory)).toBe(true);
+  });
+
+  it("POST restore replaces locations from the snapshot", async () => {
+    // Pre-existing location that should be wiped
+    await Location.create({ name: "Old shelf", kind: "shelf" });
+
+    const snapshot = {
+      version: 3,
+      createdAt: new Date().toISOString(),
+      collections: {
+        filaments: [],
+        nozzles: [],
+        printers: [],
+        bedTypes: [],
+        locations: [
+          { name: "Restored Drybox", kind: "drybox", humidity: 22, notes: "" },
+          { name: "Restored Cabinet", kind: "cabinet", humidity: null, notes: "" },
+        ],
+        printHistory: [],
+      },
+    };
+
+    const res = await POST(
+      new NextRequest("http://localhost/api/snapshot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(snapshot),
+      }),
+    );
+    const body = await res.json();
+    expect(res.status).toBe(200);
+    expect(body.restored.locations).toBe(2);
+
+    const locs = await Location.find({}).lean();
+    expect(locs).toHaveLength(2);
+    expect(locs.map((l: { name: string }) => l.name).sort()).toEqual([
+      "Restored Cabinet",
+      "Restored Drybox",
+    ]);
+  });
+
+  it("POST restore preserves PrintHistory entries with their filament refs", async () => {
+    // Build a print history entry referencing a real filament so the
+    // restore can rehydrate ObjectId fields correctly.
+    const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+    const printer = await Printer.create({
+      name: "Mk4",
+      manufacturer: "Prusa",
+      printerModel: "Mk4",
+    });
+    const filament = await Filament.create({
+      name: "PLA",
+      vendor: "T",
+      type: "PLA",
+      compatibleNozzles: [noz._id],
+    });
+    await PrintHistory.create({
+      jobLabel: "benchy",
+      printerId: printer._id,
+      usage: [{ filamentId: filament._id, grams: 12.3 }],
+      startedAt: new Date(),
+      source: "manual",
+    });
+
+    // Export full snapshot, wipe, restore.
+    const exportRes = await GET();
+    const snapshotPayload = JSON.parse(await exportRes.text());
+
+    await PrintHistory.deleteMany({});
+    await Filament.deleteMany({});
+    await Printer.deleteMany({});
+    await Nozzle.deleteMany({});
+
+    const restoreRes = await POST(
+      new NextRequest("http://localhost/api/snapshot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(snapshotPayload),
+      }),
+    );
+    expect(restoreRes.status).toBe(200);
+
+    const phs = await PrintHistory.find({}).lean();
+    expect(phs).toHaveLength(1);
+    expect(phs[0].jobLabel).toBe("benchy");
+    // ObjectId rehydration: filamentId and printerId should both be
+    // ObjectIds on disk after restore (not strings) so populate works
+    // and queries by id continue to function.
+    expect(phs[0].usage[0].filamentId.toString()).toBe(filament._id.toString());
+    expect(phs[0].printerId.toString()).toBe(printer._id.toString());
+  });
+
+  it("POST restore round-trips spool.locationId references through Location ObjectId rehydration", async () => {
+    // The harder case: a spool subdocument holds a locationId pointing at
+    // a real Location. After export → wipe → restore, the restored
+    // spool's locationId must still resolve to the right (restored)
+    // Location document.
+    const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+    const loc = await Location.create({ name: "Active Drybox", kind: "drybox" });
+    await Filament.create({
+      name: "PLA",
+      vendor: "T",
+      type: "PLA",
+      compatibleNozzles: [noz._id],
+      spools: [{ label: "Spool 1", totalWeight: 1000, locationId: loc._id }],
+    });
+
+    const exportRes = await GET();
+    const snapshotPayload = JSON.parse(await exportRes.text());
+
+    await Filament.deleteMany({});
+    await Location.deleteMany({});
+    await Nozzle.deleteMany({});
+
+    const restoreRes = await POST(
+      new NextRequest("http://localhost/api/snapshot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(snapshotPayload),
+      }),
+    );
+    expect(restoreRes.status).toBe(200);
+
+    const restoredLoc = await Location.findOne({ name: "Active Drybox" });
+    const restoredFil = await Filament.findOne({ name: "PLA" }).lean();
+    expect(restoredFil.spools[0].locationId.toString()).toBe(
+      restoredLoc._id.toString(),
+    );
+  });
+});
