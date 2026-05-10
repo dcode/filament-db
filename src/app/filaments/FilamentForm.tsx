@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import CollapsibleSection from "@/components/CollapsibleSection";
@@ -750,24 +750,32 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
       ? t("form.updateFilament")
       : t("form.createFilament");
 
-  // Sidebar TOC entries — order mirrors the form so scroll-spy stays in sync.
-  // Identity fields (name / parent / vendor / type / color / cost) intentionally
-  // sit above the first TOC entry; they're always-visible primary content
-  // rather than collapsible sections.
-  const tocEntries: TocEntry[] = [
-    { id: "spool-weight", label: t("form.section.spoolWeight") },
-    { id: "temperatures", label: t("form.section.temperatures") },
-    { id: "shrinkage", label: t("form.section.shrinkage") },
-    { id: "fan", label: t("form.section.fan") },
-    { id: "retraction", label: t("form.section.retraction") },
-    { id: "multi-material", label: t("form.section.multiMaterial") },
-    { id: "material-properties", label: t("form.section.materialProperties") },
-    { id: "material-tags", label: t("form.section.materialTags") },
-    { id: "compatible-nozzles", label: t("form.section.compatibleNozzles") },
-    { id: "calibrations", label: t("form.section.calibrations") },
-    { id: "presets", label: t("form.section.presets") },
-    { id: "gcode", label: t("form.section.gcode") },
-  ];
+  // Sidebar TOC entries — must mirror what's actually rendered, otherwise
+  // clicking an entry scrolls to a missing element and leaves the highlight
+  // stuck on an unreachable item (codex PR #214 P2). Two gating signals:
+  //   - `showAdvanced` hides shrinkage / fan / retraction / multi-material /
+  //     material-properties / material-tags
+  //   - `form.compatibleNozzles.length === 0` hides calibrations
+  // Identity fields (name / parent / vendor / type / color / cost) sit above
+  // the first TOC entry as always-visible primary content.
+  const hasCompatibleNozzles = form.compatibleNozzles.length > 0;
+  const tocEntries: TocEntry[] = useMemo(() => {
+    const all: { id: string; label: string; show: boolean }[] = [
+      { id: "spool-weight", label: t("form.section.spoolWeight"), show: true },
+      { id: "temperatures", label: t("form.section.temperatures"), show: true },
+      { id: "shrinkage", label: t("form.section.shrinkage"), show: showAdvanced },
+      { id: "fan", label: t("form.section.fan"), show: showAdvanced },
+      { id: "retraction", label: t("form.section.retraction"), show: showAdvanced },
+      { id: "multi-material", label: t("form.section.multiMaterial"), show: showAdvanced },
+      { id: "material-properties", label: t("form.section.materialProperties"), show: showAdvanced },
+      { id: "material-tags", label: t("form.section.materialTags"), show: showAdvanced },
+      { id: "compatible-nozzles", label: t("form.section.compatibleNozzles"), show: true },
+      { id: "calibrations", label: t("form.section.calibrations"), show: hasCompatibleNozzles },
+      { id: "presets", label: t("form.section.presets"), show: true },
+      { id: "gcode", label: t("form.section.gcode"), show: true },
+    ];
+    return all.filter((e) => e.show).map(({ id, label }) => ({ id, label }));
+  }, [t, showAdvanced, hasCompatibleNozzles]);
 
   return (
     <div className="lg:flex lg:gap-6 lg:items-start">
