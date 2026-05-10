@@ -1,0 +1,300 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { GET as listPrinters, POST as createPrinter } from "@/app/api/printers/route";
+import {
+  GET as getPrinter,
+  PUT as updatePrinter,
+  DELETE as deletePrinter,
+} from "@/app/api/printers/[id]/route";
+
+/**
+ * Route-level tests for /api/printers. Model has its own tests; this
+ * exercises route behaviour:
+ *   - GET filtering by manufacturer + populated installedNozzles
+ *   - POST validation of installedNozzles refs (active only)
+ *   - DELETE cascade guard against Filament.calibrations.printer
+ *   - Duplicate-name 409 from the partial unique index
+ */
+describe("/api/printers", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Printer: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Nozzle: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+
+  beforeEach(async () => {
+    const printerMod = await import("@/models/Printer");
+    const nozzleMod = await import("@/models/Nozzle");
+    const filamentMod = await import("@/models/Filament");
+    if (!mongoose.models.Printer) mongoose.model("Printer", printerMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozzleMod.default.schema);
+    if (!mongoose.models.Filament) mongoose.model("Filament", filamentMod.default.schema);
+    Printer = mongoose.models.Printer;
+    Nozzle = mongoose.models.Nozzle;
+    Filament = mongoose.models.Filament;
+    await Printer.syncIndexes();
+  });
+
+  function jsonReq(url: string, body?: unknown, method: "GET" | "POST" | "PUT" = body ? "POST" : "GET") {
+    return new NextRequest(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  describe("GET /api/printers", () => {
+    it("returns printers with installedNozzles populated", async () => {
+      const noz = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+      await Printer.create({
+        name: "X1C",
+        manufacturer: "Bambu",
+        printerModel: "X1C",
+        installedNozzles: [noz._id],
+      });
+
+      const res = await listPrinters(jsonReq("http://localhost/api/printers"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toHaveLength(1);
+      expect(body[0].installedNozzles).toHaveLength(1);
+      expect(body[0].installedNozzles[0].name).toBe("0.4 Brass");
+    });
+
+    it("filters by manufacturer", async () => {
+      await Printer.create({ name: "Mk4", manufacturer: "Prusa", printerModel: "Mk4" });
+      await Printer.create({ name: "X1C", manufacturer: "Bambu", printerModel: "X1C" });
+      await Printer.create({ name: "Core One", manufacturer: "Prusa", printerModel: "Core One" });
+
+      const res = await listPrinters(jsonReq("http://localhost/api/printers?manufacturer=Prusa"));
+      const body = await res.json();
+      expect(body.map((p: { name: string }) => p.name).sort()).toEqual(["Core One", "Mk4"]);
+    });
+
+    it("excludes soft-deleted printers", async () => {
+      await Printer.create({ name: "Live", manufacturer: "X", printerModel: "L" });
+      await Printer.create({
+        name: "Trashed",
+        manufacturer: "X",
+        printerModel: "T",
+        _deletedAt: new Date(),
+      });
+
+      const res = await listPrinters(jsonReq("http://localhost/api/printers"));
+      const body = await res.json();
+      expect(body.map((p: { name: string }) => p.name)).toEqual(["Live"]);
+    });
+
+    it("populates only non-deleted nozzles in installedNozzles", async () => {
+      const live = await Nozzle.create({ name: "Live nozzle", diameter: 0.4, type: "Brass" });
+      const dead = await Nozzle.create({
+        name: "Dead nozzle",
+        diameter: 0.6,
+        type: "Brass",
+        _deletedAt: new Date(),
+      });
+      await Printer.create({
+        name: "Has both refs",
+        manufacturer: "X",
+        printerModel: "P",
+        installedNozzles: [live._id, dead._id],
+      });
+
+      const res = await listPrinters(jsonReq("http://localhost/api/printers"));
+      const body = await res.json();
+      // populate({ match: { _deletedAt: null } }) returns null for unmatched refs
+      const populated = body[0].installedNozzles.filter((n: unknown) => n != null);
+      expect(populated).toHaveLength(1);
+      expect(populated[0].name).toBe("Live nozzle");
+    });
+  });
+
+  describe("POST /api/printers", () => {
+    it("creates a printer and strips identity fields", async () => {
+      const res = await createPrinter(
+        jsonReq("http://localhost/api/printers", {
+          _id: "ffffffffffffffffffffffff",
+          syncId: "leak-attempt",
+          name: "X1C",
+          manufacturer: "Bambu",
+          printerModel: "X1C",
+        }),
+      );
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body._id).not.toBe("ffffffffffffffffffffffff");
+      expect(body.syncId).toBeUndefined();
+      expect(body.name).toBe("X1C");
+    });
+
+    it("rejects POST when an installedNozzles entry references a deleted nozzle", async () => {
+      const live = await Nozzle.create({ name: "L", diameter: 0.4, type: "Brass" });
+      const dead = await Nozzle.create({
+        name: "D",
+        diameter: 0.4,
+        type: "Brass",
+        _deletedAt: new Date(),
+      });
+
+      const res = await createPrinter(
+        jsonReq("http://localhost/api/printers", {
+          name: "Bad refs",
+          manufacturer: "X",
+          printerModel: "P",
+          installedNozzles: [live._id, dead._id],
+        }),
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/no longer exist/i);
+    });
+
+    it("returns 409 on duplicate name", async () => {
+      await Printer.create({ name: "Mk4", manufacturer: "Prusa", printerModel: "Mk4" });
+      const res = await createPrinter(
+        jsonReq("http://localhost/api/printers", {
+          name: "Mk4",
+          manufacturer: "Prusa",
+          printerModel: "Mk4",
+        }),
+      );
+      expect(res.status).toBe(409);
+    });
+
+    it("returns 400 on invalid JSON", async () => {
+      const req = new NextRequest("http://localhost/api/printers", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{invalid",
+      });
+      const res = await createPrinter(req);
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe("DELETE /api/printers/{id}", () => {
+    it("refuses if a filament calibration still references the printer", async () => {
+      const printer = await Printer.create({
+        name: "Mk4",
+        manufacturer: "Prusa",
+        printerModel: "Mk4",
+      });
+      const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+      await Filament.create({
+        name: "Calibrated PLA",
+        vendor: "T",
+        type: "PLA",
+        calibrations: [{ nozzle: noz._id, printer: printer._id, extrusionMultiplier: 0.95 }],
+      });
+
+      const res = await deletePrinter(
+        new NextRequest(`http://localhost/api/printers/${printer._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/referenced by/i);
+    });
+
+    it("ignores soft-deleted filament calibrations when checking refs", async () => {
+      const printer = await Printer.create({
+        name: "Mk4",
+        manufacturer: "Prusa",
+        printerModel: "Mk4",
+      });
+      const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+      // Calibration belongs to a soft-deleted filament — should NOT block
+      await Filament.create({
+        name: "Trashed PLA",
+        vendor: "T",
+        type: "PLA",
+        calibrations: [{ nozzle: noz._id, printer: printer._id }],
+        _deletedAt: new Date(),
+      });
+
+      const res = await deletePrinter(
+        new NextRequest(`http://localhost/api/printers/${printer._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it("soft-deletes a printer with no references", async () => {
+      const printer = await Printer.create({
+        name: "Standalone",
+        manufacturer: "X",
+        printerModel: "P",
+      });
+      const res = await deletePrinter(
+        new NextRequest(`http://localhost/api/printers/${printer._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const after = await Printer.findById(printer._id);
+      expect(after._deletedAt).not.toBeNull();
+    });
+  });
+
+  describe("PUT /api/printers/{id}", () => {
+    it("updates basic fields including new v1.11 profile fields", async () => {
+      const printer = await Printer.create({
+        name: "Mk4",
+        manufacturer: "Prusa",
+        printerModel: "Mk4",
+      });
+      const res = await updatePrinter(
+        jsonReq(
+          `http://localhost/api/printers/${printer._id}`,
+          {
+            buildVolume: { x: 250, y: 210, z: 220 },
+            maxFlow: 24,
+            enclosed: false,
+            autoBedLevel: true,
+          },
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.buildVolume).toEqual({ x: 250, y: 210, z: 220 });
+      expect(body.maxFlow).toBe(24);
+      expect(body.autoBedLevel).toBe(true);
+    });
+
+    it("returns 404 for a soft-deleted printer", async () => {
+      const printer = await Printer.create({
+        name: "Trashed",
+        manufacturer: "X",
+        printerModel: "P",
+        _deletedAt: new Date(),
+      });
+      const res = await updatePrinter(
+        jsonReq(`http://localhost/api/printers/${printer._id}`, { name: "X" }, "PUT"),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /api/printers/{id}", () => {
+    it("returns the printer with populated nozzles", async () => {
+      const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+      const printer = await Printer.create({
+        name: "X1C",
+        manufacturer: "Bambu",
+        printerModel: "X1C",
+        installedNozzles: [noz._id],
+      });
+      const res = await getPrinter(
+        new NextRequest(`http://localhost/api/printers/${printer._id}`),
+        { params: Promise.resolve({ id: String(printer._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.installedNozzles[0].name).toBe("0.4");
+    });
+  });
+});

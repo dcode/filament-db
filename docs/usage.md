@@ -53,7 +53,36 @@ Deletion goes through the bulk-actions selection bar:
 2. A red selection bar appears above the table with **"Delete {count}"**.
 3. Click it and confirm.
 
+Deletion is **soft** — filaments move to the **trash** rather than disappearing for good. The selection bar includes a small "open trash" link so the destination is visible right when you delete.
+
 Parent filaments that still have color variants are blocked from deletion — remove or reparent the variants first.
+
+### Restoring or permanently deleting from the trash
+
+Visit `/trash` (also reachable from **Settings → Trash**). Each row shows when the filament was deleted, plus two actions:
+
+- **Restore** — un-deletes the filament and brings it back into the regular list. If you've created a new active filament with the same name in the meantime, restore is refused with a 409 explaining the conflict — rename one of them first.
+- **Delete forever** — hard-deletes from MongoDB. Cannot be undone. The button's only available on filaments already in the trash; an active filament has to be soft-deleted first as a safety step.
+
+The trash page also has an **Empty trash** action that permanently deletes everything in one go (variants are purged before parents to satisfy the no-orphan-refs constraint).
+
+---
+
+## Bulk Import / Export
+
+Two ways to reach the bulk-data actions:
+
+- **Filament list → "Import / Export" dropdown** in the action row. Convenient when you're already managing filaments.
+- **Settings → Import / Export** (or `/import-export` directly). Same actions presented as labeled tiles, useful for discovery and bookmarking.
+
+Both surfaces cover:
+
+- **Import filaments** — Prusament QR scan, Atlas import, OpenPrintTag browse, file upload (JSON / CSV / XLSX from another Filament DB instance)
+- **Import spools** — bulk CSV with one row per spool
+- **Export filaments** — PrusaSlicer INI bundle, CSV, or XLSX
+- **Export spools** — CSV inventory with location and lot number
+
+A separate **Snapshot** workflow on the Settings page handles full database backup / restore (filaments + nozzles + printers + bed types + locations + print history + shared catalogs in a single JSON file).
 
 ---
 

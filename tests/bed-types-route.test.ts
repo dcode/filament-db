@@ -1,0 +1,228 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { GET as listBedTypes, POST as createBedType } from "@/app/api/bed-types/route";
+import {
+  GET as getBedType,
+  PUT as updateBedType,
+  DELETE as deleteBedType,
+} from "@/app/api/bed-types/[id]/route";
+
+/**
+ * Route-level tests for /api/bed-types. Bed types are referenced from
+ * Filament.calibrations[].bedType, and the DELETE handler must refuse to
+ * silently break those references.
+ */
+describe("/api/bed-types", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let BedType: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Nozzle: any;
+
+  beforeEach(async () => {
+    const bedMod = await import("@/models/BedType");
+    const filMod = await import("@/models/Filament");
+    const nozMod = await import("@/models/Nozzle");
+    if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    BedType = mongoose.models.BedType;
+    Filament = mongoose.models.Filament;
+    Nozzle = mongoose.models.Nozzle;
+    await BedType.syncIndexes();
+  });
+
+  function jsonReq(url: string, body?: unknown, method: "GET" | "POST" | "PUT" = body ? "POST" : "GET") {
+    return new NextRequest(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  }
+
+  describe("GET /api/bed-types", () => {
+    it("returns bed types sorted by name", async () => {
+      await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      await BedType.create({ name: "Glass", material: "Glass" });
+      await BedType.create({ name: "Textured PEI", material: "PEI" });
+
+      const res = await listBedTypes(jsonReq("http://localhost/api/bed-types"));
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.map((b: { name: string }) => b.name)).toEqual([
+        "Glass",
+        "Smooth PEI",
+        "Textured PEI",
+      ]);
+    });
+
+    it("filters by material", async () => {
+      await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      await BedType.create({ name: "Glass", material: "Glass" });
+      await BedType.create({ name: "Textured PEI", material: "PEI" });
+
+      const res = await listBedTypes(jsonReq("http://localhost/api/bed-types?material=PEI"));
+      const body = await res.json();
+      expect(body.map((b: { name: string }) => b.name).sort()).toEqual([
+        "Smooth PEI",
+        "Textured PEI",
+      ]);
+    });
+
+    it("excludes soft-deleted bed types", async () => {
+      await BedType.create({ name: "Live", material: "PEI" });
+      await BedType.create({
+        name: "Trashed",
+        material: "PEI",
+        _deletedAt: new Date(),
+      });
+      const res = await listBedTypes(jsonReq("http://localhost/api/bed-types"));
+      const body = await res.json();
+      expect(body.map((b: { name: string }) => b.name)).toEqual(["Live"]);
+    });
+  });
+
+  describe("POST /api/bed-types", () => {
+    it("creates a bed type and strips identity fields", async () => {
+      const res = await createBedType(
+        jsonReq("http://localhost/api/bed-types", {
+          _id: "ffffffffffffffffffffffff",
+          syncId: "leak",
+          name: "Smooth PEI",
+          material: "PEI",
+        }),
+      );
+      expect(res.status).toBe(201);
+      const body = await res.json();
+      expect(body.name).toBe("Smooth PEI");
+      expect(body._id).not.toBe("ffffffffffffffffffffffff");
+      expect(body.syncId).toBeUndefined();
+    });
+
+    it("returns 409 on duplicate name", async () => {
+      await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      const res = await createBedType(
+        jsonReq("http://localhost/api/bed-types", { name: "Smooth PEI", material: "PEI" }),
+      );
+      expect(res.status).toBe(409);
+    });
+
+    it("allows reusing the name of a soft-deleted bed type", async () => {
+      const trashed = await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      trashed._deletedAt = new Date();
+      await trashed.save();
+
+      const res = await createBedType(
+        jsonReq("http://localhost/api/bed-types", { name: "Smooth PEI", material: "PEI" }),
+      );
+      expect(res.status).toBe(201);
+    });
+
+    it("returns 400 on invalid JSON", async () => {
+      const req = new NextRequest("http://localhost/api/bed-types", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{invalid",
+      });
+      const res = await createBedType(req);
+      expect(res.status).toBe(400);
+    });
+  });
+
+  describe("DELETE /api/bed-types/{id}", () => {
+    it("refuses if a filament's calibrations.bedType still references it", async () => {
+      const bed = await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+      await Filament.create({
+        name: "PLA",
+        vendor: "T",
+        type: "PLA",
+        calibrations: [{ nozzle: noz._id, bedType: bed._id }],
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/referenced by/i);
+    });
+
+    it("ignores soft-deleted filaments when checking refs", async () => {
+      const bed = await BedType.create({ name: "Smooth PEI", material: "PEI" });
+      const noz = await Nozzle.create({ name: "0.4", diameter: 0.4, type: "Brass" });
+      await Filament.create({
+        name: "Trashed PLA",
+        vendor: "T",
+        type: "PLA",
+        calibrations: [{ nozzle: noz._id, bedType: bed._id }],
+        _deletedAt: new Date(),
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it("soft-deletes a bed type with no references", async () => {
+      const bed = await BedType.create({ name: "Standalone", material: "Glass" });
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const after = await BedType.findById(bed._id);
+      expect(after._deletedAt).not.toBeNull();
+    });
+  });
+
+  describe("PUT /api/bed-types/{id}", () => {
+    it("updates fields", async () => {
+      const bed = await BedType.create({ name: "Old", material: "PEI" });
+      const res = await updateBedType(
+        jsonReq(
+          `http://localhost/api/bed-types/${bed._id}`,
+          { name: "New", notes: "rough" },
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.name).toBe("New");
+    });
+
+    it("returns 404 for a soft-deleted bed type", async () => {
+      const bed = await BedType.create({
+        name: "Trashed",
+        material: "PEI",
+        _deletedAt: new Date(),
+      });
+      const res = await updateBedType(
+        jsonReq(`http://localhost/api/bed-types/${bed._id}`, { name: "X" }, "PUT"),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(404);
+    });
+  });
+
+  describe("GET /api/bed-types/{id}", () => {
+    it("returns 404 for a soft-deleted bed type", async () => {
+      const bed = await BedType.create({
+        name: "Gone",
+        material: "PEI",
+        _deletedAt: new Date(),
+      });
+      const res = await getBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(404);
+    });
+  });
+});
