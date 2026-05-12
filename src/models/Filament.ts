@@ -320,7 +320,23 @@ const FilamentSchema = new Schema<IFilament>(
     _deletedAt: { type: Date, default: null },
     _purged: { type: Boolean, default: false, index: true },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    // GH #224: enable Mongoose optimistic concurrency on Filament so the
+    // print-history POST path detects two near-simultaneous jobs racing on
+    // the same filament's spool debits. Without `__v`-based version
+    // checking, both saves would commit and last-writer-wins silently
+    // loses one job's grams debit. With this enabled, the second save
+    // throws VersionError and the route surfaces 409 so the caller can
+    // retry against the fresh state.
+    //
+    // This is a behaviour change for any other Filament write — `save()`
+    // now refuses if the in-memory version is stale. Lean updates
+    // (`updateOne`, `findOneAndUpdate`) are unaffected; OCC is enforced
+    // only on the doc-level `save()` path, which the print-history
+    // handler is the heaviest user of.
+    optimisticConcurrency: true,
+  }
 );
 
 // Partial unique index: enforce unique names only among non-deleted documents

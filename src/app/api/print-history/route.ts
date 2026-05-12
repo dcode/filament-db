@@ -157,6 +157,30 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // GH #224: snapshot every spool's pre-mutation state BEFORE pass 2
+    // so the standalone-fallback path can roll back on a mid-loop
+    // failure. Captures the real pre-debit totalWeight so the
+    // `Math.max(0, ...)` clamp inside pass 2 can't make rollback
+    // ambiguous. The transaction branch doesn't need this — Mongo
+    // aborts the txn for us — but the fallback runs save() one at a
+    // time and would otherwise leak a partial debit if save #2 throws
+    // after save #1 committed.
+    type SpoolSnapshot = {
+      filamentId: string;
+      spoolId: string;
+      totalWeight: number | null;
+    };
+    const spoolSnapshots: SpoolSnapshot[] = [];
+    for (const f of filaments) {
+      for (const s of f.spools) {
+        spoolSnapshots.push({
+          filamentId: String(f._id),
+          spoolId: String(s._id),
+          totalWeight: typeof s.totalWeight === "number" ? s.totalWeight : null,
+        });
+      }
+    }
+
     // Pass 2: apply mutations to in-memory docs. A single filament can be
     // referenced by multiple usage entries in one job, so we mutate the
     // shared doc instance and save each filament once at the end.
@@ -224,9 +248,7 @@ export async function POST(request: NextRequest) {
     // both). Transactions require a replica set — Atlas deployments have
     // this by default, local mongod may not. On a standalone server
     // startSession().withTransaction() throws with a specific error, so
-    // we fall back to sequential saves. The fallback keeps the fix for
-    // the original reviewer concern (the 404-in-middle case) but can't
-    // protect against a mid-batch write failure on non-replicated setups.
+    // we fall back to sequential saves.
     let history;
     try {
       const session = await mongoose.startSession();
@@ -258,23 +280,84 @@ export async function POST(request: NextRequest) {
         msg.includes("Transaction numbers are only allowed") ||
         msg.includes("not supported on standalone") ||
         msg.includes("IllegalOperation");
+      // GH #224: surface concurrent-edit conflicts (Mongoose
+      // VersionError) as a 409 so the caller can re-fetch and retry
+      // against the fresh state. Without OCC enabled on the Filament
+      // schema this would never throw — but two near-simultaneous
+      // print-history POSTs that both load the same filament document
+      // would silently end with one job's grams debit lost
+      // (last-writer-wins). The schema-level `optimisticConcurrency:
+      // true` setting in src/models/Filament.ts makes this safe.
+      if (err instanceof mongoose.Error.VersionError) {
+        return errorResponse(
+          "Filament was modified by another request during this job. Please retry.",
+          409,
+        );
+      }
       if (!isTxnUnsupported) throw err;
 
       // Fallback path for non-replicated mongod (offline/test). Sequential
-      // saves so a mid-loop failure is localized rather than spawning
-      // concurrent partial commits across the array.
-      for (const f of filaments) {
-        await f.save();
+      // saves with explicit rollback on failure — without this, save #2
+      // throwing after save #1 committed would leak a partial debit
+      // (spool weight gone, no PrintHistory row, no refund path).
+      const savedFilaments: typeof filaments = [];
+      try {
+        for (const f of filaments) {
+          await f.save();
+          savedFilaments.push(f);
+        }
+        history = await PrintHistory.create({
+          _id: historyId,
+          jobLabel: body.jobLabel.trim(),
+          printerId,
+          usage: resolvedUsage,
+          startedAt,
+          source,
+          notes,
+        });
+      } catch (innerErr) {
+        // Reset every already-persisted filament to its pre-call state.
+        // Reload from DB to avoid version conflicts, then splice off any
+        // usageHistory entries we'd pushed and restore the original
+        // totalWeight from the snapshot.
+        for (const f of savedFilaments) {
+          try {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const fresh: any = await Filament.findById(f._id);
+            if (!fresh) continue;
+            for (const s of fresh.spools) {
+              const snap = spoolSnapshots.find(
+                (sn) =>
+                  sn.filamentId === String(f._id) &&
+                  sn.spoolId === String(s._id),
+              );
+              if (!snap) continue;
+              if (snap.totalWeight != null) s.totalWeight = snap.totalWeight;
+              if (Array.isArray(s.usageHistory)) {
+                s.usageHistory = s.usageHistory.filter(
+                  (e: { jobId?: unknown }) =>
+                    String(e.jobId ?? "") !== String(historyId),
+                );
+              }
+            }
+            await fresh.save();
+          } catch {
+            // Best-effort rollback — if a save errors here, log via
+            // the wrapper and continue. Manual reconciliation is
+            // preferable to silently swallowing the original error.
+          }
+        }
+        // GH #224: surface concurrent-edit conflicts as 409 here too —
+        // the fallback path catches VersionError inside this inner try,
+        // and rethrowing would surface as a generic 500 to the caller.
+        if (innerErr instanceof mongoose.Error.VersionError) {
+          return errorResponse(
+            "Filament was modified by another request during this job. Please retry.",
+            409,
+          );
+        }
+        throw innerErr;
       }
-      history = await PrintHistory.create({
-        _id: historyId,
-        jobLabel: body.jobLabel.trim(),
-        printerId,
-        usage: resolvedUsage,
-        startedAt,
-        source,
-        notes,
-      });
     }
 
     return NextResponse.json(history, { status: 201 });

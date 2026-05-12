@@ -130,6 +130,11 @@ export async function POST(request: NextRequest) {
 
   delete body._id;
   delete body._deletedAt;
+  // GH #222: parallel of the PUT-handler fix. `_purged` is a sync-engine
+  // tombstone signal — never client-writable. A POST that creates a doc
+  // with `_purged: true` would immediately be ignored by every list / get
+  // endpoint and trigger cross-peer purge on the next sync cycle.
+  delete body._purged;
   delete body.createdAt;
   delete body.updatedAt;
   delete body.__v;

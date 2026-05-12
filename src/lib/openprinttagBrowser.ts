@@ -345,6 +345,17 @@ function walkDir(dir: string): string[] {
 /**
  * Fetch the OpenPrintTag database from GitHub, parse all YAML files,
  * and return the structured result.
+ *
+ * GH #225 — cold-fetch resilience:
+ * - The fetch+extract pipeline is wrapped in a retry loop (3 attempts,
+ *   exponential backoff) so a transient TimeoutError or network blip on
+ *   the first request after Electron startup doesn't surface to the user
+ *   as a 500. Most "OpenPrintTag fetch error: TimeoutError" reports trace
+ *   to a cold connection that resolves on retry.
+ * - If every retry fails BUT we have a previously-cached payload (even an
+ *   expired one), serve the stale payload instead of throwing. The
+ *   freshness window is wide enough that users prefer a one-hour-old
+ *   brand list to "Failed to load."
  */
 export async function fetchOpenPrintTagDatabase(): Promise<OPTDatabase> {
   // Check cache
@@ -352,8 +363,53 @@ export async function fetchOpenPrintTagDatabase(): Promise<OPTDatabase> {
     return cachedDatabase;
   }
 
-  const tmpDir = mkdtempSync(join(tmpdir(), "openprinttag-"));
+  const MAX_ATTEMPTS = 3;
+  let lastError: unknown = null;
 
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const tmpDir = mkdtempSync(join(tmpdir(), "openprinttag-"));
+
+    try {
+      const result = await fetchAndParse(tmpDir);
+      return result;
+    } catch (err) {
+      lastError = err;
+      // Clean up the tmp dir from the failed attempt before retrying so
+      // disk usage doesn't grow on a flaky network.
+      try {
+        rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+      if (attempt < MAX_ATTEMPTS) {
+        // Exponential backoff: 800ms, 2400ms. Total worst-case wait
+        // ~3.2s extra over the base 60s per attempt — still well under
+        // the user's tolerance for a one-time DB browser cold-load.
+        await new Promise((r) => setTimeout(r, 800 * Math.pow(3, attempt - 1)));
+      }
+    }
+  }
+
+  // All retries failed. If we have a previously-cached payload (even
+  // if it's past the TTL), serve it — better than failing the UI.
+  if (cachedDatabase) {
+    console.warn(
+      "OpenPrintTag fetch failed after retries — serving stale cache from",
+      new Date(cacheTimestamp).toISOString(),
+    );
+    return cachedDatabase;
+  }
+
+  throw lastError instanceof Error
+    ? lastError
+    : new Error("OpenPrintTag fetch failed: " + String(lastError));
+}
+
+/**
+ * Single-attempt fetch + tarball extract + parse. Factored out so the
+ * retry loop above can call it multiple times against fresh temp dirs.
+ */
+async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
   try {
     // Download and extract the tarball via the GitHub tarball API. Earlier
     // versions shelled out to `curl ... | tar xz`, but the production

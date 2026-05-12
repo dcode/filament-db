@@ -30,7 +30,7 @@ export function isPrivateIp(ip: string): boolean {
     if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) {
       return true; // unparseable → block conservatively
     }
-    const [a, b] = parts;
+    const [a, b, c] = parts;
     if (a === 0) return true;                              // 0.0.0.0/8
     if (a === 10) return true;                             // 10.0.0.0/8 (RFC1918)
     if (a === 127) return true;                            // 127.0.0.0/8 (loopback)
@@ -38,6 +38,14 @@ export function isPrivateIp(ip: string): boolean {
     if (a === 172 && b >= 16 && b <= 31) return true;      // 172.16.0.0/12 (RFC1918)
     if (a === 192 && b === 168) return true;               // 192.168.0.0/16 (RFC1918)
     if (a === 100 && b >= 64 && b <= 127) return true;     // 100.64.0.0/10 (CG-NAT, RFC6598)
+    // GH #228: 192.0.0.0/24 (IETF Protocol Assignments, RFC 6890) and
+    // 198.18.0.0/15 (RFC 2544 network-benchmark) are reserved and
+    // should not be reachable from the public internet. Some labs and
+    // carrier infrastructure route them, so allowing them through the
+    // SSRF guard would let an attacker probe internal address space
+    // via DNS rebinding.
+    if (a === 192 && b === 0 && c === 0) return true;      // 192.0.0.0/24 (IETF protocol assignments)
+    if (a === 198 && (b === 18 || b === 19)) return true;  // 198.18.0.0/15 (network benchmark)
     if (a >= 224) return true;                             // 224.0.0.0/4 multicast + 240/4 reserved
     return false;
   }

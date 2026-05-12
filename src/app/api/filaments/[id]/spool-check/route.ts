@@ -53,9 +53,34 @@ export async function GET(
       return errorResponse(`Filament not found: ${decodedName}`, 404);
     }
 
-    const spoolWeight = filament.spoolWeight as number | null;
-    const density = filament.density as number | null;
-    const diameter = filament.diameter as number | null;
+    // GH #223: variants typically store `spoolWeight: null` and inherit
+    // from their parent (see src/lib/resolveFilament.ts INHERITABLE_FIELDS).
+    // Reading `filament.spoolWeight` directly meant the route hit the
+    // `spoolWeight == null` guard below and returned "no data — skipping
+    // check" for every color variant, silently disabling PrusaSlicer's
+    // insufficient-filament warning. Same bug class as the v1.16 compare
+    // route fix (PR #190): resolve the parent inline.
+    //
+    // Density and diameter use the same inheritance and are needed for the
+    // weight-to-length conversion, so resolve them in the same parent
+    // fetch.
+    let spoolWeight = filament.spoolWeight as number | null;
+    let density = filament.density as number | null;
+    let diameter = filament.diameter as number | null;
+
+    if (filament.parentId && (spoolWeight == null || density == null || diameter == null)) {
+      const parent = await Filament.findOne({
+        _id: filament.parentId,
+        _deletedAt: null,
+      })
+        .select("spoolWeight density diameter")
+        .lean();
+      if (parent) {
+        if (spoolWeight == null) spoolWeight = (parent.spoolWeight as number | null) ?? null;
+        if (density == null) density = (parent.density as number | null) ?? null;
+        if (diameter == null) diameter = (parent.diameter as number | null) ?? null;
+      }
+    }
 
     // Collect all spools — multi-spool array takes priority, fall back to legacy single spool
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

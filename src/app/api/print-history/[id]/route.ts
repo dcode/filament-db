@@ -35,9 +35,48 @@ export async function DELETE(
         ? filament.spools.find((s) => String(s._id) === String(u.spoolId))
         : null;
       if (!spool) continue;
-      // Refund weight
+      // Refund weight. GH #228 + Codex P1 review on PR #229: clamp at
+      // the spool's **gross** full-weight ceiling. `spool.totalWeight`
+      // is what the user reads off the scale — filament + empty spool —
+      // so the cap must be in the same unit. That's
+      //   spoolWeight (empty-spool tare) + netFilamentWeight (filament).
+      // The pre-Codex shape clamped at `netFilamentWeight` alone, which
+      // for any filament with a non-zero spool tare would under-refund
+      // the empty-spool grams (e.g. a 1200g gross / 200g-tare spool got
+      // capped to 1000g, locking 200g of legitimate weight out of the
+      // refund forever).
+      //
+      // `spoolWeight` and `netFilamentWeight` both inherit from the
+      // parent on variants (see src/lib/resolveFilament.ts
+      // INHERITABLE_FIELDS), so resolve them via a one-shot parent
+      // lookup when either is null on the variant.
       if (typeof spool.totalWeight === "number") {
-        spool.totalWeight = spool.totalWeight + u.grams;
+        let tareWeight: number | null = filament.spoolWeight ?? null;
+        let netCapacity: number | null = filament.netFilamentWeight ?? null;
+        if (filament.parentId && (tareWeight == null || netCapacity == null)) {
+          const parent = await Filament.findOne({
+            _id: filament.parentId,
+            _deletedAt: null,
+          })
+            .select("spoolWeight netFilamentWeight")
+            .lean();
+          if (parent) {
+            if (tareWeight == null) tareWeight = (parent.spoolWeight as number | null) ?? null;
+            if (netCapacity == null) netCapacity = (parent.netFilamentWeight as number | null) ?? null;
+          }
+        }
+        const refunded = spool.totalWeight + u.grams;
+        // Only clamp when we have a real net-capacity ceiling. The empty-
+        // spool tare alone isn't a ceiling — a value of "spoolWeight: 200,
+        // netFilamentWeight: null" means we know the tare but not the
+        // filament capacity, so we can't bound the refund. Leaving
+        // `netCapacity` null falls through to the legacy no-clamp behaviour.
+        if (typeof netCapacity === "number" && netCapacity > 0) {
+          const grossCapacity = netCapacity + (tareWeight ?? 0);
+          spool.totalWeight = Math.min(refunded, grossCapacity);
+        } else {
+          spool.totalWeight = refunded;
+        }
       }
       // Remove the matching usageHistory entry by jobId. Older entries
       // written before the v1.12.x audit don't carry a jobId; for those

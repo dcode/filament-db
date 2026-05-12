@@ -29,12 +29,55 @@ export async function GET(request: NextRequest) {
     const [history, filaments] = await Promise.all([
       PrintHistory.find({ _deletedAt: null, startedAt: { $gte: since } })
         .populate("printerId", "name")
-        .populate("usage.filamentId", "name vendor cost")
+        // GH #223: include parentId + the bits we'll inherit (cost) so we
+        // can resolve variant-inherited cost without a second round-trip.
+        // Without this the populate returns the variant's own `cost`
+        // (typically null on inheriting variants), so `totalCost` would
+        // contribute 0 grams worth for every print job against a variant.
+        .populate("usage.filamentId", "name vendor cost parentId")
         .lean(),
+      // Include `parentId` here as well so the manual-usage loop below can
+      // walk inheritance.
       Filament.find({ _deletedAt: null })
-        .select("name vendor cost spools")
+        .select("name vendor cost parentId spools")
         .lean(),
     ]);
+
+    // GH #223: build a parent-cost lookup so cost inheritance resolves
+    // without per-row queries. Collect every unique `parentId` referenced
+    // by either the populated PrintHistory.usage entries or the manual
+    // spool loop, batch-fetch their costs, then expose a helper that
+    // returns `variantCost ?? parentCost ?? null` for any filament shape.
+    const parentIdSet = new Set<string>();
+    for (const f of filaments) if (f.parentId) parentIdSet.add(String(f.parentId));
+    for (const entry of history) {
+      for (const u of entry.usage || []) {
+        const populated = u.filamentId as { parentId?: unknown } | null;
+        if (populated && typeof populated === "object" && populated.parentId) {
+          parentIdSet.add(String(populated.parentId));
+        }
+      }
+    }
+    const parentCostMap = new Map<string, number | null>();
+    if (parentIdSet.size > 0) {
+      const parents = await Filament.find({
+        _id: { $in: Array.from(parentIdSet) },
+        _deletedAt: null,
+      })
+        .select("_id cost")
+        .lean();
+      for (const p of parents) {
+        parentCostMap.set(String(p._id), (p.cost as number | null) ?? null);
+      }
+    }
+    function resolveCost(
+      ownCost: number | null | undefined,
+      parentId: unknown,
+    ): number | null {
+      if (ownCost != null) return ownCost;
+      if (!parentId) return null;
+      return parentCostMap.get(String(parentId)) ?? null;
+    }
 
     // Build usageByDay bucket. Date key = YYYY-MM-DD in UTC for stability.
     const byDay = new Map<string, number>();
@@ -80,11 +123,14 @@ export async function GET(request: NextRequest) {
           ? String((u.filamentId as { _id?: unknown })._id ?? "")
           : String(u.filamentId);
         const fdoc = u.filamentId && typeof u.filamentId === "object"
-          ? (u.filamentId as { name?: string; vendor?: string; cost?: number | null })
+          ? (u.filamentId as { name?: string; vendor?: string; cost?: number | null; parentId?: unknown })
           : null;
         const name = fdoc?.name ?? "(unknown)";
         const vendor = fdoc?.vendor ?? "(unknown)";
-        const cost = fdoc?.cost ?? null;
+        // GH #223: was `fdoc?.cost ?? null` — read the variant's own cost
+        // directly and contributed 0 to totalCost for every job against
+        // an inheriting variant. resolveCost falls back to the parent.
+        const cost = resolveCost(fdoc?.cost ?? null, fdoc?.parentId);
         const existing = byFilament.get(fid);
         if (existing) existing.grams += u.grams;
         else byFilament.set(fid, { name, vendor, cost, grams: u.grams });
@@ -116,18 +162,21 @@ export async function GET(request: NextRequest) {
           if (u.source !== "manual") continue;
           const dayKey = uDate.toISOString().slice(0, 10);
           byDay.set(dayKey, (byDay.get(dayKey) ?? 0) + u.grams);
+          // GH #223: same fix as the PrintHistory loop above — fall back
+          // to the parent's cost when the variant inherits.
+          const fCost = resolveCost(f.cost ?? null, f.parentId);
           const existing = byFilament.get(String(f._id));
           if (existing) existing.grams += u.grams;
           else
             byFilament.set(String(f._id), {
               name: f.name,
               vendor: f.vendor,
-              cost: f.cost ?? null,
+              cost: fCost,
               grams: u.grams,
             });
           byVendor.set(f.vendor, (byVendor.get(f.vendor) ?? 0) + u.grams);
           totalGrams += u.grams;
-          if (f.cost != null) totalCost += (u.grams / 1000) * f.cost;
+          if (fCost != null) totalCost += (u.grams / 1000) * fCost;
           manualEntries++;
         }
       }

@@ -50,6 +50,29 @@ export async function POST(
       );
     }
 
+    // GH #223: refuse to restore a variant whose parent is still in the
+    // trash. Without this guard the variant ends up with `parentId`
+    // pointing at a doc whose `_deletedAt != null`, and every read path
+    // filters parents by `_deletedAt: null` — so the variant renders
+    // with no inheritance (empty cost, density, temperatures, etc.) and
+    // the user sees a half-broken row with no obvious cause. Better to
+    // surface the dependency and let the caller restore the parent
+    // first, then the variant.
+    if (trashed.parentId) {
+      const parent = await Filament.findOne({
+        _id: trashed.parentId,
+        _deletedAt: null,
+      })
+        .select("_id name")
+        .lean();
+      if (!parent) {
+        return errorResponse(
+          `Cannot restore: this variant's parent is still in the trash. Restore the parent first.`,
+          409,
+        );
+      }
+    }
+
     trashed._deletedAt = null;
     await trashed.save();
 

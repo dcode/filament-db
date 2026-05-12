@@ -470,6 +470,124 @@ describe("print-history DELETE (undo)", () => {
     const refunded = await Filament.findById(f._id);
     expect(refunded.spools[0].totalWeight).toBe(1000);
   });
+
+  // GH #228 + Codex P1 review on PR #229: refund clamps at the spool's
+  // GROSS full weight (spoolWeight + netFilamentWeight), not at
+  // netFilamentWeight alone. spool.totalWeight is the on-scale gross
+  // reading; clamping in net-only units would permanently under-refund
+  // by the empty-spool tare for any filament with spoolWeight > 0.
+  it("refund clamps at gross capacity (spoolWeight + netFilamentWeight), not net", async () => {
+    const f = await Filament.create({
+      name: "Gross Clamp",
+      vendor: "Test",
+      type: "PLA",
+      spoolWeight: 200, // 200g empty-spool tare
+      netFilamentWeight: 1000, // 1kg of filament when full
+      // User manually corrected the gross weight down to 1000g after a
+      // previous (off-ledger) usage, leaving 800g of filament on the spool.
+      spools: [{ label: "", totalWeight: 1000 }],
+    });
+    // Log + undo a 150g job. Pre-Codex this would clamp at 1000g (net),
+    // leaving 200g of legitimate weight locked out. Post-Codex it clamps
+    // at 1200g gross, so the refund actually adds the 150g back.
+    const job = await postJob(f, "to-undo", 150);
+    const afterJob = await Filament.findById(f._id);
+    expect(afterJob.spools[0].totalWeight).toBe(850); // 1000 − 150
+
+    await deletePrintHistory(delReq(job._id), {
+      params: Promise.resolve({ id: job._id }),
+    });
+    const refunded = await Filament.findById(f._id);
+    expect(refunded.spools[0].totalWeight).toBe(1000); // 850 + 150, not clamped
+  });
+
+  it("refund clamps to gross max when the refund would push the spool over capacity", async () => {
+    const f = await Filament.create({
+      name: "Gross Clamp Cap",
+      vendor: "Test",
+      type: "PLA",
+      spoolWeight: 200,
+      netFilamentWeight: 1000, // gross capacity = 1200g
+      // User started this spool at a near-full reading and ran a job.
+      // Then they manually re-weighed and pushed totalWeight to 1100g (a
+      // re-tare to "match the scale"). Undoing the 200g job would
+      // attempt to set totalWeight to 1300g — above the 1200g gross
+      // ceiling, which the clamp prevents.
+      spools: [{ label: "", totalWeight: 1200 }],
+    });
+    const job = await postJob(f, "near-cap", 200);
+    const f2 = await Filament.findById(f._id);
+    f2.spools[0].totalWeight = 1100;
+    await f2.save();
+
+    await deletePrintHistory(delReq(job._id), {
+      params: Promise.resolve({ id: job._id }),
+    });
+    const after = await Filament.findById(f._id);
+    expect(after.spools[0].totalWeight).toBe(1200); // capped at gross max
+  });
+
+  it("variant inherits parent's spoolWeight when clamping the refund", async () => {
+    // Codex P1 specifically called out that spoolWeight inherits like
+    // every other field in INHERITABLE_FIELDS. A variant with no own
+    // spoolWeight must still use the parent's tare when computing
+    // the gross ceiling.
+    const parent = await Filament.create({
+      name: "Clamp Parent",
+      vendor: "Test",
+      type: "PLA",
+      spoolWeight: 250, // tare lives on the parent
+      netFilamentWeight: 1000,
+    });
+    const variant = await Filament.create({
+      name: "Clamp Variant",
+      vendor: "Test",
+      type: "PLA",
+      color: "#abcdef",
+      parentId: parent._id,
+      // spoolWeight + netFilamentWeight intentionally null → inherit
+      spools: [{ label: "", totalWeight: 1100 }],
+    });
+    const job = await postJob(variant, "var-job", 200);
+    // Manual correction pushes totalWeight to 1200 (mid-print re-weigh).
+    const v2 = await Filament.findById(variant._id);
+    v2.spools[0].totalWeight = 1200;
+    await v2.save();
+
+    await deletePrintHistory(delReq(job._id), {
+      params: Promise.resolve({ id: job._id }),
+    });
+    const after = await Filament.findById(variant._id);
+    // Gross ceiling = parent.spoolWeight (250) + parent.netFilamentWeight (1000) = 1250.
+    // Refund of 200 → 1400; clamps to 1250.
+    expect(after.spools[0].totalWeight).toBe(1250);
+  });
+
+  it("no clamp when netFilamentWeight is unset (legacy filament behaviour)", async () => {
+    // The pre-#228 code had no upper bound on refund. For legacy
+    // filaments with no netFilamentWeight set, we preserve that
+    // behaviour rather than guessing at a capacity.
+    const f = await Filament.create({
+      name: "No Capacity",
+      vendor: "Test",
+      type: "PLA",
+      spoolWeight: 200,
+      // netFilamentWeight intentionally unset
+      spools: [{ label: "", totalWeight: 100 }],
+    });
+    const job = await postJob(f, "legacy", 50);
+    const f2 = await Filament.findById(f._id);
+    // User manually corrected to 0 mid-job.
+    f2.spools[0].totalWeight = 0;
+    await f2.save();
+
+    await deletePrintHistory(delReq(job._id), {
+      params: Promise.resolve({ id: job._id }),
+    });
+    const after = await Filament.findById(f._id);
+    // No clamp: refund 50 onto 0 → 50.
+    expect(after.spools[0].totalWeight).toBe(50);
+  });
 });
 
 describe("analytics GET — double-counting regression", () => {

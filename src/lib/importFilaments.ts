@@ -301,9 +301,18 @@ export async function upsertImportRows(
         };
       }
       if (softDeleted) {
+        // GH #228: the resurrect path was the only Filament write in the
+        // codebase running `updateOne` without `runValidators`. The pre-
+        // update hook on `tdsUrl` still fires (it's gated by the
+        // `update.tdsUrl` check inside the hook, not by `runValidators`),
+        // but every other schema-level validator — `cost.min`,
+        // `lowStockThreshold.min`, type coercions — was bypassed. A
+        // malformed re-import of a previously-trashed row could persist
+        // invalid numeric fields.
         await Filament.updateOne(
           { _id: softDeleted._id },
           { ...doc, _deletedAt: null },
+          { runValidators: true, context: "query" },
         );
         updated++;
       } else {
