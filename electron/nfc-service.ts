@@ -73,16 +73,32 @@ export class NfcService extends EventEmitter {
 
         // Ignore the first status event per reader — it reflects the reader's
         // initial state which can falsely report SCARD_STATE_PRESENT on some
-        // interfaces (e.g. the SAM slot on Linux reports present=true with no
-        // tag). We must skip setting readerPresent here too, otherwise the SAM
-        // reader's phantom "present" permanently blocks tag removal detection.
+        // interfaces. Two known false positives:
+        //
+        //   1. The SAM slot on Linux reports present=true with no tag. We must
+        //      skip setting readerPresent here too, otherwise the SAM
+        //      reader's phantom "present" permanently blocks tag removal
+        //      detection.
+        //
+        //   2. The ACR1552U on macOS (and likely other ACS-driver readers)
+        //      reports present=true WITH a non-empty `status.atr` on the
+        //      first event even when no tag is in the field (GH #230). The
+        //      previous code carved out an exception when
+        //      `status.atr?.length` was truthy, on the theory that ATR
+        //      presence meant a tag was already on the reader at plug-in.
+        //      That theory was wrong for at least one driver and caused
+        //      every reader plug-in to surface a "Cannot connect to tag"
+        //      toast — because the auto-read in main.ts saw tagPresent
+        //      flip true and tried to read a tag that wasn't there.
+        //
+        // Trade-off: a user who plugs in the reader with a tag already on it
+        // doesn't get an auto-read on plug-in. They lift + re-place the tag
+        // once (or any other physical perturbation) and the next status
+        // event runs through the normal `isPresent` path below. That minor
+        // friction is far less disruptive than the previous behaviour of
+        // throwing a scary error on every plug-in.
         if (firstStatus) {
           firstStatus = false;
-          if (isPresent && !isEmpty && status.atr?.length) {
-            // ATR present means a tag is genuinely on the reader at startup
-            this.readerPresent.set(reader.name, true);
-            this.updateStatus({ tagPresent: true, tagUid: null });
-          }
           return;
         }
 
