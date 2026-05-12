@@ -38,6 +38,13 @@ describe("isPrivateIp — IPv4 block list", () => {
     ["192.168.1.1", "RFC1918 home routers"],
     ["100.64.0.1", "CG-NAT (RFC6598)"],
     ["100.127.255.254", "CG-NAT upper bound"],
+    // GH #228 — IETF protocol assignments + RFC 2544 benchmark range.
+    // Some carriers actually route these, so they're a real SSRF vector
+    // that the v1.16.1 isPrivateIp missed.
+    ["192.0.0.1", "192.0.0.0/24 IETF protocol assignments"],
+    ["192.0.0.255", "192.0.0.0/24 upper"],
+    ["198.18.0.1", "198.18.0.0/15 network benchmark lower"],
+    ["198.19.255.254", "198.18.0.0/15 network benchmark upper"],
     ["224.0.0.1", "multicast"],
     ["239.255.255.255", "multicast upper"],
     ["240.0.0.1", "240/4 reserved"],
@@ -60,6 +67,9 @@ describe("isPrivateIp — IPv4 block list", () => {
     "192.169.0.1", // just above 192.168/16
     "11.0.0.1", // just above 10/8
     "9.255.255.255", // just below 10/8
+    "192.0.1.1", // just above 192.0.0.0/24 (GH #228)
+    "198.17.255.255", // just below 198.18.0.0/15 (GH #228)
+    "198.20.0.1", // just above 198.18.0.0/15 (GH #228)
     "169.253.0.1", // just below link-local
     "169.255.0.1", // just above link-local
     "126.255.255.255", // just below loopback /8

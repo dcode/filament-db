@@ -243,8 +243,8 @@ describe("GH #224 — print-history concurrency + rollback", () => {
       sessionSpy.mockRestore();
       proto.save = originalSave;
     }
-    threw; // unused warning silencer
-    res; // unused warning silencer
+    void threw;
+    void res;
 
     const aAfter = await Filament.findById(a._id).lean();
     const bAfter = await Filament.findById(b._id).lean();

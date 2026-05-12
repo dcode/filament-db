@@ -110,9 +110,16 @@
       "get": {
         "tags": ["Filaments"],
         "summary": "Get filament by ID",
-        "description": "Returns a single filament with resolved inherited values (for variants), populated nozzle/printer references, and any child variants.",
+        "description": "Returns a single filament with resolved inherited values (for variants), populated nozzle/printer references, and any child variants. Pass `?raw=true` to skip parent-inheritance resolution and receive only the variant's own overrides — used by the edit page to avoid silently copying parent values onto the child (GH #106). When `?raw=true` is passed on a variant the response includes a `_parent` summary projection.",
         "parameters": [
-          { "$ref": "#/components/parameters/FilamentId" }
+          { "$ref": "#/components/parameters/FilamentId" },
+          {
+            "name": "raw",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["true", "false"] },
+            "description": "When 'true', skip parent-inheritance resolution and return only the variant's own field values. Fields the variant doesn't override come back as null. Required by the variant edit form so saving doesn't copy parent values onto the child."
+          }
         ],
         "responses": {
           "200": {

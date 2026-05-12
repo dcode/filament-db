@@ -3,7 +3,7 @@
 import { useState, useEffect, useMemo, useRef } from "react";
 import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
-import CollapsibleSection from "@/components/CollapsibleSection";
+import CollapsibleSection, { expandAndScrollToSection } from "@/components/CollapsibleSection";
 import FormToc, { FormTocMobileButton, type TocEntry } from "@/components/FormToc";
 
 interface BedTypeTempEntry {
@@ -779,7 +779,27 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
 
   return (
     <div className="lg:flex lg:gap-6 lg:items-start">
-    <form onSubmit={handleSubmit} className="space-y-4 flex-1 min-w-0">
+    <form
+      onSubmit={handleSubmit}
+      // GH #228: when HTML5 validation rejects a required input inside a
+      // collapsed CollapsibleSection, the browser focuses the invalid
+      // element and tries to scroll to it — but the field is `hidden`,
+      // so the user sees nothing and the form looks frozen.
+      // `expandAndScrollToSection` walks up from the invalid input to
+      // its enclosing `<section data-toc-section>` and opens it before
+      // the browser's default scroll runs. Use the capture phase
+      // because the `invalid` event doesn't bubble in the standard
+      // sense — capture lets us see it on the form root regardless.
+      onInvalidCapture={(e) => {
+        const target = e.target as HTMLElement | null;
+        if (!target) return;
+        const section = target.closest("section[id]") as HTMLElement | null;
+        if (section && section.id) {
+          expandAndScrollToSection(section.id);
+        }
+      }}
+      className="space-y-4 flex-1 min-w-0"
+    >
       {fetchErrors.length > 0 && (
         <div className="px-3 py-2 bg-yellow-50 dark:bg-yellow-900/30 border border-yellow-200 dark:border-yellow-800 rounded text-sm text-yellow-700 dark:text-yellow-300">
           {t("form.fetchError", { items: fetchErrors.join(", ") })}

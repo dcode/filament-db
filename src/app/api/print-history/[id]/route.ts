@@ -35,9 +35,21 @@ export async function DELETE(
         ? filament.spools.find((s) => String(s._id) === String(u.spoolId))
         : null;
       if (!spool) continue;
-      // Refund weight
+      // Refund weight. GH #228: clamp at the filament's
+      // `netFilamentWeight` ceiling when one is set, so undoing a job
+      // after the user manually corrected `totalWeight` downward (or
+      // ran multiple jobs since) can't push the spool above its
+      // physical full-spool capacity. If `netFilamentWeight` is unset
+      // (legacy filaments), behaviour matches the pre-#228 code (no
+      // upper bound). The filament-level cap is correct because every
+      // spool of the same filament shares the same full-spool weight.
       if (typeof spool.totalWeight === "number") {
-        spool.totalWeight = spool.totalWeight + u.grams;
+        const refunded = spool.totalWeight + u.grams;
+        const capacity = filament.netFilamentWeight;
+        spool.totalWeight =
+          typeof capacity === "number" && capacity > 0
+            ? Math.min(refunded, capacity)
+            : refunded;
       }
       // Remove the matching usageHistory entry by jobId. Older entries
       // written before the v1.12.x audit don't carry a jobId; for those

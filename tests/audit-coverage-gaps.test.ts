@@ -166,7 +166,7 @@ describe("GH #227 — audit coverage gaps", () => {
       // The save happened inside the (fake) transaction without rollback
       // support, so we can't assert pre-call state here. Documented:
       // production Atlas DOES roll back; the memory-server can't.
-      before; // touched
+      void before;
     });
   });
 
