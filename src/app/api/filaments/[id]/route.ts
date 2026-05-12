@@ -113,6 +113,15 @@ export async function PUT(
     const { id } = await params;
     delete body._id;
     delete body._deletedAt;
+    // GH #222 (P1 security): `_purged` is a sync-engine tombstone signal,
+    // not a client-writable field. Omitting this strip lets a caller send
+    // `{ "_purged": true }` in a regular PUT body, which persists the flag
+    // on an active (non-trashed) document. On the next hybrid-sync cycle
+    // the engine propagates the purge to the peer DB, effectively
+    // permanent-deleting the filament across both sides without going
+    // through the trash → permanent-delete UI gate that's supposed to
+    // require `_deletedAt != null` first. Repro: see the issue body.
+    delete body._purged;
     delete body.createdAt;
     delete body.updatedAt;
     delete body.__v;

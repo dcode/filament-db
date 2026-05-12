@@ -63,9 +63,13 @@ export async function POST(request: NextRequest) {
       let updated = 0;
 
       for (const remote of remoteFilaments) {
-        // Strip MongoDB internal fields
+        // Strip MongoDB internal fields. GH #222: include `_purged` so an
+        // import from an Atlas source that has the tombstone flag set
+        // doesn't inadvertently mark the local copy purged — and so a
+        // crafted Atlas connection can't be used as a tombstone-injection
+        // vector against a victim's local DB.
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { _id: _remoteId, __v: _remoteV, createdAt: _createdAt, updatedAt: _updatedAt, _deletedAt: _remoteDeleted, ...filamentData } = remote;
+        const { _id: _remoteId, __v: _remoteV, createdAt: _createdAt, updatedAt: _updatedAt, _deletedAt: _remoteDeleted, _purged: _remotePurged, ...filamentData } = remote;
 
         // Strip every foreign-ObjectId reference — they point at documents
         // in the *source* Atlas database and won't resolve locally. Leaving
