@@ -4,6 +4,7 @@ import Printer from "@/models/Printer";
 import Filament from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { findNozzleConflicts } from "@/lib/nozzleConflicts";
 
 export async function GET(
   _request: NextRequest,
@@ -55,6 +56,30 @@ export async function PUT(
       });
       if (activeCount !== body.installedNozzles.length) {
         return errorResponse("One or more selected nozzles no longer exist.", 400);
+      }
+
+      // GH #232 — a physical nozzle can only live in one printer at a
+      // time. Reject the request with a structured 409 listing the
+      // conflicting nozzles + the printer that currently claims each
+      // one. The client (PrinterForm) reads the `conflicts[]` payload to
+      // offer a Move / Clone / Cancel prompt rather than just showing
+      // a raw error. See src/lib/nozzleConflicts.ts for the rationale
+      // on keeping resolution client-side instead of adding a `force`
+      // flag here.
+      const conflicts = await findNozzleConflicts(
+        Printer,
+        Nozzle,
+        body.installedNozzles,
+        id,
+      );
+      if (conflicts.length > 0) {
+        return NextResponse.json(
+          {
+            error: "Nozzle is already installed in another printer",
+            conflicts,
+          },
+          { status: 409 },
+        );
       }
     }
 

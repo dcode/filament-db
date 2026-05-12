@@ -2,12 +2,16 @@
 
 import { useEffect, useState, useRef } from "react";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { NozzleConflictError, type NozzleConflict } from "@/lib/nozzleConflicts";
 
 interface Nozzle {
   _id: string;
   name: string;
   diameter: number;
   type: string;
+  /** GH #232 — server-side enrichment in /api/nozzles GET. Each entry is
+   * a printer that currently has this nozzle in its installedNozzles. */
+  printers?: { _id: string; name: string }[];
 }
 
 interface AmsSlotEntry {
@@ -41,6 +45,10 @@ interface PrinterFormData {
 }
 
 interface PrinterInitialData {
+  /** GH #232 — present on edit (the route returns `_id` via .lean());
+   * absent on create. Used to filter "in use by another printer" from
+   * "in use by this printer" when rendering the inline conflict badge. */
+  _id?: string;
   name?: string;
   manufacturer?: string;
   printerModel?: string;
@@ -108,6 +116,18 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const savedRef = useRef(false);
+  // GH #232 — when the parent's onSubmit throws NozzleConflictError, we
+  // store the conflicts here to open the resolution modal. `null` means
+  // no modal is showing. Resolution writes back into form state +
+  // re-invokes onSubmit on confirm.
+  const [pendingConflicts, setPendingConflicts] = useState<NozzleConflict[] | null>(null);
+  // Per-conflict user choice. Default = "clone" because that's the safe
+  // path (creates a new nozzle for this printer, leaves the other
+  // printer untouched). "move" silently strips the nozzle from the
+  // other printer, which is more destructive.
+  const [conflictChoices, setConflictChoices] = useState<Record<string, "clone" | "move">>({});
+  const [resolvingConflicts, setResolvingConflicts] = useState(false);
+  const [conflictError, setConflictError] = useState<string | null>(null);
 
   // Warn on unsaved changes when navigating away
   useEffect(() => {
@@ -203,35 +223,172 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
     return Number.isFinite(n) ? n : null;
   };
 
+  // Hoisted out of handleSubmit so it can be re-invoked after the user
+  // resolves nozzle conflicts in the modal.
+  const buildSubmitPayload = (
+    installedNozzles: string[] = form.installedNozzles,
+  ): Record<string, unknown> => ({
+    name: form.name,
+    manufacturer: form.manufacturer,
+    printerModel: form.printerModel,
+    installedNozzles,
+    notes: form.notes,
+    buildVolume: {
+      x: parseNum(form.buildVolume.x),
+      y: parseNum(form.buildVolume.y),
+      z: parseNum(form.buildVolume.z),
+    },
+    maxFlow: parseNum(form.maxFlow),
+    maxSpeed: parseNum(form.maxSpeed),
+    enclosed: form.enclosed,
+    autoBedLevel: form.autoBedLevel,
+    amsSlots: form.amsSlots.map((s) => ({
+      slotName: s.slotName,
+      filamentId: s.filamentId,
+      spoolId: s.spoolId,
+    })),
+  });
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaving(true);
     try {
-      await onSubmit({
-        name: form.name,
-        manufacturer: form.manufacturer,
-        printerModel: form.printerModel,
-        installedNozzles: form.installedNozzles,
-        notes: form.notes,
-        buildVolume: {
-          x: parseNum(form.buildVolume.x),
-          y: parseNum(form.buildVolume.y),
-          z: parseNum(form.buildVolume.z),
-        },
-        maxFlow: parseNum(form.maxFlow),
-        maxSpeed: parseNum(form.maxSpeed),
-        enclosed: form.enclosed,
-        autoBedLevel: form.autoBedLevel,
-        amsSlots: form.amsSlots.map((s) => ({
-          slotName: s.slotName,
-          filamentId: s.filamentId,
-          spoolId: s.spoolId,
-        })),
-      });
+      await onSubmit(buildSubmitPayload());
       savedRef.current = true;
       setDirty(false);
+    } catch (err) {
+      // GH #232 — a 409 nozzle conflict thrown by the parent's onSubmit
+      // routes to the resolution modal instead of the generic
+      // error-toast path. Anything else propagates as before.
+      if (err instanceof NozzleConflictError) {
+        // Default every conflict to "clone" — safer than silently
+        // stripping the nozzle off another printer.
+        const choices: Record<string, "clone" | "move"> = {};
+        for (const c of err.conflicts) choices[c.nozzleId] = "clone";
+        setConflictChoices(choices);
+        setPendingConflicts(err.conflicts);
+        setConflictError(null);
+      } else {
+        throw err;
+      }
     } finally {
       setSaving(false);
+    }
+  };
+
+  /**
+   * Apply the user's resolution choices, then retry the save. Order:
+   *   1. For every "move" choice, GET the other printer, PUT it with
+   *      the nozzle stripped from its installedNozzles.
+   *   2. For every "clone" choice, POST /api/nozzles/{id}/clone, get
+   *      the new id, swap it into the local installedNozzles state.
+   *   3. Retry onSubmit with the updated installedNozzles.
+   *
+   * If anything goes wrong mid-resolution we surface the error inside
+   * the modal so the user can retry without losing their other
+   * choices.
+   */
+  const resolveConflicts = async () => {
+    if (!pendingConflicts) return;
+    setResolvingConflicts(true);
+    setConflictError(null);
+    try {
+      // Build the next installedNozzles array by walking the form state
+      // and substituting clone ids where the user chose "clone".
+      const cloneSubstitutions = new Map<string, string>();
+      for (const c of pendingConflicts) {
+        const choice = conflictChoices[c.nozzleId];
+        if (choice === "clone") {
+          const res = await fetch(`/api/nozzles/${c.nozzleId}/clone`, {
+            method: "POST",
+          });
+          if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            throw new Error(
+              body?.error || `Failed to clone "${c.nozzleName || c.nozzleId}"`,
+            );
+          }
+          const cloned = await res.json();
+          cloneSubstitutions.set(c.nozzleId, String(cloned._id));
+        } else if (choice === "move") {
+          // Load the other printer to strip the nozzle off, then PUT
+          // it back. Two round-trips — fine, this is one-shot UX work.
+          const getRes = await fetch(`/api/printers/${c.otherPrinterId}`);
+          if (!getRes.ok) {
+            throw new Error(
+              `Couldn't load "${c.otherPrinterName}" to move "${c.nozzleName || c.nozzleId}".`,
+            );
+          }
+          const other = await getRes.json();
+          const otherInstalled: string[] = (other.installedNozzles || []).map(
+            (n: { _id: string } | string) =>
+              typeof n === "string" ? n : n._id,
+          );
+          const stripped = otherInstalled.filter((nid) => nid !== c.nozzleId);
+          const putRes = await fetch(`/api/printers/${c.otherPrinterId}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...other,
+              installedNozzles: stripped,
+            }),
+          });
+          if (!putRes.ok) {
+            const body = await putRes.json().catch(() => null);
+            throw new Error(
+              body?.error ||
+                `Failed to move "${c.nozzleName || c.nozzleId}" off "${c.otherPrinterName}".`,
+            );
+          }
+        }
+      }
+
+      // Substitute clone ids in form state. Move choices leave the
+      // original id in place (the nozzle now lives on this printer
+      // unchanged).
+      const resolvedInstalled = form.installedNozzles.map(
+        (nid) => cloneSubstitutions.get(nid) ?? nid,
+      );
+      // Update form state so the checkbox list reflects the new clones
+      // immediately — and so any subsequent submit uses the resolved
+      // ids without re-running resolution.
+      setForm((f) => ({ ...f, installedNozzles: resolvedInstalled }));
+
+      // Re-fetch the nozzle list so the new clones appear as checked
+      // entries instead of orphaned ids.
+      const nozzlesRes = await fetch("/api/nozzles");
+      if (nozzlesRes.ok) {
+        const next = await nozzlesRes.json();
+        setNozzles(next);
+      }
+
+      // Close the modal and re-submit.
+      setPendingConflicts(null);
+      setSaving(true);
+      try {
+        await onSubmit(buildSubmitPayload(resolvedInstalled));
+        savedRef.current = true;
+        setDirty(false);
+      } catch (err) {
+        // If the retry also returns a conflict (e.g. a third printer
+        // claimed the nozzle between the first 409 and now), surface
+        // it as a fresh modal instead of double-nesting.
+        if (err instanceof NozzleConflictError) {
+          const choices: Record<string, "clone" | "move"> = {};
+          for (const c of err.conflicts) choices[c.nozzleId] = "clone";
+          setConflictChoices(choices);
+          setPendingConflicts(err.conflicts);
+          setConflictError(null);
+        } else {
+          throw err;
+        }
+      } finally {
+        setSaving(false);
+      }
+    } catch (err) {
+      setConflictError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setResolvingConflicts(false);
     }
   };
 
@@ -459,23 +616,42 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
           <label className={labelClass}>{t("printers.form.nozzles")}</label>
           <p className="text-xs text-gray-500 mb-2">{t("printers.form.nozzlesHint")}</p>
           <div className="grid grid-cols-2 gap-2">
-            {nozzles.map((n) => (
-              <label
-                key={n._id}
-                className="flex items-center gap-2 px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer text-sm"
-              >
-                <input
-                  type="checkbox"
-                  checked={form.installedNozzles.includes(n._id)}
-                  onChange={() => toggleNozzle(n._id)}
-                  className="w-4 h-4 rounded"
-                />
-                <span>{n.name}</span>
-                <span className="text-gray-500 text-xs">
-                  {n.diameter}mm {n.type}
-                </span>
-              </label>
-            ))}
+            {nozzles.map((n) => {
+              // GH #232 — surface which other printer currently has this
+              // nozzle installed, so the user can see the conflict
+              // *before* they save. Empty when no other printer claims
+              // it (the common case on a clean DB).
+              const otherPrinters = (n.printers ?? []).filter(
+                (p) => p._id !== initialData?._id,
+              );
+              return (
+                <label
+                  key={n._id}
+                  className="flex items-center gap-2 px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer text-sm"
+                >
+                  <input
+                    type="checkbox"
+                    checked={form.installedNozzles.includes(n._id)}
+                    onChange={() => toggleNozzle(n._id)}
+                    className="w-4 h-4 rounded"
+                  />
+                  <span>{n.name}</span>
+                  <span className="text-gray-500 text-xs">
+                    {n.diameter}mm {n.type}
+                  </span>
+                  {otherPrinters.length > 0 && (
+                    <span
+                      className="ml-auto px-1.5 py-0.5 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 rounded text-[10px] whitespace-nowrap"
+                      title={t("printers.form.nozzleInUseTip")}
+                    >
+                      {t("printers.form.nozzleInUseLabel", {
+                        printer: otherPrinters.map((p) => p.name).join(", "),
+                      })}
+                    </span>
+                  )}
+                </label>
+              );
+            })}
           </div>
         </div>
       )}
@@ -498,6 +674,118 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
       >
         {saving ? t("printers.form.saving") : initialData ? t("printers.form.update") : t("printers.form.create")}
       </button>
+
+      {/* GH #232 — nozzle-conflict resolution modal. Renders inside the
+       *  form element so the user's submit context stays intact; the
+       *  modal's primary action triggers the resolution flow + a retry. */}
+      {pendingConflicts && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="nozzle-conflict-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+        >
+          <div className="w-full max-w-lg bg-white dark:bg-gray-900 rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-5 space-y-4">
+            <h2
+              id="nozzle-conflict-title"
+              className="text-lg font-semibold text-gray-900 dark:text-gray-100"
+            >
+              {t("printers.form.nozzleConflictTitle")}
+            </h2>
+            <p className="text-sm text-gray-600 dark:text-gray-300">
+              {t("printers.form.nozzleConflictHint")}
+            </p>
+
+            <div className="space-y-3 max-h-72 overflow-y-auto">
+              {pendingConflicts.map((c) => (
+                <div
+                  key={c.nozzleId}
+                  className="border border-gray-200 dark:border-gray-700 rounded p-3 text-sm"
+                >
+                  <div className="font-medium text-gray-900 dark:text-gray-100">
+                    {c.nozzleName ?? c.nozzleId}
+                  </div>
+                  <div className="text-xs text-gray-500 mb-2">
+                    {t("printers.form.nozzleConflictCurrentlyIn", {
+                      printer: c.otherPrinterName,
+                    })}
+                  </div>
+                  <div className="flex flex-col gap-1">
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name={`nozzle-conflict-${c.nozzleId}`}
+                        value="clone"
+                        checked={conflictChoices[c.nozzleId] === "clone"}
+                        onChange={() =>
+                          setConflictChoices((prev) => ({
+                            ...prev,
+                            [c.nozzleId]: "clone",
+                          }))
+                        }
+                      />
+                      <span className="text-gray-800 dark:text-gray-200">
+                        {t("printers.form.nozzleConflictChoiceClone")}
+                      </span>
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input
+                        type="radio"
+                        name={`nozzle-conflict-${c.nozzleId}`}
+                        value="move"
+                        checked={conflictChoices[c.nozzleId] === "move"}
+                        onChange={() =>
+                          setConflictChoices((prev) => ({
+                            ...prev,
+                            [c.nozzleId]: "move",
+                          }))
+                        }
+                      />
+                      <span className="text-gray-800 dark:text-gray-200">
+                        {t("printers.form.nozzleConflictChoiceMove", {
+                          printer: c.otherPrinterName,
+                        })}
+                      </span>
+                    </label>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {conflictError && (
+              <div className="text-sm text-red-600 dark:text-red-400">
+                {conflictError}
+              </div>
+            )}
+
+            <div className="flex gap-2 justify-end">
+              <button
+                type="button"
+                disabled={resolvingConflicts}
+                onClick={() => {
+                  // Cancel — close modal, leave form as the user had it.
+                  // They can uncheck the conflicting nozzles and re-submit.
+                  setPendingConflicts(null);
+                  setConflictError(null);
+                }}
+                className="px-4 py-2 text-sm rounded border border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-50"
+              >
+                {t("common.cancel")}
+              </button>
+              <button
+                type="button"
+                disabled={resolvingConflicts}
+                onClick={resolveConflicts}
+                className="px-4 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                {resolvingConflicts
+                  ? t("printers.form.nozzleConflictResolving")
+                  : t("printers.form.nozzleConflictApply")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </form>
   );
 }
