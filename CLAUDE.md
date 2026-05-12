@@ -34,7 +34,7 @@ src/app/api/        REST API (incl. v1.11: /locations, /print-history, /analytic
 src/components/     React components (NfcProvider, Toast, dialogs, ThemeProvider, UpdateBanner, AppNav)
 src/hooks/          Custom hooks (useNfc, useCurrency)
 src/i18n/           Translations + provider (en, de)
-src/lib/            Core logic (openprinttag CBOR, NDEF, TDS extraction, INI parser, CSV parser, image compression, theme init script, spool validator, PrusaSlicer bundle, OpenPrintTag DB browser, safeRenderUrl, inventoryStats, externalUrlGuard)
+src/lib/            Core logic (openprinttag CBOR + decode, NDEF, TDS extraction, INI parser, CSV parser, image compression, theme init script, spool validator, PrusaSlicer + OrcaSlicer bundles, OpenPrintTag DB browser, safeRenderUrl, inventoryStats, externalUrlGuard, apiErrorHandler, customCurrency, exportFilaments, exportSpools, importFilaments, resolveFilament, sortFilamentList, prusament)
 src/models/         Mongoose schemas (Filament, Nozzle, Printer, BedType, Location, PrintHistory, SharedCatalog)
 src/types/          TypeScript type defs (electron.d.ts, filament.ts)
 electron/           Electron main process (main.ts, preload.ts, ndef.ts, bambu-tag.ts, auto-updater.ts)
@@ -57,7 +57,7 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 
 - **Framework**: Custom React Context-based i18n (no external library), following the useCurrency pattern
 - **Provider**: `src/i18n/TranslationProvider.tsx` — provides `t(key, params?)`, `locale`, `setLocale`
-- **Locales**: `src/i18n/locales/en.json` (English), `src/i18n/locales/de.json` (German) — 737+ flat key-value pairs
+- **Locales**: `src/i18n/locales/en.json` (English), `src/i18n/locales/de.json` (German) — ~1100 flat key-value pairs (count drifts on every PR — `jq 'keys|length' src/i18n/locales/en.json` for current)
 - **Interpolation**: `{paramName}` tokens in translation strings, e.g. `t("sync.time.minutesAgo", { count: 5 })`
 - **Fallback chain**: current locale → English → raw key
 - **Persistence**: electron-store (desktop) or localStorage (web), key `filamentdb-locale`
@@ -66,7 +66,7 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 
 ## Testing
 
-- 868+ tests across 47+ files (unit + Mongoose model + Next.js route handlers). Exact counts drift on every PR — run `npm test` for the current numbers.
+- ~1100 tests across ~60 files (unit + Mongoose model + Next.js route handlers). Exact counts drift on every PR — run `npm test` for the current numbers.
 - Coverage thresholds: 80% lines/statements, 90% functions, 75% branches (enforced on `src/lib/**` and `src/models/**`; `src/lib/compressImage.ts` is excluded because its main flow is DOM-only)
 - Setup file: `tests/setup.ts` (mongodb-memory-server). **Caveat**: setup wipes `mongoose.models` between tests; route-level tests that use `.populate(...)` must re-register models in `beforeEach` by calling `mongoose.model(name, schema)` directly (see `tests/locations-route.test.ts` for the pattern).
 - Tests run in CI on Node 20 and 22
@@ -97,9 +97,14 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 - **PrusaSlicer Filament Edition**: [hyiger/PrusaSlicer](https://github.com/hyiger/PrusaSlicer) has a `FilamentDB` module that fetches presets on startup via the REST API, syncs changes back with per-nozzle calibration context
 - **Port**: Dev and desktop use port **3456** (`next dev -p 3456`, Electron startup). Docker exposes the app on container port **3000** and is normally mapped with `-p 3456:3000`. PrusaSlicer defaults to `http://localhost:3456`.
 
+## OrcaSlicer Integration
+
+- **Config bundle API**: `GET /api/filaments/orcaslicer` exports filaments as an OrcaSlicer bundle; `POST /api/filaments/{id}/orcaslicer` syncs a single preset back. Mirrors the PrusaSlicer shape — the field mapping in `src/lib/orcaSlicerBundle.ts` differs in key names but the round-trip + nil-handling rules are the same.
+- **Calibration context**: same per-nozzle / high-flow query-param convention as PrusaSlicer. The OrcaSlicer fork uses the same FilamentDB module shape, so both slicers can share calibration history on the same filament.
+
 ## OpenPrintTag Database Browser
 
-- **Page**: `/openprinttag` — browse the OpenPrintTag community database (11k+ materials)
+- **Page**: `/openprinttag` — browse the OpenPrintTag community database (~11k FFF materials at time of writing — count grows; the `/api/openprinttag` response carries `totalFFF` for the live number)
 - **API**: `GET /api/openprinttag` fetches GitHub tarball, parses YAML, filters to FFF, caches 1 hour
 - **Import**: `POST /api/openprinttag/import` with `{ slugs: [...] }` — upserts by name
 - **Completeness scoring**: 0–10 scale (color, density, print temps, bed temps, drying temp, hardness, TD, chamber, photos, url)
@@ -126,5 +131,26 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 - **Atlas read-only sync error UX (#143)**: `wrapSyncErrorMessage()` in `electron/sync-service.ts` detects the MongoDB driver's unauthorized shape (regex on `user is not allowed to do action` OR `code === 13`) and replaces the raw text with an actionable hint that names the DB, recommends a `readWrite` role, and points the user at Settings → Connection.
 - **Filament list aggregation projection**: `GET /api/filaments` uses an aggregation pipeline that drops heavy spool subfields (`photoDataUrl`, `usageHistory`, `dryCycles`), keeps only `temperatures.nozzle` + `temperatures.bed`, and surfaces a `hasCalibrations` boolean computed from variant + parent (via `$lookup`, so inheriting variants are correctly counted as calibrated). The summary preserves `tdsUrl` (for FilamentForm vendor suggestions) and `spools[].label` (for the AMS slot picker). The "Missing calibration" quick filter on the list page now actually works (was a no-op before).
 - **Inventory list helpers extracted + consistent on retired spools**: `getRemainingPct`, `getSpoolCount`, `getRemainingGrams` extracted from `src/app/page.tsx` into `src/lib/inventoryStats.ts` and now all three exclude retired spools (previously only the grams helper did, so a filament with one active + one retired spool would show "2 spools, 75% remaining" while the low-stock chip considered it nearly empty).
+
+## v1.14 Features
+
+- **`asar`-bundled standalone server window-show safety net (#176/#179)**: Electron used to wait for the embedded Next.js server's first paint before showing the window. On slow Windows hosts that paint never fires inside the splash timeout and users see a "white window" forever. The main process now resolves on whichever happens first — `did-finish-load` or a hard 8-second timeout — and a hotfix in 1.14.3 reverted asar packaging for the embedded server because it broke `process.cwd()`-relative file reads.
+- **Anti-FOUC theme bootstrap (#205/#209)**: `src/lib/themeInitScript.ts` runs as a `<script>` element injected by `ThemeProvider`. The earlier inline-string form tripped React's "script tag in component" warning when streamed via RSC; the current form passes both the warning check and CSP nonce gating (still pending — see #225).
+- **Analytics "+N manual" hint (#204/#208)**: When `usage.length === 0` but `spool.usageHistory[].source === "manual"` entries cover the totals, the analytics page now surfaces a "+N manual" annotation instead of looking like the totals came from nowhere.
+- **Phantom-spool POST guard (#203/#207)**: `POST /api/filaments/{id}/spools` with an empty body no longer creates a phantom 0g spool. Validates `totalWeight` shape and refuses with 400 if absent.
+
+## v1.15 Features
+
+- **Filament trash workflow (#213)**: `DELETE /api/filaments/{id}` soft-deletes (sets `_deletedAt`). New endpoints `GET /api/filaments/trash` and `POST /api/filaments/{id}/restore`. Permanent delete via `DELETE /api/filaments/{id}?permanent=true` — requires the doc to already be in the trash (the active → trash → purge gating is enforced server-side, not just in the UI). Parent-with-trashed-variants refusal at both delete steps.
+- **`_purged` tombstone for sync-safe permanent delete (Codex P1 #213)**: hard-delete on one peer would get resurrected by the hybrid-sync engine on the next cycle. Permanent-delete now sets `_purged: true` instead of removing the row; the sync engine treats `_purged` as a one-way propagation signal so both sides converge to the same gone-forever state. **Security note (#222)**: `_purged` must be stripped from all client-writable bodies — see the strip block in `src/app/api/filaments/{,/[id]}/route.ts`.
+- **Partial-unique-on-non-deleted index on `name`** in `Filament` (and parallel updates to `Nozzle`, `Printer`, `BedType`, `Location`, `SharedCatalog`). A new active filament can reuse the name of a trashed one; restore refuses with 409 if the original name now conflicts with another active row.
+- **`/trash` and `/import-export` pages**: top-level UI surfaces for the workflows above, reachable from Settings.
+- **Snapshot schema v4**: `GET /api/snapshot` and `POST /api/snapshot/restore` carry trash + tombstone state so backup/restore round-trips don't lose the trash.
+
+## v1.16 Features
+
+- **FilamentForm collapsible sections + sticky TOC sidebar (#214)**: the long Edit Filament form (~2300 lines, 12 fieldsets) now chunks into collapsible sections via `src/components/CollapsibleSection.tsx`, with a `src/components/FormToc.tsx` sidebar that scroll-spies the active section. Required identity fields (name, vendor, type, parent) stay always-visible at the top. Per-section open/closed state persists in `localStorage`. An imperative helper `expandAndScrollToSection(id)` is exported for "open the offending section + scroll" on validation error.
+- **Audit sweep #1 (PR #221, covers #215-#220)**: npm `overrides` to force-patch postcss past Next's nested copy; `npm start` repointed at `node .next/standalone/server.js` (incompatible with `next start` under standalone output); OpenAPI gained trash + restore + `?permanent=true` documentation; required form labels associated via `id` + `htmlFor`; Vitest's Vite dynamic-import warnings + Mongoose `new: true|false` deprecation warnings cleaned up; new CI `smoke` workflow job (mongo:7 service + standalone build + curl checks against `/`, `/dashboard`, `/api-docs`, `/api/openapi`, `/api/filaments`).
+- **Audit sweep #2 (this branch, covers #222-#228)**: P1 security fix for the `_purged` client-writable gadget (#222); variant-inheritance resolution in `/spool-check`, `/analytics`, and the restore handler (#223); print-history concurrency with optimistic concurrency control + sequential-fallback rollback (#224); `/api/openprinttag` cold-fetch retry + CSP header (#225); coverage for the previously-untested transaction branch + tdsExtractor error paths + row-limit route-level translation (#227); polish bucket (#228).
 
 Note: SLIX2 NFC tags have write-protected block 79. The NDEF wrapper reserves the last 4 bytes (`usableMemory = tagMemorySize - 4`).
