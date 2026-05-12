@@ -142,7 +142,7 @@ async function seed() {
     const nozzle = await Nozzle.findOneAndUpdate(
       { name },
       { name, diameter: spec.diameter, type: "Brass", highFlow: spec.highFlow },
-      { upsert: true, new: true, returnDocument: "after" }
+      { upsert: true, returnDocument: "after" }
     );
     nozzleIdMap.set(name, nozzle._id);
     console.log(`  ✓ ${name} (${spec.diameter}mm, ${spec.highFlow ? "high-flow" : "standard"})`);
@@ -159,7 +159,7 @@ async function seed() {
     await Filament.findOneAndUpdate(
       { name: filament.name },
       { ...filament, compatibleNozzles: nozzleIds },
-      { upsert: true, new: true, returnDocument: "after" }
+      { upsert: true, returnDocument: "after" }
     );
 
     const nozzleInfo = nozzleNames.length > 0 ? ` [${nozzleNames.join(", ")}]` : "";

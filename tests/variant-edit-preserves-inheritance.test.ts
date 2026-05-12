@@ -28,15 +28,22 @@ describe("variant edit round-trip preserves inheritance", () => {
   let Filament: any;
 
   beforeEach(async () => {
+    // Static imports — `await import("@/models/${name}")` triggered a Vite
+    // dynamic-import warning ("file extension must be included in the static
+    // part") because the matcher couldn't pre-resolve the path.
     const filamentMod = await import("@/models/Filament");
     if (!mongoose.models.Filament) {
       mongoose.model("Filament", filamentMod.default.schema);
     }
     // Models that GET populates — without these registered the
     // populate() call throws "Schema hasn't been registered".
-    for (const name of ["Nozzle", "Printer", "BedType"] as const) {
+    const referenced = [
+      ["Nozzle", await import("@/models/Nozzle")],
+      ["Printer", await import("@/models/Printer")],
+      ["BedType", await import("@/models/BedType")],
+    ] as const;
+    for (const [name, mod] of referenced) {
       if (!mongoose.models[name]) {
-        const mod = await import(`@/models/${name}`);
         mongoose.model(name, mod.default.schema);
       }
     }

@@ -811,8 +811,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
       )}
 
       <div>
-        <label className={labelClass}>{t("form.name")} *</label>
+        <label className={labelClass} htmlFor="filament-name">{t("form.name")} *</label>
         <input
+          id="filament-name"
           className={inputClass}
           value={form.name}
           onChange={(e) => setForm({ ...form, name: e.target.value })}
@@ -2161,6 +2162,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                 <div className="flex items-center gap-2 mb-2">
                   <input
                     type="text"
+                    aria-label={t("form.placeholder.presetLabel")}
                     className={inputClass}
                     value={preset.label}
                     onChange={(e) => updatePreset(idx, "label", e.target.value)}

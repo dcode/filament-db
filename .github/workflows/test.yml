@@ -51,3 +51,103 @@ jobs:
         with:
           name: coverage-report
           path: coverage/
+
+  smoke:
+    # Boot the production standalone build and curl a handful of routes so a
+    # bad next.config / standalone-output regression is caught before release.
+    # `npm run build` already runs on the test matrix above; we rebuild here
+    # because workflow jobs don't share build artifacts and copying them
+    # across jobs costs more time than just rebuilding.
+    runs-on: ubuntu-latest
+    needs: test
+
+    services:
+      mongo:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Standalone server reads MONGODB_URI from env at request time.
+      MONGODB_URI: mongodb://localhost:27017/filament-db-smoke
+      # Bind to 3456 (the project's canonical dev/desktop port) so the curl
+      # URLs match what a developer would hit locally.
+      PORT: "3456"
+      HOSTNAME: "127.0.0.1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install PC/SC development headers (Linux)
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build (standalone)
+        run: npm run build
+
+      - name: Stage standalone runtime (public + static)
+        # `output: "standalone"` copies node_modules + server.js but not
+        # public/ or .next/static — Next's docs say to copy those in
+        # manually so the production server can serve assets and routes
+        # like /api/openapi (which reads public/openapi.json).
+        run: |
+          cp -R public .next/standalone/public
+          mkdir -p .next/standalone/.next
+          cp -R .next/static .next/standalone/.next/static
+
+      - name: Start standalone server
+        run: |
+          npm start &
+          echo "$!" > .smoke-server.pid
+          # Wait until the server is accepting connections (max ~60s).
+          for i in $(seq 1 60); do
+            if curl -sS -o /dev/null "http://127.0.0.1:${PORT}/api/openapi"; then
+              echo "server is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "server failed to start within 60s" >&2
+          exit 1
+
+      - name: Smoke check core routes
+        run: |
+          set -euo pipefail
+          fail=0
+          check() {
+            local path="$1"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:${PORT}${path}")
+            if [ "$code" = "200" ]; then
+              echo "  ok  $path → $code"
+            else
+              echo "  FAIL $path → $code" >&2
+              fail=1
+            fi
+          }
+          check /
+          check /dashboard
+          check /api-docs
+          check /api/openapi
+          check /api/filaments
+          exit $fail
+
+      - name: Stop standalone server
+        if: always()
+        run: |
+          if [ -f .smoke-server.pid ]; then
+            kill "$(cat .smoke-server.pid)" 2>/dev/null || true
+          fi

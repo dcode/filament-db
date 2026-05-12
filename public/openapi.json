@@ -270,9 +270,15 @@
       "delete": {
         "tags": ["Filaments"],
         "summary": "Delete filament",
-        "description": "Soft-deletes a filament by setting _deletedAt. Cannot delete a parent that still has variants.",
+        "description": "By default this is a soft delete that sets _deletedAt — the filament moves to the trash and can be restored via POST /api/filaments/{id}/restore. Pass ?permanent=true to mark the row as purged (sets _purged so the hybrid sync engine propagates the deletion to peers); the filament must already be in the trash. Cannot delete a parent that still has variants.",
         "parameters": [
-          { "$ref": "#/components/parameters/FilamentId" }
+          { "$ref": "#/components/parameters/FilamentId" },
+          {
+            "name": "permanent",
+            "in": "query",
+            "schema": { "type": "string", "enum": ["true", "false"] },
+            "description": "When 'true', permanently purges a trashed filament instead of soft-deleting. The filament must already be in the trash (i.e. previously soft-deleted)."
+          }
         ],
         "responses": {
           "200": {
@@ -289,7 +295,7 @@
             }
           },
           "400": {
-            "description": "Cannot delete — has variants",
+            "description": "Cannot delete — has variants, or permanent delete attempted on a filament that isn't in the trash",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" }
@@ -298,6 +304,96 @@
           },
           "404": {
             "description": "Filament not found",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filaments/trash": {
+      "get": {
+        "tags": ["Filaments"],
+        "summary": "List trashed filaments",
+        "description": "Returns soft-deleted filaments (those with a non-null _deletedAt), sorted by deletion time descending. Permanently-purged tombstones (_purged: true) are excluded — they remain in the collection only so the hybrid sync engine can propagate the purge to peers and should never reappear in the trash UI.",
+        "responses": {
+          "200": {
+            "description": "List of trashed filaments (lightweight projection)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "_id": { "type": "string" },
+                      "name": { "type": "string" },
+                      "vendor": { "type": "string" },
+                      "type": { "type": "string" },
+                      "color": { "type": "string" },
+                      "cost": { "type": "number", "nullable": true },
+                      "parentId": { "type": "string", "nullable": true },
+                      "_deletedAt": { "type": "string", "format": "date-time" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to list trash",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/filaments/{id}/restore": {
+      "post": {
+        "tags": ["Filaments"],
+        "summary": "Restore filament from trash",
+        "description": "Un-soft-deletes a trashed filament by clearing _deletedAt. Refuses with 409 if another active filament now uses the same name — the partial unique index on `name` only covers non-deleted documents, so the caller has to rename one or the other before the restore can succeed.",
+        "parameters": [
+          { "$ref": "#/components/parameters/FilamentId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Restored",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string", "example": "Restored" },
+                    "_id": { "type": "string" }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Filament not in trash (either does not exist, was never soft-deleted, or has already been permanently purged)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "409": {
+            "description": "Name conflict — another active filament already uses this name",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          },
+          "500": {
+            "description": "Failed to restore filament",
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/Error" }
