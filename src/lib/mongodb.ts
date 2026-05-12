@@ -181,6 +181,18 @@ export default async function dbConnect() {
 
         // First printer keeps the original ref. For every other
         // printer, mint a clone and swap the reference.
+        //
+        // Codex P1 review on PR #233: the swap must be atomic at the
+        // printer-document level. A naive `$pull` followed by
+        // `$addToSet` would lose the assignment if the second write
+        // fails (transient DB error, process restart) — and the next
+        // migration retry wouldn't recover because the nozzle is no
+        // longer duplicated in `refCount`. Fix: build the new
+        // installedNozzles array client-side and write the whole array
+        // back with a single `$set`. If THAT write fails before
+        // success, delete the clone so the next retry starts clean
+        // (otherwise we'd accumulate orphaned "Name #N" rows on every
+        // failed run).
         for (let i = 1; i < refs.length; i++) {
           const printerId = refs[i].printerId;
           const newName = nextCloneName(source.name, peerNames);
@@ -193,19 +205,45 @@ export default async function dbConnect() {
             hardened: source.hardened,
             notes: source.notes,
           });
-          // Swap the reference on the printer: remove the original
-          // nozzleId, add the clone's id. Done in two ops to keep this
-          // straightforward — bulkWrite would be marginally faster but
-          // the duplicate count is tiny (a handful at most).
-          await Printer.updateOne(
-            { _id: printerId },
-            { $pull: { installedNozzles: source._id } },
-          );
-          await Printer.updateOne(
-            { _id: printerId },
-            { $addToSet: { installedNozzles: clone._id } },
-          );
-          clonesCreated++;
+
+          try {
+            // Read the printer's current installedNozzles fresh, build
+            // the swapped array, write it back atomically. Done as a
+            // single $set so the on-disk state never sees the
+            // intermediate "nozzle removed, clone not yet attached"
+            // window the split-update version had.
+            const fresh = await Printer.findById(printerId)
+              .select("installedNozzles")
+              .lean();
+            if (!fresh) {
+              throw new Error(
+                `printer ${printerId} disappeared mid-migration`,
+              );
+            }
+            const installed: (mongoose.Types.ObjectId | string)[] =
+              fresh.installedNozzles || [];
+            const swapped = installed.map((nid) =>
+              String(nid) === String(source._id) ? clone._id : nid,
+            );
+            await Printer.updateOne(
+              { _id: printerId },
+              { $set: { installedNozzles: swapped } },
+            );
+            clonesCreated++;
+          } catch (swapErr) {
+            // The atomic-swap write failed (or the printer was deleted
+            // out from under us). Roll back the clone we just minted
+            // so the next migration retry sees the original duplicate
+            // state and re-tries from scratch — otherwise the
+            // collection accumulates an orphan "Name #N" with no
+            // printer holding it.
+            await Nozzle.deleteOne({ _id: clone._id }).catch(() => {
+              // Best-effort cleanup. If the cleanup also fails, the
+              // orphan is visible in /nozzles and the user can prune;
+              // surfacing the original swap error is more important.
+            });
+            throw swapErr;
+          }
         }
       }
 
