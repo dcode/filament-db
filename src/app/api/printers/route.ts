@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Printer from "@/models/Printer";
+import { findNozzleConflicts } from "@/lib/nozzleConflicts";
 import Nozzle from "@/models/Nozzle";
 import { getErrorMessage, errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
@@ -60,6 +61,24 @@ export async function POST(request: NextRequest) {
       });
       if (activeCount !== body.installedNozzles.length) {
         return errorResponse("One or more selected nozzles no longer exist.", 400);
+      }
+
+      // GH #232 — parallel of the PUT check. No printer id to exclude
+      // (this is a create), so any other-printer claim is a conflict.
+      const conflicts = await findNozzleConflicts(
+        Printer,
+        Nozzle,
+        body.installedNozzles,
+        null,
+      );
+      if (conflicts.length > 0) {
+        return NextResponse.json(
+          {
+            error: "Nozzle is already installed in another printer",
+            conflicts,
+          },
+          { status: 409 },
+        );
       }
     }
 

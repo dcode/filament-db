@@ -8,6 +8,7 @@ import { useToast } from "@/components/Toast";
 import UnsavedChangesDialog from "@/components/UnsavedChangesDialog";
 import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { NozzleConflictError, type NozzleConflict } from "@/lib/nozzleConflicts";
 
 export default function EditPrinter() {
   const params = useParams();
@@ -45,10 +46,15 @@ export default function EditPrinter() {
     if (res.ok) {
       toast(t("printers.updated"));
       router.push("/printers");
-    } else {
-      const body = await res.json().catch(() => null);
-      toast(body?.error || t("printers.updateError"), "error");
+      return;
     }
+    // GH #232 — see comment in printers/new/page.tsx: 409 means the
+    // form needs to open the move-or-clone resolution modal, not toast.
+    const body = await res.json().catch(() => null);
+    if (res.status === 409 && Array.isArray(body?.conflicts)) {
+      throw new NozzleConflictError(body.conflicts as NozzleConflict[]);
+    }
+    toast(body?.error || t("printers.updateError"), "error");
   };
 
   const handleDiscard = () => {

@@ -7,6 +7,7 @@ import { useToast } from "@/components/Toast";
 import UnsavedChangesDialog from "@/components/UnsavedChangesDialog";
 import { useUnsavedChanges } from "@/hooks/useUnsavedChanges";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { NozzleConflictError, type NozzleConflict } from "@/lib/nozzleConflicts";
 
 export default function NewPrinter() {
   const router = useRouter();
@@ -27,10 +28,17 @@ export default function NewPrinter() {
     if (res.ok) {
       toast(t("printers.created"));
       router.push("/printers");
-    } else {
-      const body = await res.json().catch(() => null);
-      toast(body?.error || t("printers.createError"), "error");
+      return;
     }
+    // GH #232 — a 409 with `conflicts[]` means one or more of the
+    // selected nozzles is already installed in another printer. Throw
+    // a typed error so PrinterForm can open the move-or-clone modal
+    // instead of just showing a generic toast.
+    const body = await res.json().catch(() => null);
+    if (res.status === 409 && Array.isArray(body?.conflicts)) {
+      throw new NozzleConflictError(body.conflicts as NozzleConflict[]);
+    }
+    toast(body?.error || t("printers.createError"), "error");
   };
 
   const handleDiscard = () => {
