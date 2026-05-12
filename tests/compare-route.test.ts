@@ -24,14 +24,22 @@ describe("/api/filaments/compare — variant inheritance (GH #184)", () => {
   let Filament: any;
 
   beforeEach(async () => {
+    // Static imports — `await import("@/models/${name}")` triggered a Vite
+    // dynamic-import warning ("file extension must be included in the static
+    // part") because the matcher couldn't pre-resolve the path. A static
+    // lookup table keeps each import string fully literal.
     const filamentMod = await import("@/models/Filament");
     if (!mongoose.models.Filament) {
       mongoose.model("Filament", filamentMod.default.schema);
     }
     // Models populate() walks
-    for (const name of ["Nozzle", "Printer", "BedType"] as const) {
+    const referenced = [
+      ["Nozzle", await import("@/models/Nozzle")],
+      ["Printer", await import("@/models/Printer")],
+      ["BedType", await import("@/models/BedType")],
+    ] as const;
+    for (const [name, mod] of referenced) {
       if (!mongoose.models[name]) {
-        const mod = await import(`@/models/${name}`);
         mongoose.model(name, mod.default.schema);
       }
     }

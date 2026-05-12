@@ -20,13 +20,18 @@ describe("/api/filaments/compare — inherited spoolWeight (Codex P2 PR #190)", 
   let Filament: any;
 
   beforeEach(async () => {
+    // Static imports — see compare-route.test.ts for the Vite warning detail.
     const filamentMod = await import("@/models/Filament");
     if (!mongoose.models.Filament) {
       mongoose.model("Filament", filamentMod.default.schema);
     }
-    for (const name of ["Nozzle", "Printer", "BedType"] as const) {
+    const referenced = [
+      ["Nozzle", await import("@/models/Nozzle")],
+      ["Printer", await import("@/models/Printer")],
+      ["BedType", await import("@/models/BedType")],
+    ] as const;
+    for (const [name, mod] of referenced) {
       if (!mongoose.models[name]) {
-        const mod = await import(`@/models/${name}`);
         mongoose.model(name, mod.default.schema);
       }
     }

@@ -38,7 +38,7 @@ export async function POST(request: NextRequest) {
         const existing = await Filament.findOneAndUpdate(
           { name, _deletedAt: null },
           { $set: rest, $setOnInsert: { name } },
-          { upsert: true, new: false },
+          { upsert: true, returnDocument: "before" },
         );
         if (existing) {
           updated++;
