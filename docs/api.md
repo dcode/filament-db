@@ -484,7 +484,9 @@ Response headers:
 
 The stream sends a `retry: 5000` prelude (EventSource clients reconnect after 5s on a drop) and a `: hb` heartbeat comment every 25 seconds so idle proxies don't drop the connection. Consumers using libcurl-style HTTP clients must implement their own reconnect loop.
 
-The bus is in-process (Node `EventEmitter` on `globalThis`) — fine for the Electron desktop app and a single-container Docker deploy, but a scaled multi-process deployment would need to put a real broker behind it.
+The bus is in-process (Node `EventEmitter` on `globalThis`). "In-process" here means **one Filament DB instance, not one physical machine** — subscribers can be anywhere reachable over HTTP (a Pi running Filament DB can drive PrusaSlicer on a Mac across the LAN; the slicer just connects to `http://<filament-db-host>:3456/api/scan/stream`). What pins to a single machine is the publisher: NFC reads come from the Electron renderer's `NfcProvider`, so the reader must be plugged into whichever box runs the Electron app — a headless Docker / web-only deploy has no `NfcProvider` and never publishes. A horizontally-scaled multi-process deployment would need an external broker behind the bus.
+
+A few network-deploy notes if you go cross-machine: the API is unauthenticated by design (single-user trust model — see the README warning), so be deliberate about which network port 3456 is exposed on. The Electron-bundled Next.js binds based on the `HOSTNAME` env var; if cross-machine subscribers can't connect, try `HOSTNAME=0.0.0.0`. And because `replay` events carry stale scans across slicer restarts, consumers should filter on `timestamp` if a multi-hour-old tag shouldn't be re-applied.
 
 ### POST /api/scan/publish
 

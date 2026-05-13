@@ -56,7 +56,7 @@ For Bambu tags, a "Bambu Lab spool (read-only)" badge is shown since these tags 
 
 ### Live scan stream (slicer integration)
 
-Every successful auto-read is also pushed onto a Server-Sent Events stream at `GET /api/scan/stream`, so a slicer running on the same machine can subscribe once and switch its active filament preset to match each scan. The renderer publishes via `POST /api/scan/publish` after the match step; consumers receive a `scan` event per read, plus an initial `replay` event carrying the most recent scan so a slicer opened just after a tag read still picks it up.
+Every successful auto-read is also pushed onto a Server-Sent Events stream at `GET /api/scan/stream`, so a subscribed slicer can switch its active filament preset to match each scan. The slicer doesn't have to live on the same machine as Filament DB — anything that can reach the server over HTTP works (LAN, Tailscale, reverse tunnel), so a headless Filament DB on a Raspberry Pi can drive PrusaSlicer on a Mac across the room. The renderer publishes via `POST /api/scan/publish` after the match step; consumers receive a `scan` event per read, plus an initial `replay` event carrying the most recent scan so a slicer opened just after a tag read still picks it up.
 
 Event payload shape (same for `scan` and `replay`):
 
@@ -71,7 +71,9 @@ Event payload shape (same for `scan` and `replay`):
 
 Consumers should switch presets on `filament.name` when non-null and ignore the event otherwise. Add `?replay=0` to suppress the on-connect replay. See [API Reference -- Scan Stream](api.md#scan-stream) for the full endpoint contract.
 
-The bus is in-process and single-machine — it works for the Electron desktop app and a single-container Docker deploy. Scaled multi-process deploys would need a real broker behind it.
+The bus is in-process: one `EventEmitter` shared by all subscribers of the same Filament DB instance. That's the only "single" — subscribers can be on different machines as long as they all connect to the same instance. The constraint that actually pins to a single machine is on the *publisher* side: scans are emitted from the Electron renderer's `NfcProvider`, so the NFC reader has to be plugged into whichever machine runs the Electron app. A headless Docker / web-only deploy has no `NfcProvider` and never publishes — the stream would just stay idle. A horizontally-scaled multi-process Filament DB deployment would need an external broker (Redis pub/sub or similar) behind the bus.
+
+If you do go cross-machine, note that the API is unauthenticated by design (see the README warning) so be deliberate about what network you expose port 3456 on. The Electron-bundled Next.js binds based on the `HOSTNAME` env var; if cross-machine subscribers can't connect, try `HOSTNAME=0.0.0.0`.
 
 ### Writing Tags
 
