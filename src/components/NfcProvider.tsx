@@ -32,6 +32,38 @@ interface NfcContextValue {
 
 const NfcContext = createContext<NfcContextValue | null>(null);
 
+/**
+ * Fire-and-forget POST to /api/scan/publish so SSE subscribers (the
+ * PrusaSlicer / OrcaSlicer FilamentDB module) can react to the scan.
+ * Failure is intentionally silent — the user-visible tag dialog must not
+ * wait on this, and any error here is logged for diagnostics only.
+ */
+function publishScan(
+  decoded: DecodedOpenPrintTag,
+  match: FilamentMatch | null,
+  candidates: FilamentMatch[],
+): void {
+  const body = {
+    filament: match,
+    candidates,
+    decoded: {
+      materialName: decoded.materialName,
+      brandName: decoded.brandName,
+      materialType: decoded.materialType,
+      color: decoded.color,
+      spoolUid: decoded.spoolUid,
+      tagSource: decoded.tagSource,
+    },
+  };
+  void fetch("/api/scan/publish", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => {
+    console.warn("[nfc] scan publish failed", err);
+  });
+}
+
 export function useNfcContext(): NfcContextValue {
   const ctx = useContext(NfcContext);
   if (!ctx) {
@@ -85,15 +117,18 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
           // parses as {error: "..."} which would leave match/candidates
           // as undefined and render nothing useful.
           setTagReadResult({ data: event.data, match: null, candidates: [] });
+          publishScan(event.data, null, []);
           return;
         }
         const parsed = await res.json();
         const match = parsed?.match ?? null;
         const candidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
         setTagReadResult({ data: event.data, match, candidates });
+        publishScan(event.data, match, candidates);
       } catch {
         // Network failure — still show tag data so the user can act on it
         setTagReadResult({ data: event.data, match: null, candidates: [] });
+        publishScan(event.data, null, []);
       }
     });
     return unsub;
