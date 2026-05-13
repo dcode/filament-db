@@ -54,6 +54,25 @@ In both cases, the app then searches the database for a matching filament. A dia
 
 For Bambu tags, a "Bambu Lab spool (read-only)" badge is shown since these tags cannot be written (they are RSA-2048 signed).
 
+### Live scan stream (slicer integration)
+
+Every successful auto-read is also pushed onto a Server-Sent Events stream at `GET /api/scan/stream`, so a slicer running on the same machine can subscribe once and switch its active filament preset to match each scan. The renderer publishes via `POST /api/scan/publish` after the match step; consumers receive a `scan` event per read, plus an initial `replay` event carrying the most recent scan so a slicer opened just after a tag read still picks it up.
+
+Event payload shape (same for `scan` and `replay`):
+
+```json
+{
+  "timestamp": 1700000000000,
+  "filament": { "_id": "…", "name": "Prusament PLA Galaxy Black", "vendor": "Prusament", "type": "PLA", "color": "#000000" },
+  "candidates": [],
+  "decoded": { "materialName": "…", "brandName": "…", "materialType": "PLA", "tagSource": "openprinttag" }
+}
+```
+
+Consumers should switch presets on `filament.name` when non-null and ignore the event otherwise. Add `?replay=0` to suppress the on-connect replay. See [API Reference -- Scan Stream](api.md#scan-stream) for the full endpoint contract.
+
+The bus is in-process and single-machine — it works for the Electron desktop app and a single-container Docker deploy. Scaled multi-process deploys would need a real broker behind it.
+
 ### Writing Tags
 
 From any filament's detail page:
@@ -139,10 +158,20 @@ The app communicates with the ACR1552U via PC/SC using `@pokusew/pcsclite`:
 │  ├── Status tracking                     │
 │  ├── Auto-read event handling            │
 │  ├── Filament matching via API           │
-│  └── NfcReadDialog (match/create flow)   │
+│  ├── NfcReadDialog (match/create flow)   │
+│  └── POST /api/scan/publish (fan-out)    │
 │                                          │
 │  Filament detail page                    │
 │  └── Write NFC button                    │
+└──────────────────────────────────────────┘
+         │ HTTP
+┌─ Scan Stream (Next.js server) ───────────┐
+│  scanBus (Node EventEmitter on global)   │
+│  ├── POST /api/scan/publish              │
+│  └── GET  /api/scan/stream (SSE)         │
+│         └── PrusaSlicer / OrcaSlicer     │
+│             FilamentDB module subscribes │
+│             and switches active preset   │
 └──────────────────────────────────────────┘
 ```
 

@@ -28,6 +28,7 @@ A desktop and web application for managing 3D printing filament profiles. Import
 - **Bed types** -- define bed surfaces (Smooth PEI, Textured PEI, G10/FR4, Glass, etc.) for per-bed-type calibration
 - **Per-printer per-nozzle per-bed-type calibration** -- store EM, max volumetric speed, pressure advance, retraction, temperature overrides, and fan settings per printer/nozzle/bed-type combination
 - **NFC tag read/write/erase** -- read, write, and erase [OpenPrintTag](https://openprinttag.io/) NFC-V (ISO 15693) tags and read Bambu Lab MIFARE Classic spool tags using an ACR1552U reader (desktop app)
+- **NFC scan → slicer preset** -- live Server-Sent Events stream at `GET /api/scan/stream` emits each tag read so a subscribed PrusaSlicer / OrcaSlicer FilamentDB module can auto-select the matching filament preset by name; the most recent scan replays on connect so a slicer opened just after a tag read still picks it up
 - **Instance IDs** -- unique per-filament identifier (5-byte hex, Prusament-compatible), written to NFC tags
 
 ### Sharing & Comparison
@@ -59,6 +60,7 @@ A desktop and web application for managing 3D printing filament profiles. Import
 ### Developer
 - **REST API** -- full CRUD endpoints for filaments, nozzles, printers, and bed types
 - **PrusaSlicer API** -- `GET /api/filaments/prusaslicer` exports filaments as a PrusaSlicer-compatible INI config bundle (one section per filament); calibration overrides are applied dynamically via `GET /api/filaments/{id}/calibration`; `POST` imports bundles back
+- **Scan stream (SSE)** -- `GET /api/scan/stream` Server-Sent Events feed and `POST /api/scan/publish` for fanning NFC tag reads to slicer integrations or other subscribers in real time
 - **API documentation** -- API reference plus interactive Swagger UI at `/api-docs` with an OpenAPI 3.0 spec for the documented REST surface
 
 ## Tech Stack

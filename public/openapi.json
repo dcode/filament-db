@@ -27,6 +27,7 @@
     { "name": "PrusaSlicer", "description": "PrusaSlicer config bundle export and import" },
     { "name": "OpenPrintTag", "description": "OpenPrintTag community database browser and import" },
     { "name": "OrcaSlicer", "description": "OrcaSlicer profile export and sync" },
+    { "name": "Scan Stream", "description": "Live NFC scan fan-out via Server-Sent Events" },
     { "name": "Print History", "description": "Record and undo print jobs" },
     { "name": "Sharing", "description": "Publish and retrieve shared filament catalogs" },
     { "name": "Utilities", "description": "Auxiliary API helpers" },
@@ -1695,6 +1696,62 @@
         }
       }
     },
+    "/api/scan/stream": {
+      "get": {
+        "tags": ["Scan Stream"],
+        "summary": "Subscribe to NFC scans (Server-Sent Events)",
+        "description": "Long-lived Server-Sent Events stream. Each NFC tag read is emitted as a `scan` event after the renderer decodes the tag and matches it against the database. The most recent scan is also replayed once on connect as a `replay` event so a slicer opened just after a tag read still picks it up. Heartbeats (`: hb`) are sent every 25 seconds to defeat idle-proxy timeouts; clients also receive a `retry: 5000` prelude so EventSource implementations reconnect after a drop. The underlying bus is in-process (Node EventEmitter on `globalThis`), so this works for the Electron desktop app and a single-container Docker deploy — a scaled multi-process deployment would need an external broker.",
+        "parameters": [
+          { "name": "replay", "in": "query", "required": false, "schema": { "type": "string", "enum": ["0", "1"] }, "description": "Set to `0` to suppress the on-connect replay of the most recent scan. Defaults to enabled." }
+        ],
+        "responses": {
+          "200": {
+            "description": "Server-Sent Events stream. Each record is `event: <type>\\ndata: <json>\\n\\n` where `<type>` is `scan` or `replay` and `<json>` matches the `ScanEvent` schema.",
+            "content": { "text/event-stream": { "schema": { "$ref": "#/components/schemas/ScanEvent" } } }
+          }
+        }
+      }
+    },
+    "/api/scan/publish": {
+      "post": {
+        "tags": ["Scan Stream"],
+        "summary": "Publish a decoded scan to subscribers",
+        "description": "Fan-out endpoint used by the renderer's `NfcProvider` after the existing `/api/filaments/match` step. Public clients normally don't need to call this directly; documented for completeness and for testing the SSE path without a physical reader. The body is validated against an allow-list — unknown fields are stripped before the event is published, so a malformed POST cannot pollute the replay cache.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "filament": { "nullable": true, "allOf": [{ "$ref": "#/components/schemas/ScanEventFilament" }] },
+                  "candidates": { "type": "array", "items": { "$ref": "#/components/schemas/ScanEventFilament" } },
+                  "decoded": { "$ref": "#/components/schemas/ScanEventDecoded" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Scan accepted and emitted to all subscribers.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok", "event"],
+                  "properties": {
+                    "ok": { "type": "boolean", "enum": [true] },
+                    "event": { "$ref": "#/components/schemas/ScanEvent" }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Body is not valid JSON, is not an object, or contains neither a filament match nor any decoded tag fields.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/filaments/{id}/spools/{spoolId}/usage": {
       "post": {
         "tags": ["Spools"],
@@ -2221,6 +2278,39 @@
           "error": { "type": "string" }
         },
         "required": ["error"]
+      },
+      "ScanEventFilament": {
+        "type": "object",
+        "required": ["_id", "name"],
+        "properties": {
+          "_id": { "type": "string", "description": "Filament MongoDB ObjectId" },
+          "name": { "type": "string" },
+          "vendor": { "type": "string" },
+          "type": { "type": "string", "description": "Material type (PLA, PETG, ABS, ...)" },
+          "color": { "type": "string", "description": "Hex color, e.g. #000000" }
+        }
+      },
+      "ScanEventDecoded": {
+        "type": "object",
+        "description": "Subset of decoded NFC tag fields useful to consumers. Allow-listed by the publish route — unknown keys are stripped.",
+        "properties": {
+          "materialName": { "type": "string" },
+          "brandName": { "type": "string" },
+          "materialType": { "type": "string" },
+          "color": { "type": "string" },
+          "spoolUid": { "type": "string" },
+          "tagSource": { "type": "string", "enum": ["openprinttag", "bambu"] }
+        }
+      },
+      "ScanEvent": {
+        "type": "object",
+        "required": ["timestamp", "filament", "candidates", "decoded"],
+        "properties": {
+          "timestamp": { "type": "integer", "format": "int64", "description": "Epoch ms when the scan was published" },
+          "filament": { "nullable": true, "allOf": [{ "$ref": "#/components/schemas/ScanEventFilament" }], "description": "Matched filament, or null when no row matched" },
+          "candidates": { "type": "array", "items": { "$ref": "#/components/schemas/ScanEventFilament" }, "description": "Plausible alternatives (vendor+type, then vendor-only) when there is no exact match" },
+          "decoded": { "$ref": "#/components/schemas/ScanEventDecoded" }
+        }
       },
       "Temperatures": {
         "type": "object",

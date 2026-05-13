@@ -3,22 +3,13 @@
 import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from "react";
 import { useNfc, type NfcStatus } from "@/hooks/useNfc";
 import type { DecodedOpenPrintTag } from "@/lib/openprinttag-decode";
+import {
+  createScanMatchHandler,
+  type FilamentMatch,
+  type NfcTagReadResult,
+} from "@/lib/scanMatchHandler";
 
-interface FilamentMatch {
-  _id: string;
-  name: string;
-  vendor: string;
-  type: string;
-  color: string;
-}
-
-export interface NfcTagReadResult {
-  data?: DecodedOpenPrintTag;
-  error?: string;
-  empty?: boolean;
-  match?: FilamentMatch | null;
-  candidates?: FilamentMatch[];
-}
+export type { NfcTagReadResult } from "@/lib/scanMatchHandler";
 
 interface NfcContextValue {
   isElectron: boolean;
@@ -31,6 +22,38 @@ interface NfcContextValue {
 }
 
 const NfcContext = createContext<NfcContextValue | null>(null);
+
+/**
+ * Fire-and-forget POST to /api/scan/publish so SSE subscribers (the
+ * PrusaSlicer / OrcaSlicer FilamentDB module) can react to the scan.
+ * Failure is intentionally silent — the user-visible tag dialog must not
+ * wait on this, and any error here is logged for diagnostics only.
+ */
+function publishScan(
+  decoded: DecodedOpenPrintTag,
+  match: FilamentMatch | null,
+  candidates: FilamentMatch[],
+): void {
+  const body = {
+    filament: match,
+    candidates,
+    decoded: {
+      materialName: decoded.materialName,
+      brandName: decoded.brandName,
+      materialType: decoded.materialType,
+      color: decoded.color,
+      spoolUid: decoded.spoolUid,
+      tagSource: decoded.tagSource,
+    },
+  };
+  void fetch("/api/scan/publish", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  }).catch((err) => {
+    console.warn("[nfc] scan publish failed", err);
+  });
+}
 
 export function useNfcContext(): NfcContextValue {
   const ctx = useContext(NfcContext);
@@ -53,49 +76,19 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
   const { isElectron, status, writing, error: writeError, writeTag } = useNfc();
   const [tagReadResult, setTagReadResult] = useState<NfcTagReadResult | null>(null);
 
-  // Listen for auto-read events from the main process
+  // Listen for auto-read events from the main process. Match-and-publish
+  // sequencing (cancel-stale-fetch + ignore-stale-commit) lives in
+  // createScanMatchHandler so the race-prone async path is unit-testable
+  // and rapid back-to-back scans can't have the older match clobber the
+  // newer one.
   useEffect(() => {
     if (!isElectron) return;
     const api = window.electronAPI!;
-    const unsub = api.onNfcTagRead(async (raw: unknown) => {
-      const event = raw as { data?: DecodedOpenPrintTag; error?: string; empty?: boolean };
-      if (event.error) {
-        setTagReadResult({ error: event.error });
-        return;
-      }
-
-      if (event.empty) {
-        setTagReadResult({ empty: true });
-        return;
-      }
-
-      if (!event.data) return;
-
-      // Try to match against existing filaments
-      const params = new URLSearchParams();
-      if (event.data.materialName) params.set("name", event.data.materialName);
-      if (event.data.brandName) params.set("vendor", event.data.brandName);
-      if (event.data.materialType) params.set("type", event.data.materialType);
-
-      try {
-        const res = await fetch(`/api/filaments/match?${params}`);
-        if (!res.ok) {
-          // Non-2xx: show the tag data without match info, but don't try
-          // to parse the body as if it's a match result — a 5xx error body
-          // parses as {error: "..."} which would leave match/candidates
-          // as undefined and render nothing useful.
-          setTagReadResult({ data: event.data, match: null, candidates: [] });
-          return;
-        }
-        const parsed = await res.json();
-        const match = parsed?.match ?? null;
-        const candidates = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
-        setTagReadResult({ data: event.data, match, candidates });
-      } catch {
-        // Network failure — still show tag data so the user can act on it
-        setTagReadResult({ data: event.data, match: null, candidates: [] });
-      }
+    const handler = createScanMatchHandler({
+      onResult: setTagReadResult,
+      onPublish: publishScan,
     });
+    const unsub = api.onNfcTagRead(handler);
     return unsub;
   }, [isElectron]);
 
