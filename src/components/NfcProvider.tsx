@@ -18,12 +18,25 @@ interface NfcContextValue {
   writeError: string | null;
   writeTag: (payload: Uint8Array, productUrl?: string) => Promise<void>;
   /**
-   * Last decoded scan result. Survives dialog dismissal and stays put
-   * while the same tag (or a successor) is on the reader, so the
-   * status pill can keep showing "Loaded: <name>" after the dialog is
-   * dismissed.
+   * Last decoded scan result. Survives dialog dismissal so the dialog's
+   * action buttons (View Filament / Create New / candidate suggestions)
+   * remain usable after the user closes the modal — that's where the
+   * decoded tag data lives. Note that this is intentionally NOT cleared
+   * on tag removal; the dialog should stay actionable even after the
+   * user lifts the tag. The status pill's display name lives in
+   * `loadedTagName` instead, which DOES clear on lift so it doesn't
+   * report a stale filament after the tag is gone (codex P2 on
+   * PR #235).
    */
   tagReadResult: NfcTagReadResult | null;
+  /**
+   * Display name for the status pill: the matched filament's name, or
+   * the tag's declared material name if no match. Cleared the moment
+   * the reader reports no tag present, so a brief "Tag detected (uid)"
+   * window appears while the next tag is decoding rather than showing
+   * the previous tag's name.
+   */
+  loadedTagName: string | null;
   /** Whether the read-result dialog is currently visible. */
   dialogOpen: boolean;
   /** Hide the dialog without clearing `tagReadResult`. */
@@ -82,6 +95,7 @@ export function useNfcContext(): NfcContextValue {
       writeError: null,
       writeTag: async () => {},
       tagReadResult: null,
+      loadedTagName: null,
       dialogOpen: false,
       dismissTagRead: () => {},
       notifyTagWritten: () => {},
@@ -90,16 +104,37 @@ export function useNfcContext(): NfcContextValue {
   return ctx;
 }
 
+function pickLoadedName(result: NfcTagReadResult): string | null {
+  // Prefer the matched DB filament's name (what the user thinks of as
+  // "what's loaded"), then fall back to the tag's declared material
+  // name for unmatched-but-decoded tags.
+  return result.match?.name ?? result.data?.materialName ?? null;
+}
+
 export default function NfcProvider({ children }: { children: ReactNode }) {
   const { isElectron, status, writing, error: writeError, writeTag } = useNfc();
   const [tagReadResult, setTagReadResult] = useState<NfcTagReadResult | null>(null);
   // The dialog and the "current scan" state used to be one flag —
   // dismissing the dialog cleared tagReadResult and the status pill
   // lost its "Loaded: <name>" label. Decouple them: tagReadResult
-  // stays put after dismissal so the pill keeps showing what's on the
-  // reader; dialogOpen controls the modal independently. A fresh scan
-  // overwrites tagReadResult and re-opens the dialog.
+  // stays put after dismissal so the dialog's action buttons remain
+  // usable; dialogOpen controls the modal independently.
   const [dialogOpen, setDialogOpen] = useState(false);
+  // Pill display name, kept separate from tagReadResult so the pill
+  // can clear immediately when the reader reports no tag present —
+  // codex P2 on PR #235 flagged that an A→B swap would leave the pill
+  // showing "Loaded: <A>" until B's decode landed because the dialog's
+  // tagReadResult lingered intentionally past dismiss. The dialog
+  // doesn't suffer from the same bug because the gate is
+  // `dialogOpen && tagReadResult` — only a fresh scan re-opens it.
+  const [loadedTagName, setLoadedTagName] = useState<string | null>(null);
+
+  // Clear the pill name as soon as the tag is lifted. We do NOT clear
+  // tagReadResult here on purpose — the dialog may still be open and
+  // the user may still want to act on its buttons.
+  useEffect(() => {
+    if (!status.tagPresent) setLoadedTagName(null); // eslint-disable-line react-hooks/set-state-in-effect -- pill-clear in response to external reader state
+  }, [status.tagPresent]);
 
   // Listen for auto-read events from the main process. Match-and-publish
   // sequencing (cancel-stale-fetch + ignore-stale-commit) lives in
@@ -112,6 +147,7 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
     const handler = createScanMatchHandler({
       onResult: (result) => {
         setTagReadResult(result);
+        setLoadedTagName(pickLoadedName(result));
         setDialogOpen(true);
       },
       onPublish: publishScan,
@@ -128,6 +164,7 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
   // than waiting for the user to lift + replace the tag.
   const notifyTagWritten = useCallback((filament: FilamentMatch) => {
     setTagReadResult({ match: filament, candidates: [] });
+    setLoadedTagName(filament.name);
     // Intentionally not opening the dialog — the user just clicked
     // "Write NFC" on the filament detail page; popping a modal on top
     // of that workflow would be jarring. The pill update is enough.
@@ -142,6 +179,7 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
         writeError,
         writeTag,
         tagReadResult,
+        loadedTagName,
         dialogOpen,
         dismissTagRead,
         notifyTagWritten,

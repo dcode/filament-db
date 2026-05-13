@@ -5,7 +5,7 @@ import { useNfcContext } from "@/components/NfcProvider";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
 export default function NfcStatus() {
-  const { isElectron, status, tagReadResult } = useNfcContext();
+  const { isElectron, status, loadedTagName } = useNfcContext();
   const { t } = useTranslation();
   const [mounted, setMounted] = useState(false);
 
@@ -27,16 +27,11 @@ export default function NfcStatus() {
     label = t("nfc.status.readyPlaceTag");
   } else {
     dotColor = "bg-green-400";
-    // Once a tag has been decoded we want the pill to remember what's
-    // physically loaded — the dialog is dismissable and there's no other
-    // persistent surface that shows it. Prefer the DB-matched name (the
-    // user's own filament label), fall back to the tag's declared
-    // material name, then UID, then a generic "Tag detected".
-    const matchedName = tagReadResult?.match?.name ?? null;
-    const decodedName = tagReadResult?.data?.materialName ?? null;
-    const displayName = matchedName ?? decodedName ?? null;
-    if (displayName) {
-      label = t("nfc.status.tagLoaded", { name: displayName });
+    // `loadedTagName` is gated on the reader's tagPresent state in the
+    // provider, so an A→B tag swap shows "Tag detected (<uid>)" during
+    // the brief decode window rather than the previous tag's name.
+    if (loadedTagName) {
+      label = t("nfc.status.tagLoaded", { name: loadedTagName });
     } else if (status.tagUid) {
       label = t("nfc.status.tagDetectedWithUid", { uid: status.tagUid.slice(-8).toUpperCase() });
     } else {
