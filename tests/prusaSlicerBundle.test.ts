@@ -120,6 +120,51 @@ describe("filamentToSlicerKeys", () => {
     expect(keys.cooling).toBe("1");
   });
 
+  it("emits empty compatible_printers + compatible_printers_condition by default", () => {
+    // Without these, synced presets are filtered out of the active
+    // printer's filament dropdown in PrusaSlicer — programmatic
+    // Tab::select_preset falls back to the closest compatible default
+    // and the scan-stream auto-select can't switch to a scanned tag.
+    const filament = {
+      name: "Overture PETG",
+      vendor: "Overture",
+      type: "PETG",
+      color: "#000000",
+      diameter: 1.75,
+      temperatures: {},
+      settings: {},
+    };
+
+    const keys = filamentToSlicerKeys(filament);
+
+    expect(keys.compatible_printers).toBe("");
+    expect(keys.compatible_printers_condition).toBe("");
+  });
+
+  it("preserves a user-set compatible_printers from the settings bag", () => {
+    // If a previous import (or hand-edit) pinned the preset to a
+    // specific printer, the default-blanking must NOT clobber that.
+    const filament = {
+      name: "Restricted PLA",
+      vendor: "Test",
+      type: "PLA",
+      color: "#000000",
+      diameter: 1.75,
+      temperatures: {},
+      settings: {
+        compatible_printers: "Original Prusa MK4S",
+        compatible_printers_condition: 'printer_model=="MK4S"',
+      },
+    };
+
+    const keys = filamentToSlicerKeys(filament);
+
+    expect(keys.compatible_printers).toBe("Original Prusa MK4S");
+    expect(keys.compatible_printers_condition).toBe(
+      'printer_model=="MK4S"',
+    );
+  });
+
   it("omits missing temperatures when not in settings (PrusaSlicer uses defaults)", () => {
     const filament = {
       name: "Minimal",

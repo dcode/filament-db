@@ -362,6 +362,8 @@ Remove a spool from a filament. Returns the updated filament document.
 
 Exports all filaments as a PrusaSlicer-compatible INI config bundle with one `[filament:Name]` section per filament. Structured DB fields (temperatures, density, cost, max volumetric speed, shrinkage) are mapped to their PrusaSlicer INI equivalents and merged with the `settings` passthrough bag. Calibration overrides (extrusion multiplier, pressure advance, retraction, max volumetric speed) are NOT baked into the bundle — they are applied dynamically by PrusaSlicer Filament Edition via `GET /api/filaments/:name/calibration` when the printer/nozzle context changes.
 
+Each emitted section also includes `compatible_printers = ` and `compatible_printers_condition = ` (both empty) by default, which PrusaSlicer treats as "no restriction" — the synced filament shows up in every printer's dropdown, and the scan-stream auto-select works regardless of which printer profile is active. If a user pinned a specific restriction via a previous round-trip import (the keys arrive non-empty in the settings bag), the export preserves that restriction.
+
 Query parameters:
 - `type` -- filter by filament type (e.g. `PLA`, `PETG`)
 - `vendor` -- filter by vendor name

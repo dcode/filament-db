@@ -492,6 +492,7 @@
   "nfc.status.readyPlaceTag": "Bereit — Tag auflegen",
   "nfc.status.tagDetected": "Tag erkannt",
   "nfc.status.tagDetectedWithUid": "Tag erkannt ({uid})",
+  "nfc.status.tagLoaded": "Geladen: {name}",
 
   "atlas.import.title": "Aus MongoDB Atlas importieren",
   "atlas.import.selectTitle": "Filamente zum Import auswählen",

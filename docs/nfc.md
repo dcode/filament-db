@@ -104,11 +104,15 @@ Click **"Export OPT"** on any filament's detail page to download the OpenPrintTa
 
 The status pill appears in the header when running in the desktop app:
 
-| Color | State |
-|-------|-------|
-| Gray | No NFC reader detected |
-| Yellow | Reader connected, waiting for tag |
-| Green | Tag detected on reader |
+| Color | Label | State |
+|-------|-------|-------|
+| Gray | "No NFC reader" | No reader detected |
+| Yellow | "Ready — place tag" | Reader connected, waiting for tag |
+| Green | "Loaded: \<filament name\>" | Tag detected and decoded; name matched against the DB (or the tag's declared material name when no DB match exists) |
+| Green | "Tag detected (\<uid\>)" | Tag detected but not yet decoded — brief transition window |
+| Green | "Tag detected" | Tag detected, reader hasn't reported a UID yet |
+
+The "Loaded" label persists after the tag-read dialog is dismissed (so you can still see which spool is on the reader after closing the popup) and updates immediately after a successful **Write NFC** — no need to lift and replace the tag. The label resets the moment the reader reports the tag has been lifted, so swapping tag A for tag B briefly shows the "Tag detected (\<uid\>)" intermediate state rather than the previous tag's name.
 
 ## Technical Details
 

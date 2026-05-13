@@ -8,24 +8,26 @@ import { useTranslation } from "@/i18n/TranslationProvider";
 
 export default function NfcReadDialog() {
   const router = useRouter();
-  const { tagReadResult, dismissTagRead } = useNfcContext();
+  const { tagReadResult, dialogOpen, dismissTagRead } = useNfcContext();
   const { t } = useTranslation();
 
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  const visible = dialogOpen && tagReadResult != null;
+
   // Escape key handler
   useEffect(() => {
-    if (!tagReadResult) return;
+    if (!visible) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") dismissTagRead();
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [tagReadResult, dismissTagRead]);
+  }, [visible, dismissTagRead]);
 
   // Focus trap: focus the dialog when it appears and trap tab within it
   useEffect(() => {
-    if (!tagReadResult || !dialogRef.current) return;
+    if (!visible || !dialogRef.current) return;
     dialogRef.current.focus();
 
     const dialog = dialogRef.current;
@@ -51,9 +53,9 @@ export default function NfcReadDialog() {
     };
     document.addEventListener("keydown", handleTab);
     return () => document.removeEventListener("keydown", handleTab);
-  }, [tagReadResult]);
+  }, [visible]);
 
-  if (!tagReadResult) return null;
+  if (!visible || !tagReadResult) return null;
 
   const { data, error, empty, match, candidates } = tagReadResult;
 

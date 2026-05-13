@@ -492,6 +492,7 @@
   "nfc.status.readyPlaceTag": "Ready — place tag",
   "nfc.status.tagDetected": "Tag detected",
   "nfc.status.tagDetectedWithUid": "Tag detected ({uid})",
+  "nfc.status.tagLoaded": "Loaded: {name}",
 
   "atlas.import.title": "Import from MongoDB Atlas",
   "atlas.import.selectTitle": "Select Filaments to Import",
