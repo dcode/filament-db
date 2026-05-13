@@ -92,6 +92,24 @@ export function filamentToSlicerKeys(
     keys.inherits = filament.inherits;
   }
 
+  // Filaments synced from Filament DB are intended to be usable on every
+  // printer in the slicer — Filament DB doesn't model per-printer
+  // restrictions. PrusaSlicer treats an empty `compatible_printers` +
+  // `compatible_printers_condition` pair as "no restriction", so write
+  // those defaults if (and only if) the upstream settings bag doesn't
+  // already pin them to something specific from a previous import.
+  // Without this, presets sync into PrusaSlicer but the active printer's
+  // filament list filters them out — the Filaments tab dropdown skips
+  // them, programmatic Tab::select_preset falls back to the closest
+  // compatible default, and the scan-stream-driven auto-select can't
+  // switch to a scanned tag.
+  if (!("compatible_printers" in keys)) {
+    keys.compatible_printers = "";
+  }
+  if (!("compatible_printers_condition" in keys)) {
+    keys.compatible_printers_condition = "";
+  }
+
   return keys;
 }
 
