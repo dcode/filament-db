@@ -665,25 +665,37 @@ export default function Home() {
       <div ref={stickyHeaderRef} className="sticky top-[var(--app-header-h)] z-20 bg-white dark:bg-gray-950 pb-3 -mt-8 pt-8 border-b border-gray-200 dark:border-gray-800 shadow-sm">
       {/* Page heading was removed (#176) — the brand "Filament DB" + version
           pill in AppHeader (and the active "Filaments" nav link) already
-          identify the page. The stats-toggle on the left and the action
-          buttons on the right share one row so there's no wasted vertical
-          space above the metadata line. */}
-      <div className="flex items-center justify-between gap-4 mb-3 flex-wrap">
-        {filaments.length > 0 ? (
-          <button
-            onClick={() => setShowStats((s) => !s)}
-            className="text-sm text-gray-500 hover:text-gray-300 flex items-center gap-1"
-          >
-            <span>{showStats ? "▾" : "▸"}</span>
-            <span>{t("filaments.stats.total", { count: filaments.length })}</span>
-            <span className="text-gray-600">·</span>
-            <span>{t("filaments.stats.typeCount", { count: types.length })}</span>
-            <span className="text-gray-600">·</span>
-            <span>{t("filaments.stats.vendorCount", { count: vendors.length })}</span>
-          </button>
-        ) : (
-          <span />
-        )}
+          identify the page. The action buttons used to share this row so
+          there'd be no wasted vertical space above the metadata, but they
+          were moved down to the search-filter row so all the controls
+          actually used together live together. */}
+      {filaments.length > 0 && (
+        <button
+          onClick={() => setShowStats((s) => !s)}
+          className="text-sm text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-3"
+        >
+          <span>{showStats ? "▾" : "▸"}</span>
+          <span>{t("filaments.stats.total", { count: filaments.length })}</span>
+          <span className="text-gray-600">·</span>
+          <span>{t("filaments.stats.typeCount", { count: types.length })}</span>
+          <span className="text-gray-600">·</span>
+          <span>{t("filaments.stats.vendorCount", { count: vendors.length })}</span>
+        </button>
+      )}
+      {/* Statistics expansion — toggle lives on the stats text above; this
+          just renders the expanded grid when the user opens it. */}
+      {filaments.length > 0 && showStats && (
+        <div className="mb-4">
+          <FilamentStats filaments={filaments} />
+        </div>
+      )}
+
+      <div className="flex items-center justify-between gap-3 mb-2 flex-wrap">
+        <QuickFilterChips
+          active={quickFilter}
+          onChange={setQuickFilter}
+          counts={quickFilterCounts}
+        />
         <div className="flex gap-2 shrink-0">
           {/* Import / Export dropdown */}
           <div className="relative" ref={importExportRef}>
@@ -790,22 +802,7 @@ export default function Home() {
         </div>
       </div>
 
-      {/* Statistics expansion — toggle moved into the action-buttons row
-          above (#176 follow-up); this just renders the expanded grid. */}
-      {filaments.length > 0 && showStats && (
-        <div className="mb-4">
-          <FilamentStats filaments={filaments} />
-        </div>
-      )}
-
       <div className="flex gap-3 mb-4 flex-wrap">
-        <div className="col-span-full">
-          <QuickFilterChips
-            active={quickFilter}
-            onChange={setQuickFilter}
-            counts={quickFilterCounts}
-          />
-        </div>
         <input
           type="text"
           placeholder={t("common.search")}

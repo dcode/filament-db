@@ -3,7 +3,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
-import NfcStatus from "@/components/NfcStatus";
 import { useNfcContext } from "@/components/NfcProvider";
 import { generateOpenPrintTagBinary } from "@/lib/openprinttag";
 import { safeHttpUrl } from "@/lib/safeRenderUrl";
@@ -96,7 +95,7 @@ export default function FilamentDetail() {
   const [addSpoolForm, setAddSpoolForm] = useState<
     { open: boolean; label: string; totalWeight: string }
   >({ open: false, label: "", totalWeight: "" });
-  const { isElectron, status: nfcStatus, writing: nfcWriting, writeTag } = useNfcContext();
+  const { isElectron, status: nfcStatus, writing: nfcWriting, writeTag, notifyTagWritten } = useNfcContext();
   const [nfcWriteSuccess, setNfcWriteSuccess] = useState<boolean | null>(null);
   const nfcWriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { toast } = useToast();
@@ -245,6 +244,13 @@ export default function FilamentDetail() {
       const productUrl = filament.tdsUrl
         || `https://filamentdb.app/filament/${encodeURIComponent(filament.vendor)}/${encodeURIComponent(filament.name)}`;
       await writeTag(payload, productUrl);
+      notifyTagWritten({
+        _id: String(filament._id),
+        name: filament.name,
+        vendor: filament.vendor,
+        type: filament.type,
+        color: filament.color ?? "",
+      });
       setNfcWriteSuccess(true);
       if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current);
       nfcWriteTimerRef.current = setTimeout(() => setNfcWriteSuccess(null), 3000);
@@ -290,6 +296,13 @@ export default function FilamentDetail() {
       const productUrl = filament.tdsUrl
         || `https://filamentdb.app/filament/${encodeURIComponent(filament.vendor)}/${encodeURIComponent(filament.name)}`;
       await writeTag(payload, productUrl);
+      notifyTagWritten({
+        _id: String(filament._id),
+        name: filament.name,
+        vendor: filament.vendor,
+        type: filament.type,
+        color: filament.color ?? "",
+      });
       setNfcWriteSuccess(true);
       toast(t("detail.nfc.updated", { weight: String(Math.round(actualRemaining)) }));
       if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current);
@@ -300,7 +313,7 @@ export default function FilamentDetail() {
       if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current);
       nfcWriteTimerRef.current = setTimeout(() => setNfcWriteSuccess(null), 5000);
     }
-  }, [filament, writeTag, toast, t]);
+  }, [filament, writeTag, notifyTagWritten, toast, t]);
 
   const handleWeightUpdate = async () => {
     if (!filament) return;
@@ -533,7 +546,9 @@ export default function FilamentDetail() {
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
-          {isElectron && <NfcStatus />}
+          {/* NFC status pill removed — the global one in AppHeader already
+              shows reader/loaded state, no need to render a duplicate next
+              to the Write NFC button. */}
           {isElectron && nfcStatus.tagPresent && (
             <button
               onClick={handleNfcWrite}
