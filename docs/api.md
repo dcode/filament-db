@@ -427,6 +427,111 @@ Returns:
 
 ---
 
+## Scan Stream
+
+Push live NFC tag reads into a long-lived stream so slicers can subscribe and auto-select the matching filament preset. The renderer publishes each scan after it decodes a tag and matches it against the DB; consumers (the PrusaSlicer / OrcaSlicer FilamentDB module, or any other client) subscribe via Server-Sent Events.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/scan/stream` | Subscribe to NFC scans as Server-Sent Events |
+| `POST` | `/api/scan/publish` | Publish a decoded scan to subscribers (used by the renderer) |
+
+### GET /api/scan/stream
+
+Server-Sent Events endpoint. The response stays open; each NFC tag read emits one record. Event types:
+
+| `event:` value | When sent | Notes |
+|----------------|-----------|-------|
+| `replay` | Once, on connect | The most recently published scan, replayed so a slicer opened just after a tag read still picks it up. Skipped if no scan has happened yet this process lifetime. |
+| `scan` | Per tag read | A freshly decoded + matched tag. |
+
+Query parameters:
+- `replay` -- set to `0` to suppress the on-connect replay (only the prelude + future `scan` events are sent).
+
+Each `data:` payload is the same JSON shape:
+
+```json
+{
+  "timestamp": 1700000000000,
+  "filament": {
+    "_id": "65f00000000000000000abcd",
+    "name": "Prusament PLA Galaxy Black",
+    "vendor": "Prusament",
+    "type": "PLA",
+    "color": "#000000"
+  },
+  "candidates": [],
+  "decoded": {
+    "materialName": "Prusament PLA Galaxy Black",
+    "brandName": "Prusament",
+    "materialType": "PLA",
+    "color": "#000000",
+    "spoolUid": "2acc21072a",
+    "tagSource": "openprinttag"
+  }
+}
+```
+
+Field notes:
+- `filament` is the matched DB row, or `null` when no row matches. Slicers key presets by name and should switch on `filament.name` when non-null.
+- `candidates` is a short list of plausible alternatives (vendor + type, then vendor-only) when there is no exact match; empty otherwise.
+- `decoded` carries a subset of the tag fields useful to consumers; `tagSource` is `"openprinttag"` or `"bambu"`.
+
+Response headers:
+- `content-type: text/event-stream; charset=utf-8`
+- `cache-control: no-cache, no-transform`
+- `x-accel-buffering: no` (defeats response buffering by nginx-style proxies)
+
+The stream sends a `retry: 5000` prelude (EventSource clients reconnect after 5s on a drop) and a `: hb` heartbeat comment every 25 seconds so idle proxies don't drop the connection. Consumers using libcurl-style HTTP clients must implement their own reconnect loop.
+
+The bus is in-process (Node `EventEmitter` on `globalThis`) — fine for the Electron desktop app and a single-container Docker deploy, but a scaled multi-process deployment would need to put a real broker behind it.
+
+### POST /api/scan/publish
+
+Used by the renderer's `NfcProvider` to push a scan after the existing `/api/filaments/match` step. Public clients normally don't need to call this directly; it's documented for completeness and for testing the SSE path without a physical reader.
+
+Request body:
+
+```json
+{
+  "filament": {
+    "_id": "65f00000000000000000abcd",
+    "name": "Prusament PLA Galaxy Black",
+    "vendor": "Prusament",
+    "type": "PLA",
+    "color": "#000000"
+  },
+  "candidates": [],
+  "decoded": {
+    "materialName": "Prusament PLA Galaxy Black",
+    "brandName": "Prusament",
+    "materialType": "PLA",
+    "color": "#000000",
+    "spoolUid": "2acc21072a",
+    "tagSource": "openprinttag"
+  }
+}
+```
+
+- `filament` -- the matched DB row, or `null` if no row matched.
+- `candidates` -- optional array of plausible alternatives in the same shape as `filament`.
+- `decoded` -- subset of the decoded tag fields. Unknown `tagSource` values are dropped.
+
+The body is validated against an allow-list — unknown fields are stripped before the event is published, so a malformed POST cannot pollute the replay cache.
+
+Returns `202 Accepted`:
+
+```json
+{
+  "ok": true,
+  "event": { /* the published scan, including the server-assigned timestamp */ }
+}
+```
+
+400 if the body isn't valid JSON, isn't an object, or contains neither a filament match nor any decoded fields (nothing for a consumer to act on).
+
+---
+
 ## OpenPrintTag Database
 
 | Method | Endpoint | Description |
