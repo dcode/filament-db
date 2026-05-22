@@ -188,7 +188,7 @@ export default async function dbConnect() {
     try {
       const Printer = (await import("@/models/Printer")).default;
       const Nozzle = (await import("@/models/Nozzle")).default;
-      const { nextCloneName } = await import("@/lib/nozzleConflicts");
+      const { nextCloneName, clonePeerNamePattern } = await import("@/lib/nozzleConflicts");
 
       const printers = await Printer.find({ _deletedAt: null })
         .select("_id name installedNozzles")
@@ -219,9 +219,12 @@ export default async function dbConnect() {
         if (!source) continue; // soft-deleted between count and read; skip
 
         // Existing peer names (for "Name #N" collision avoidance).
+        // GH #298: the pattern is anchored at both ends, so it matches
+        // only the base name + its numbered clones — not unrelated
+        // siblings that merely share a prefix.
         const peers = (await Nozzle.find({
           _deletedAt: null,
-          name: { $regex: `^${escapeForRegex(source.name)}` },
+          name: { $regex: clonePeerNamePattern(source.name) },
         })
           .select("name")
           .lean()) as { name: string }[];
@@ -310,9 +313,4 @@ export default async function dbConnect() {
   }
 
   return cached.conn;
-}
-
-/** Escape a string for inclusion in a Mongo `$regex` filter. */
-function escapeForRegex(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

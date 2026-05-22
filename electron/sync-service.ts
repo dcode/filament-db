@@ -464,14 +464,18 @@ export class SyncService extends EventEmitter {
         }
 
         if (localDeleted && !remoteDeleted) {
-          // Deleted locally — propagate if deletion is newer
-          const localDeletedAt = new Date(localDoc._deletedAt).getTime();
-          const remoteUpdatedAt = new Date(remoteDoc.updatedAt).getTime();
-          if (localDeletedAt > remoteUpdatedAt) {
+          // Deleted locally — propagate if the deletion is at least as
+          // recent as the remote update. GH #317: `>=` (not `>`) so the
+          // delete wins on a timestamp tie — an equal-millisecond
+          // delete-right-after-edit must not resurrect the row. NaN-safe
+          // via readTimestamp ?? 0.
+          const localDeletedAt = SyncService.readTimestamp(localDoc._deletedAt) ?? 0;
+          const remoteUpdatedAt = SyncService.readUpdatedAt(remoteDoc) ?? 0;
+          if (localDeletedAt >= remoteUpdatedAt) {
             await remoteCol.updateOne({ _id: remoteDoc._id }, { $set: { _deletedAt: localDoc._deletedAt } });
             result.deleted++;
           } else {
-            // Remote was updated after local delete — resurrect locally
+            // Remote was updated strictly after local delete — resurrect locally
             const doc = this.stripForTransfer(remoteDoc);
             const transformed = transformDoc ? transformDoc(doc, "toLocal") : doc;
             await localCol.updateOne({ _id: localDoc._id }, { $set: { ...transformed, _deletedAt: null } });
@@ -481,9 +485,10 @@ export class SyncService extends EventEmitter {
         }
 
         if (!localDeleted && remoteDeleted) {
-          const remoteDeletedAt = new Date(remoteDoc._deletedAt).getTime();
-          const localUpdatedAt = new Date(localDoc.updatedAt).getTime();
-          if (remoteDeletedAt > localUpdatedAt) {
+          // Mirror of the branch above — delete wins on a tie (GH #317).
+          const remoteDeletedAt = SyncService.readTimestamp(remoteDoc._deletedAt) ?? 0;
+          const localUpdatedAt = SyncService.readUpdatedAt(localDoc) ?? 0;
+          if (remoteDeletedAt >= localUpdatedAt) {
             await localCol.updateOne({ _id: localDoc._id }, { $set: { _deletedAt: remoteDoc._deletedAt } });
             result.deleted++;
           } else {
@@ -495,9 +500,11 @@ export class SyncService extends EventEmitter {
           continue;
         }
 
-        // Both active — last-write-wins
-        const localTime = new Date(localDoc.updatedAt).getTime();
-        const remoteTime = new Date(remoteDoc.updatedAt).getTime();
+        // Both active — last-write-wins. GH #317: NaN-safe timestamps so
+        // a doc missing `updatedAt` doesn't stall the merge (it sorts as
+        // epoch 0 rather than making every comparison false).
+        const localTime = SyncService.readUpdatedAt(localDoc) ?? 0;
+        const remoteTime = SyncService.readUpdatedAt(remoteDoc) ?? 0;
 
         if (localTime > remoteTime) {
           // Local is newer — push to remote
@@ -872,14 +879,38 @@ export class SyncService extends EventEmitter {
    * inserts can store strings — handle both, and return undefined for
    * anything we can't read. */
   private static readUpdatedAt(doc: Document): number | undefined {
-    const u = doc.updatedAt;
-    if (!u) return undefined;
-    if (u instanceof Date) return u.getTime();
-    if (typeof u === "string") {
-      const t = Date.parse(u);
+    return SyncService.readTimestamp(doc.updatedAt);
+  }
+
+  /**
+   * Parse any timestamp-ish value (Date | ISO string | epoch ms) to
+   * epoch milliseconds. Returns undefined for a missing or unparseable
+   * value, so callers can apply an explicit fallback.
+   *
+   * GH #317: the conflict-resolution comparisons used
+   * `new Date(value).getTime()` directly — a doc missing `updatedAt`
+   * yielded NaN, every `NaN > x` / `NaN >= x` comparison was false, and
+   * the row never synced in either direction (a silent stall). Callers
+   * now do `readTimestamp(...) ?? 0` so a missing timestamp is treated
+   * as "epoch", not NaN.
+   */
+  private static readTimestamp(value: unknown): number | undefined {
+    // GH #317 (Codex review): only `null`/`undefined` counts as
+    // "missing". A `!value` check also swallowed a numeric `0` — a
+    // legitimate epoch timestamp — making an `updatedAt: 0` row look
+    // untimed and altering conflict resolution.
+    if (value == null) return undefined;
+    if (value instanceof Date) {
+      const t = value.getTime();
       return Number.isNaN(t) ? undefined : t;
     }
-    if (typeof u === "number") return u;
+    if (typeof value === "string") {
+      const t = Date.parse(value);
+      return Number.isNaN(t) ? undefined : t;
+    }
+    if (typeof value === "number") {
+      return Number.isNaN(value) ? undefined : value;
+    }
     return undefined;
   }
 
