@@ -14,6 +14,12 @@ interface Nozzle {
   printers?: { _id: string; name: string }[];
 }
 
+interface BedTypeOption {
+  _id: string;
+  name: string;
+  material: string;
+}
+
 interface AmsSlotEntry {
   _uid: string;
   _id?: string;
@@ -35,6 +41,7 @@ interface PrinterFormData {
   manufacturer: string;
   printerModel: string;
   installedNozzles: string[];
+  installedBedTypes: string[];
   notes: string;
   buildVolume: { x: string; y: string; z: string };
   maxFlow: string;
@@ -53,6 +60,7 @@ interface PrinterInitialData {
   manufacturer?: string;
   printerModel?: string;
   installedNozzles?: (Nozzle | string)[];
+  installedBedTypes?: (BedTypeOption | string)[];
   notes?: string;
   buildVolume?: { x: number | null; y: number | null; z: number | null };
   maxFlow?: number | null;
@@ -89,6 +97,9 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
     installedNozzles: initialData?.installedNozzles?.map((n: Nozzle | string) =>
       typeof n === "string" ? n : n._id,
     ) || [],
+    installedBedTypes: initialData?.installedBedTypes?.map((b: BedTypeOption | string) =>
+      typeof b === "string" ? b : b._id,
+    ) || [],
     notes: initialData?.notes || "",
     buildVolume: {
       x: initialData?.buildVolume?.x?.toString() ?? "",
@@ -112,6 +123,8 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
   });
   const [nozzles, setNozzles] = useState<Nozzle[]>([]);
   const [nozzlesFetchError, setNozzlesFetchError] = useState(false);
+  const [bedTypes, setBedTypes] = useState<BedTypeOption[]>([]);
+  const [bedTypesFetchError, setBedTypesFetchError] = useState(false);
   const [filamentOptions, setFilamentOptions] = useState<FilamentOption[]>([]);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -157,6 +170,21 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
     return () => ac.abort();
   }, []);
 
+  useEffect(() => {
+    const ac = new AbortController();
+    fetch("/api/bed-types", { signal: ac.signal })
+      .then((r) => {
+        if (!r.ok) throw new Error("fetch failed");
+        return r.json();
+      })
+      .then(setBedTypes)
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setBedTypesFetchError(true);
+      });
+    return () => ac.abort();
+  }, []);
+
   // Lazy-load filament options only when the user actually adds an AMS
   // slot — most printers don't have AMS, so avoid the extra request.
   useEffect(() => {
@@ -189,6 +217,16 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
       installedNozzles: f.installedNozzles.includes(id)
         ? f.installedNozzles.filter((n) => n !== id)
         : [...f.installedNozzles, id],
+    }));
+    setDirty(true);
+  };
+
+  const toggleBedType = (id: string) => {
+    setForm((f) => ({
+      ...f,
+      installedBedTypes: f.installedBedTypes.includes(id)
+        ? f.installedBedTypes.filter((b) => b !== id)
+        : [...f.installedBedTypes, id],
     }));
     setDirty(true);
   };
@@ -232,6 +270,7 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
     manufacturer: form.manufacturer,
     printerModel: form.printerModel,
     installedNozzles,
+    installedBedTypes: form.installedBedTypes,
     notes: form.notes,
     buildVolume: {
       x: parseNum(form.buildVolume.x),
@@ -652,6 +691,38 @@ export default function PrinterForm({ initialData, onSubmit, onDirtyChange }: Pr
                 </label>
               );
             })}
+          </div>
+        </div>
+      )}
+
+      {bedTypesFetchError && (
+        <div className="px-3 py-2 bg-yellow-900/30 border border-yellow-800 rounded text-sm text-yellow-300">
+          {t("printers.form.bedTypesLoadError")}
+        </div>
+      )}
+
+      {bedTypes.length > 0 && (
+        <div>
+          <label className={labelClass}>{t("printers.form.bedTypes")}</label>
+          <p className="text-xs text-gray-500 mb-2">{t("printers.form.bedTypesHint")}</p>
+          {/* Plain checkbox list — bed types are a shared catalog, so
+              (unlike nozzles) there's no per-printer conflict to surface. */}
+          <div className="grid grid-cols-2 gap-2">
+            {bedTypes.map((b) => (
+              <label
+                key={b._id}
+                className="flex items-center gap-2 px-3 py-2 rounded hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer text-sm"
+              >
+                <input
+                  type="checkbox"
+                  checked={form.installedBedTypes.includes(b._id)}
+                  onChange={() => toggleBedType(b._id)}
+                  className="w-4 h-4 rounded"
+                />
+                <span>{b.name}</span>
+                <span className="text-gray-500 text-xs">{b.material}</span>
+              </label>
+            ))}
           </div>
         </div>
       )}

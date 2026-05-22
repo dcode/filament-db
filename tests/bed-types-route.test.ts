@@ -25,9 +25,13 @@ describe("/api/bed-types", () => {
     const bedMod = await import("@/models/BedType");
     const filMod = await import("@/models/Filament");
     const nozMod = await import("@/models/Nozzle");
+    // Printer is needed by the bed-types GET — it reverse-looks-up which
+    // printers reference each bed type for the "Available On" column.
+    const prtMod = await import("@/models/Printer");
     if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
     if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
     if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
     BedType = mongoose.models.BedType;
     Filament = mongoose.models.Filament;
     Nozzle = mongoose.models.Nozzle;

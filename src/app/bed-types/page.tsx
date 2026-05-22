@@ -10,6 +10,9 @@ interface BedType {
   name: string;
   material: string;
   notes: string;
+  /** Printers this bed type is available on — reverse lookup through
+   * Printer.installedBedTypes, attached by the /api/bed-types GET. */
+  printers?: { _id: string; name: string }[];
 }
 
 export default function BedTypesPage() {
@@ -159,6 +162,7 @@ export default function BedTypesPage() {
                 </th>
                 <th className="text-left py-3 px-2">{t("bedTypes.table.name")}</th>
                 <th className="text-left py-3 px-2">{t("bedTypes.table.material")}</th>
+                <th className="text-left py-3 px-2">{t("bedTypes.table.availableOn")}</th>
                 <th className="text-left py-3 px-2">{t("bedTypes.table.notes")}</th>
                 <th className="text-right py-3 px-2">{t("bedTypes.table.actions")}</th>
               </tr>
@@ -183,6 +187,22 @@ export default function BedTypesPage() {
                     <span className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs">
                       {b.material}
                     </span>
+                  </td>
+                  <td className="py-2 px-2">
+                    {b.printers && b.printers.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {b.printers.map((p) => (
+                          <span
+                            key={p._id}
+                            className="px-1.5 py-0.5 bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200 rounded text-xs"
+                          >
+                            {p.name}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-gray-400 text-xs">&mdash;</span>
+                    )}
                   </td>
                   <td className="py-2 px-2 text-gray-500 text-xs">{b.notes || "\u2014"}</td>
                   <td className="py-2 px-2 text-right">

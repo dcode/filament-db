@@ -12,12 +12,19 @@ interface Nozzle {
   type: string;
 }
 
+interface BedTypeRef {
+  _id: string;
+  name: string;
+  material: string;
+}
+
 interface Printer {
   _id: string;
   name: string;
   manufacturer: string;
   printerModel: string;
   installedNozzles: Nozzle[];
+  installedBedTypes: BedTypeRef[];
   notes: string;
 }
 
@@ -170,6 +177,7 @@ export default function PrintersPage() {
                 <th className="text-left py-3 px-2">{t("printers.table.manufacturer")}</th>
                 <th className="text-left py-3 px-2">{t("printers.table.model")}</th>
                 <th className="text-left py-3 px-2">{t("printers.table.nozzles")}</th>
+                <th className="text-left py-3 px-2">{t("printers.table.bedTypes")}</th>
                 <th className="text-left py-3 px-2">{t("printers.table.notes")}</th>
                 <th className="text-right py-3 px-2">{t("printers.table.actions")}</th>
               </tr>
@@ -201,6 +209,22 @@ export default function PrintersPage() {
                             className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs"
                           >
                             {n.diameter}mm {n.type}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <span className="text-gray-500 text-xs">{t("printers.table.none")}</span>
+                    )}
+                  </td>
+                  <td className="py-2 px-2">
+                    {p.installedBedTypes && p.installedBedTypes.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {p.installedBedTypes.map((b) => (
+                          <span
+                            key={b._id}
+                            className="px-2 py-0.5 bg-gray-200 dark:bg-gray-800 rounded text-xs"
+                          >
+                            {b.name}
                           </span>
                         ))}
                       </div>
