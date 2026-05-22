@@ -3,6 +3,28 @@ import { MongoClient } from "mongodb";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
+import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
+
+/**
+ * GH #255: explicit ALLOW-LIST of filament fields that may be copied
+ * from a remote Atlas document. The remote DB is whatever URI the
+ * caller supplied — fully attacker-controlled — so spreading the remote
+ * document and stripping a fixed deny-list let everything unlisted
+ * through, including `syncId` / `instanceId` (a sync-engine collision /
+ * takeover vector). Cross-DB ObjectId refs (`parentId`,
+ * `compatibleNozzles`, `calibrations`) are deliberately NOT listed —
+ * they point at the source database and are force-emptied below.
+ */
+const IMPORTABLE_FILAMENT_FIELDS = [
+  "name", "vendor", "type", "color", "colorName", "cost", "density",
+  "diameter", "temperatures", "bedTypeTemps", "maxVolumetricSpeed",
+  "presets", "spools", "spoolWeight", "netFilamentWeight", "totalWeight",
+  "lowStockThreshold", "dryingTemperature", "dryingTime",
+  "transmissionDistance", "glassTempTransition", "heatDeflectionTemp",
+  "shoreHardnessA", "shoreHardnessD", "shrinkageXY", "shrinkageZ",
+  "minPrintSpeed", "maxPrintSpeed", "spoolType", "optTags", "tdsUrl",
+  "inherits", "settings",
+] as const;
 
 // POST with { uri } — list filaments from remote Atlas
 // POST with { uri, filaments: [...ids] } — import selected filaments
@@ -23,6 +45,20 @@ export async function POST(request: NextRequest) {
 
   if (!uri || typeof uri !== "string") {
     return NextResponse.json({ error: "Connection string is required" }, { status: 400 });
+  }
+
+  // GH #254: SSRF guard — without this, a request body with
+  // `uri: "mongodb://10.0.0.5:27017"` turns the server into an
+  // internal-network port scanner. Importing from a remote Atlas
+  // legitimately uses a public `mongodb+srv://` host, so require that
+  // scheme and reject any host resolving to a private/internal address.
+  try {
+    await assertSafeMongoUri(uri, { requireSrv: true, blockPrivateHosts: true });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Invalid connection string" },
+      { status: 400 },
+    );
   }
 
   const client = new MongoClient(uri, {
@@ -69,41 +105,47 @@ export async function POST(request: NextRequest) {
       let updated = 0;
 
       for (const remote of remoteFilaments) {
-        // Strip MongoDB internal fields. GH #222: include `_purged` so an
-        // import from an Atlas source that has the tombstone flag set
-        // doesn't inadvertently mark the local copy purged — and so a
-        // crafted Atlas connection can't be used as a tombstone-injection
-        // vector against a victim's local DB.
-        // eslint-disable-next-line @typescript-eslint/no-unused-vars
-        const { _id: _remoteId, __v: _remoteV, createdAt: _createdAt, updatedAt: _updatedAt, _deletedAt: _remoteDeleted, _purged: _remotePurged, ...filamentData } = remote;
+        // GH #255: copy ONLY allow-listed fields from the (attacker-
+        // controlled) remote document — `syncId` / `instanceId` /
+        // `_purged` and any other unlisted key never make it through.
+        const filamentData: Record<string, unknown> = {};
+        for (const key of IMPORTABLE_FILAMENT_FIELDS) {
+          if (remote[key] !== undefined) filamentData[key] = remote[key];
+        }
 
-        // Strip every foreign-ObjectId reference — they point at documents
-        // in the *source* Atlas database and won't resolve locally. Leaving
-        // them would surface as dangling refs in calibration/nozzle UIs.
-        //
-        // Set these to explicit empty values rather than `delete`ing them so
-        // that when `Filament.updateOne(..., filamentData)` runs on an
-        // existing row, Mongoose actually *clears* the previously-stored
-        // Atlas values. Keys absent from the update doc would otherwise
-        // leave stale Atlas IDs in place on re-import/update.
+        // Foreign-ObjectId references point at documents in the *source*
+        // Atlas database and won't resolve locally. Set them to explicit
+        // empty values (rather than omitting them) so an updateOne on an
+        // existing row actually *clears* any previously-stored Atlas IDs.
         filamentData.parentId = null;
         filamentData.compatibleNozzles = [];
         filamentData.calibrations = [];
         if (Array.isArray(filamentData.spools)) {
           for (const s of filamentData.spools) {
-            if (s && typeof s === "object") s.locationId = null;
+            if (s && typeof s === "object") (s as Record<string, unknown>).locationId = null;
           }
         }
 
-        const existing = await Filament.findOne({ name: filamentData.name, _deletedAt: null });
+        const importName = String(filamentData.name ?? "");
+        const existing = await Filament.findOne({ name: importName, _deletedAt: null });
         if (existing) {
-          await Filament.updateOne({ _id: existing._id }, filamentData);
+          // GH #255: runValidators so schema constraints (cost.min, etc.)
+          // are enforced on the update path, not just on create.
+          await Filament.updateOne(
+            { _id: existing._id },
+            filamentData,
+            { runValidators: true, context: "query" },
+          );
           updated++;
         } else {
           // If a soft-deleted doc with the same name exists, resurrect it
-          const softDeleted = await Filament.findOne({ name: filamentData.name, _deletedAt: { $ne: null } });
+          const softDeleted = await Filament.findOne({ name: importName, _deletedAt: { $ne: null } });
           if (softDeleted) {
-            await Filament.updateOne({ _id: softDeleted._id }, { ...filamentData, _deletedAt: null });
+            await Filament.updateOne(
+              { _id: softDeleted._id },
+              { ...filamentData, _deletedAt: null },
+              { runValidators: true, context: "query" },
+            );
             updated++;
           } else {
             await Filament.create(filamentData);

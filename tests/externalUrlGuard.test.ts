@@ -11,7 +11,7 @@ vi.mock("node:dns/promises", () => ({
   lookup: mockLookup,
 }));
 
-import { isPrivateIp, assertExternalUrl } from "@/lib/externalUrlGuard";
+import { isPrivateIp, assertExternalUrl, readBodyCapped } from "@/lib/externalUrlGuard";
 
 /**
  * SSRF guard tests. The module is security-critical (used by the TDS
@@ -116,9 +116,50 @@ describe("isPrivateIp — IPv6 block list", () => {
     expect(isPrivateIp("::ffff:169.254.169.254")).toBe(true);
   });
 
+  it("blocks IPv4-mapped IPv6 in hex-group form (GH #257)", () => {
+    // The dotted form was handled; the equivalent hex-group form fell
+    // through to the IPv6 branch, matched no private prefix, and was
+    // wrongly treated as public.
+    expect(isPrivateIp("::ffff:7f00:1")).toBe(true);          // 127.0.0.1
+    expect(isPrivateIp("::ffff:a9fe:a9fe")).toBe(true);       // 169.254.169.254 metadata
+    expect(isPrivateIp("::ffff:0a00:0001")).toBe(true);       // 10.0.0.1
+    expect(isPrivateIp("0:0:0:0:0:ffff:7f00:1")).toBe(true);  // fully-expanded form
+  });
+
+  it("blocks IPv4-compatible IPv6 that points at private space", () => {
+    // Deprecated ::/96 form — ::169.254.169.254 still reaches metadata.
+    expect(isPrivateIp("::a9fe:a9fe")).toBe(true);
+    expect(isPrivateIp("::7f00:1")).toBe(true);
+  });
+
+  it("blocks an unparseable IPv6 literal (fail closed)", () => {
+    expect(isPrivateIp("1:2:3:4:5:6:7:8:9")).toBe(true); // too many groups
+    expect(isPrivateIp("gggg::1")).toBe(true);            // non-hex
+    expect(isPrivateIp("12345::1")).toBe(true);           // group out of range
+  });
+
   it("allows public IPv6 (Google / Cloudflare DNS)", () => {
     expect(isPrivateIp("2001:4860:4860::8888")).toBe(false);
     expect(isPrivateIp("2606:4700:4700::1111")).toBe(false);
+  });
+});
+
+describe("readBodyCapped — GH #258 response-size guard", () => {
+  it("returns the full body when it is under the cap", async () => {
+    const res = new Response("x".repeat(100));
+    const buf = await readBodyCapped(res, 1024);
+    expect(buf.length).toBe(100);
+  });
+
+  it("throws once the streamed body exceeds the cap", async () => {
+    const res = new Response("x".repeat(5000));
+    await expect(readBodyCapped(res, 1024)).rejects.toThrow(/limit/i);
+  });
+
+  it("handles an empty body", async () => {
+    const res = new Response(null);
+    const buf = await readBodyCapped(res, 1024);
+    expect(buf.length).toBe(0);
   });
 });
 

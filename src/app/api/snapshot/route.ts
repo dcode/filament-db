@@ -282,7 +282,21 @@ async function restoreSnapshot(request: NextRequest) {
 
     // Insert snapshot data (order matters: reference targets before referrers
     // — nozzles, printers, bedTypes, locations all exist before filaments
-    // that reference them via calibrations / spools.locationId)
+    // that reference them via calibrations / spools.locationId).
+    //
+    // GH #259: `insertMany` runs WITHOUT `lean: true`. `lean` skipped
+    // Mongoose hydration entirely — so casting, schema validation, and
+    // strict-mode unknown-key stripping were all bypassed, making
+    // restore an arbitrary-document-write primitive (negative numerics,
+    // injected keys, bad types). Hydrating each doc applies the schema.
+    //
+    // GH #259 (Codex P1): `ordered: true` (NOT `ordered: false`). With
+    // `ordered: false` Mongoose inserts the valid subset and — with the
+    // default `throwOnValidationError: false` — does NOT throw, so an
+    // invalid snapshot would be acknowledged as a successful restore
+    // while silently dropping records. `ordered: true` throws on the
+    // first invalid document, and the catch below rolls every
+    // collection back to the pre-restore backup — true all-or-nothing.
     const results = {
       filaments: 0,
       nozzles: 0,
@@ -295,43 +309,43 @@ async function restoreSnapshot(request: NextRequest) {
 
     if (nozzles.length > 0) {
       const docs = (nozzles as Record<string, unknown>[]).map(restoreTypes);
-      await Nozzle.insertMany(docs, { lean: true, ordered: false });
+      await Nozzle.insertMany(docs, { ordered: true });
       results.nozzles = nozzles.length;
     }
 
     if (printers.length > 0) {
       const docs = (printers as Record<string, unknown>[]).map(restoreTypes);
-      await Printer.insertMany(docs, { lean: true, ordered: false });
+      await Printer.insertMany(docs, { ordered: true });
       results.printers = printers.length;
     }
 
     if (bedTypes.length > 0) {
       const docs = (bedTypes as Record<string, unknown>[]).map(restoreTypes);
-      await BedType.insertMany(docs, { lean: true, ordered: false });
+      await BedType.insertMany(docs, { ordered: true });
       results.bedTypes = bedTypes.length;
     }
 
     if (locations.length > 0) {
       const docs = (locations as Record<string, unknown>[]).map(restoreTypes);
-      await Location.insertMany(docs, { lean: true, ordered: false });
+      await Location.insertMany(docs, { ordered: true });
       results.locations = locations.length;
     }
 
     if (filaments.length > 0) {
       const docs = (filaments as Record<string, unknown>[]).map(restoreTypes);
-      await Filament.insertMany(docs, { lean: true, ordered: false });
+      await Filament.insertMany(docs, { ordered: true });
       results.filaments = filaments.length;
     }
 
     if (printHistory.length > 0) {
       const docs = (printHistory as Record<string, unknown>[]).map(restoreTypes);
-      await PrintHistory.insertMany(docs, { lean: true, ordered: false });
+      await PrintHistory.insertMany(docs, { ordered: true });
       results.printHistory = printHistory.length;
     }
 
     if (sharedCatalogs.length > 0) {
       const docs = (sharedCatalogs as Record<string, unknown>[]).map(restoreTypes);
-      await SharedCatalog.insertMany(docs, { lean: true, ordered: false });
+      await SharedCatalog.insertMany(docs, { ordered: true });
       results.sharedCatalogs = sharedCatalogs.length;
     }
 

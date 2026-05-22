@@ -2,11 +2,29 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament, { IFilament } from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
-import "@/models/Printer";
+import Printer from "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 import { mergeSlicerSettings } from "@/lib/slicerSettings";
+import { assignSpoolToSlot } from "@/lib/spoolSlots";
+
+/**
+ * GH #261: clear every spool of a filament out of all printer AMS slots.
+ * Deleting a filament removes its spools, but `Printer.amsSlots[].spoolId`
+ * still references them — leaving printers showing a phantom spool that
+ * can never be cleared from the (now-gone) spool side. The spool DELETE
+ * handler already does this per-spool; the filament DELETE must too.
+ */
+async function clearFilamentSpoolsFromSlots(
+  spools: { _id?: unknown }[] | undefined | null,
+): Promise<void> {
+  for (const spool of spools ?? []) {
+    if (spool?._id) {
+      await assignSpoolToSlot(Printer, String(spool._id), null);
+    }
+  }
+}
 
 /**
  * GET /api/filaments/{id}
@@ -134,6 +152,13 @@ export async function PUT(
     delete body._parent;
     delete body._variants;
     delete body._inherited;
+    // GH #260: `spools` is NOT editable through the filament PUT. Spools
+    // have dedicated CRUD endpoints (POST/PUT/DELETE /spools/...) that
+    // validate via validateSpoolBody — a bulk PUT of the whole `spools`
+    // array would bypass that and let a client rewrite a spool's
+    // usageHistory ledger, inject a non-numeric totalWeight, etc. The
+    // edit form never sends `spools`; strip it as a hard guarantee.
+    delete body.spools;
 
     // Validate parentId if provided
     if (body.parentId) {
@@ -462,7 +487,7 @@ export async function DELETE(
         _deletedAt: { $ne: null },
         _purged: { $ne: true },
       })
-        .select("_id")
+        .select("_id spools")
         .lean();
       if (!trashed) {
         return errorResponse(
@@ -486,6 +511,16 @@ export async function DELETE(
           400,
         );
       }
+      // GH #261/#333: drop this filament's spools from every printer AMS
+      // slot BEFORE the purge write. `_purged` is a one-way tombstone — if
+      // slot cleanup ran afterwards and failed, the precondition above
+      // (`_purged: { $ne: true }`) would reject every retry, leaving the
+      // dangling slot refs uncleanable forever. Clearing first keeps the
+      // operation retryable: a failure here leaves the filament in the
+      // trash, exactly the state the retry expects.
+      await clearFilamentSpoolsFromSlots(
+        (trashed as { spools?: { _id?: unknown }[] }).spools,
+      );
       // Don't physically `deleteOne` here. The hybrid sync engine pairs
       // docs across peers by syncId and treats "missing on one side" as a
       // fresh insert from the other side — so a hard delete on one peer
@@ -508,14 +543,24 @@ export async function DELETE(
       );
     }
 
-    const filament = await Filament.findOneAndUpdate(
-      { _id: id, _deletedAt: null },
-      { _deletedAt: new Date() },
-      { returnDocument: "after" }
-    ).lean();
+    const filament = await Filament.findOne({ _id: id, _deletedAt: null })
+      .select("_id spools")
+      .lean();
     if (!filament) {
       return errorResponse("Not found", 404);
     }
+    // GH #261/#333: drop this filament's spools from every printer AMS slot
+    // BEFORE the soft-delete write. If slot cleanup fails the filament is
+    // still active and the whole DELETE is retryable; clearing afterwards
+    // would 404 the retry (`_deletedAt: null` no longer matches) and leave
+    // dangling slot refs behind.
+    await clearFilamentSpoolsFromSlots(
+      (filament as { spools?: { _id?: unknown }[] }).spools,
+    );
+    await Filament.updateOne(
+      { _id: id, _deletedAt: null },
+      { _deletedAt: new Date() },
+    );
     return NextResponse.json({ message: "Deleted" });
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to delete filament");

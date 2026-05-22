@@ -7,7 +7,7 @@
  * Supported providers: Google Gemini, Anthropic Claude, OpenAI ChatGPT.
  */
 
-import { assertExternalUrl } from "@/lib/externalUrlGuard";
+import { assertExternalUrl, ssrfDispatcher, readBodyCapped } from "@/lib/externalUrlGuard";
 
 export type AiProvider = "gemini" | "claude" | "openai";
 
@@ -145,7 +145,11 @@ async function fetchTdsContent(url: string): Promise<TdsContent> {
           Accept: "text/html,application/xhtml+xml,application/pdf,*/*",
         },
         redirect: "manual",
-      });
+        // GH #256: pin the socket to the SSRF-validated IP so a DNS
+        // rebind between assertExternalUrl and connect can't reach
+        // private space.
+        dispatcher: ssrfDispatcher,
+      } as RequestInit & { dispatcher?: typeof ssrfDispatcher });
 
       // Treat 3xx (except 304) as a redirect we follow ourselves so the
       // next hop is re-validated.
@@ -177,28 +181,22 @@ async function fetchTdsContent(url: string): Promise<TdsContent> {
     }
 
     const contentType = res.headers.get("content-type") || "";
-    const contentLength = parseInt(res.headers.get("content-length") || "0", 10);
-
-    if (contentLength > MAX_CONTENT_SIZE) {
-      throw new Error(`TDS content too large (${(contentLength / 1024 / 1024).toFixed(1)} MB). Maximum is 10 MB.`);
-    }
-
     const isPdf = contentType.includes("application/pdf") || url.toLowerCase().endsWith(".pdf");
 
+    // GH #258: enforce the size cap on the bytes ACTUALLY received.
+    // A `content-length` header is advisory — a hostile host can omit
+    // it or lie, and `res.text()` / `res.arrayBuffer()` would then
+    // buffer an unbounded body into memory. readBodyCapped aborts the
+    // stream the moment it crosses the limit.
+    const body = await readBodyCapped(res, MAX_CONTENT_SIZE);
+
     if (isPdf) {
-      const buffer = await res.arrayBuffer();
-      if (buffer.byteLength > MAX_CONTENT_SIZE) {
-        throw new Error(`PDF too large (${(buffer.byteLength / 1024 / 1024).toFixed(1)} MB). Maximum is 10 MB.`);
-      }
-      const base64 = Buffer.from(buffer).toString("base64");
+      const base64 = body.toString("base64");
       return { type: "pdf", data: base64, mimeType: "application/pdf" };
     }
 
     // HTML/text content
-    let text = await res.text();
-    if (text.length > MAX_CONTENT_SIZE) {
-      text = text.slice(0, MAX_CONTENT_SIZE);
-    }
+    let text = body.toString("utf-8");
 
     // Strip HTML tags, scripts, styles to get clean text
     text = text
