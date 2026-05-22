@@ -15,6 +15,10 @@ interface MongooseCache {
      * one physical instance per printer. Idempotent: on a clean DB the
      * pass finds no duplicates and the flag is set on first connect. */
     nozzlePhysicalInstances: boolean;
+    /** GH #303 — run syncIndexes() on the core models so a pre-existing
+     * plain unique `name` (or `instanceId`) index is dropped and rebuilt
+     * as the partial-unique-on-non-deleted index the schema declares. */
+    coreModelIndexes: boolean;
   };
 }
 
@@ -35,7 +39,7 @@ export default async function dbConnect() {
     conn: null,
     promise: null,
     uri: null,
-    migrations: { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false },
+    migrations: { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false, coreModelIndexes: false },
   };
 
   if (!global.mongoose) {
@@ -49,7 +53,17 @@ export default async function dbConnect() {
     cached.conn = null;
     cached.promise = null;
     cached.uri = null;
-    cached.migrations = { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false };
+    cached.migrations = { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false, coreModelIndexes: false };
+  }
+
+  // GH #312: a cached connection can go dead after a DB outage or an
+  // Atlas failover. mongoose.connection.readyState === 1 means
+  // "connected"; anything else (0 disconnected, 2 connecting,
+  // 3 disconnecting) means the cached handle is stale. Drop it so the
+  // reconnect path below runs instead of returning a dead handle.
+  if (cached.conn && mongoose.connection.readyState !== 1) {
+    cached.conn = null;
+    cached.promise = null;
   }
 
   // Short-circuit only when both the connection AND all migrations are
@@ -60,7 +74,8 @@ export default async function dbConnect() {
     cached.conn &&
     cached.migrations.instanceIds &&
     cached.migrations.sharedCatalogIndexes &&
-    cached.migrations.nozzlePhysicalInstances
+    cached.migrations.nozzlePhysicalInstances &&
+    cached.migrations.coreModelIndexes
   ) {
     return cached.conn;
   }
@@ -111,6 +126,39 @@ export default async function dbConnect() {
       cached.migrations.sharedCatalogIndexes = true;
     } catch (err) {
       console.error("[migration] Failed to sync SharedCatalog indexes (will retry on next connect):", err);
+    }
+  }
+
+  // GH #303: Filament / Location / BedType / Nozzle / Printer all declare
+  // a partial-unique index on `name` (and Filament also on `instanceId`,
+  // GH #302). Mongoose's autoIndex builds *missing* indexes but will not
+  // drop a pre-existing plain unique index and replace it with the
+  // partial one. On any DB whose `name` index predates the partial-index
+  // change, the soft-delete name-reuse feature silently fails with
+  // E11000. syncIndexes() drops mismatched indexes and recreates them —
+  // idempotent on fresh DBs, corrective on upgraded ones. Same
+  // retry-tracked pattern as the SharedCatalog block above.
+  if (!cached.migrations.coreModelIndexes) {
+    try {
+      const models = await Promise.all([
+        import("@/models/Filament"),
+        import("@/models/Location"),
+        import("@/models/BedType"),
+        import("@/models/Nozzle"),
+        import("@/models/Printer"),
+      ]);
+      for (const mod of models) {
+        const model = mod.default;
+        const dropped = await model.syncIndexes();
+        if (dropped.length > 0) {
+          console.log(
+            `[migration] Rebuilt ${model.modelName} indexes (dropped: ${dropped.join(", ")})`,
+          );
+        }
+      }
+      cached.migrations.coreModelIndexes = true;
+    } catch (err) {
+      console.error("[migration] Failed to sync core model indexes (will retry on next connect):", err);
     }
   }
 

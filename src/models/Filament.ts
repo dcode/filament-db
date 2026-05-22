@@ -193,7 +193,12 @@ const FilamentSchema = new Schema<IFilament>(
   {
     name: { type: String, required: true },
     syncId: { type: String, unique: true, sparse: true, index: true },
-    instanceId: { type: String, unique: true, default: generateInstanceId },
+    // GH #302: NOT a field-level `unique: true` — that builds a plain
+    // unique index that collides with soft-delete / `_purged` tombstone
+    // rows (a snapshot restore / re-import can E11000 against a hidden
+    // tombstone). The partial-unique index registered below scopes
+    // uniqueness to non-deleted documents, matching the `name` index.
+    instanceId: { type: String, default: generateInstanceId },
     vendor: { type: String, required: true, index: true },
     type: { type: String, required: true, index: true },
     color: { type: String, default: "#808080" },
@@ -342,6 +347,15 @@ const FilamentSchema = new Schema<IFilament>(
 // Partial unique index: enforce unique names only among non-deleted documents
 FilamentSchema.index(
   { name: 1 },
+  { unique: true, partialFilterExpression: { _deletedAt: null } }
+);
+
+// GH #302: instanceId is unique only among non-deleted documents — see
+// the field definition above. Scoping to `_deletedAt: null` keeps a
+// re-imported / restored filament from colliding with a tombstone row
+// that still carries the same instanceId.
+FilamentSchema.index(
+  { instanceId: 1 },
   { unique: true, partialFilterExpression: { _deletedAt: null } }
 );
 
