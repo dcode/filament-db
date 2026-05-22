@@ -38,16 +38,24 @@ vi.mock("electron-updater", () => ({
 }));
 
 interface FakeWindow {
-  webContents: { send: ReturnType<typeof vi.fn> };
+  webContents: { send: ReturnType<typeof vi.fn>; isDestroyed: () => boolean };
+  isDestroyed: () => boolean;
 }
 /**
  * Each fake window gets its OWN send spy. Sharing one would let a
  * regression that still emits to the previous window slip through —
  * `win2.webContents.send` and `win1.webContents.send` would be the
  * same mock and any call would satisfy either assertion.
+ *
+ * `isDestroyed` mirrors the real BrowserWindow / webContents API —
+ * `emit()` consults it before sending (GH #239). Defaults to a live
+ * window; tests flip it to simulate a closed one.
  */
 function makeWin(): FakeWindow {
-  return { webContents: { send: vi.fn() } };
+  return {
+    webContents: { send: vi.fn(), isDestroyed: () => false },
+    isDestroyed: () => false,
+  };
 }
 
 describe("initAutoUpdater — idempotency", () => {
@@ -115,5 +123,17 @@ describe("initAutoUpdater — idempotency", () => {
     // are required to verify this; with the previous shared-spy setup a
     // regression that still targeted win1 would have been invisible.
     expect(win1.webContents.send.mock.calls.length).toBe(win1CallsAfterFirstInit);
+  });
+
+  it("does not emit to a destroyed window (GH #239)", () => {
+    // On macOS the app keeps running after the window is closed; a
+    // periodic update check still fires emit(). Touching webContents on
+    // a destroyed window throws "Object has been destroyed" — emit()
+    // must short-circuit instead.
+    const win = makeWin();
+    win.isDestroyed = () => true;
+
+    expect(() => initAutoUpdater(win)).not.toThrow();
+    expect(win.webContents.send).not.toHaveBeenCalled();
   });
 });
