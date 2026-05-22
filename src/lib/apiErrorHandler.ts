@@ -22,6 +22,20 @@ export function errorResponse(
 }
 
 /**
+ * True when an error is a MongoDB duplicate-key error (code 11000) —
+ * e.g. a `create` that collided with a partial-unique index. Useful for
+ * retry-on-duplicate logic where a concurrent insert raced this one.
+ */
+export function isDuplicateKeyError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    (err as { code: unknown }).code === 11000
+  );
+}
+
+/**
  * Checks if an error is a MongoDB duplicate-key error (code 11000).
  * Returns a formatted 409 response if so, otherwise null.
  */
@@ -29,12 +43,7 @@ export function handleDuplicateKeyError(
   err: unknown,
   entityName: string,
 ): NextResponse | null {
-  if (
-    typeof err === "object" &&
-    err !== null &&
-    "code" in err &&
-    (err as { code: number }).code === 11000
-  ) {
+  if (isDuplicateKeyError(err)) {
     const keyValue = (err as { keyValue?: Record<string, unknown> }).keyValue;
     const field = keyValue ? Object.keys(keyValue)[0] : "field";
     const value = keyValue ? Object.values(keyValue)[0] : "unknown";

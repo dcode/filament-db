@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
 import { parseIniFilaments } from "@/lib/parseIni";
-import { checkFileSize } from "@/lib/apiErrorHandler";
+import { checkFileSize, isDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function POST(request: NextRequest) {
   try {
@@ -82,8 +82,27 @@ export async function POST(request: NextRequest) {
           continue;
         }
 
-        await Filament.create({ name, ...rest });
-        created++;
+        // No active or trashed row — create. GH #327 (Codex): a
+        // concurrent import of the same new name can race two requests
+        // past the lookups above and both into create(); the
+        // partial-unique index then throws E11000 for the loser. Treat
+        // that as "another request just created it" and fall through to
+        // an update, so identical parallel imports stay idempotent
+        // instead of intermittently erroring.
+        try {
+          await Filament.create({ name, ...rest });
+          created++;
+        } catch (createErr) {
+          if (!isDuplicateKeyError(createErr)) throw createErr;
+          const raced = await Filament.findOne({ name, _deletedAt: null });
+          if (!raced) throw createErr;
+          await Filament.updateOne(
+            { _id: raced._id },
+            { $set: rest },
+            { runValidators: true, context: "query" },
+          );
+          updated++;
+        }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         errors.push(`${filament.name}: ${msg}`);

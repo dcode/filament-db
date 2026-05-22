@@ -7,6 +7,7 @@ import "@/models/BedType";
 import { resolveFilament } from "@/lib/resolveFilament";
 import { generatePrusaSlicerBundle } from "@/lib/prusaSlicerBundle";
 import { parseIniFilaments } from "@/lib/parseIni";
+import { isDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 /**
  * GET /api/filaments/prusaslicer
@@ -187,8 +188,28 @@ export async function POST(request: NextRequest) {
           );
           updated++;
         } else {
-          await Filament.create(doc);
-          created++;
+          // GH #327 (Codex): retry-on-duplicate. Two concurrent imports
+          // of the same new name can both pass the lookups above and
+          // race into create(); the partial-unique index then throws
+          // E11000 for the loser. Resolve that as an update so parallel
+          // identical imports stay idempotent instead of 500-ing.
+          try {
+            await Filament.create(doc);
+            created++;
+          } catch (createErr) {
+            if (!isDuplicateKeyError(createErr)) throw createErr;
+            const raced = await Filament.findOne({
+              name: f.name,
+              _deletedAt: null,
+            });
+            if (!raced) throw createErr;
+            await Filament.updateOne(
+              { _id: raced._id },
+              { $set: doc },
+              { runValidators: true, context: "query" },
+            );
+            updated++;
+          }
         }
       }
 
