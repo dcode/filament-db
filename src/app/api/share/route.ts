@@ -129,6 +129,22 @@ export async function POST(request: NextRequest) {
         ? new Date(body.expiresAt)
         : null;
 
+    // GH #282: the catalog document must stay under MongoDB's 16MB BSON
+    // limit. Spool subdocuments (which carry base64 photoDataUrl images
+    // + usage/dry history) are already stripped from each filament
+    // above, but a very large catalog could still approach the limit
+    // from filament count alone. Reject with a clear message before the
+    // write rather than letting Mongo hard-fail mid-insert.
+    const MAX_PAYLOAD_BYTES = 12 * 1024 * 1024; // 12MB — headroom under 16MB
+    const payloadBytes = Buffer.byteLength(JSON.stringify(payload), "utf8");
+    if (payloadBytes > MAX_PAYLOAD_BYTES) {
+      return errorResponse(
+        `This catalog is too large to publish (${(payloadBytes / 1024 / 1024).toFixed(1)}MB). ` +
+          `Select fewer filaments — the limit is ${MAX_PAYLOAD_BYTES / 1024 / 1024}MB.`,
+        413,
+      );
+    }
+
     const catalog = await SharedCatalog.create({
       title: body.title.trim(),
       description: typeof body.description === "string" ? body.description : "",

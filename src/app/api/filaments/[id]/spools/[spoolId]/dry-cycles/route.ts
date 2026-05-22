@@ -3,6 +3,11 @@ import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 
+/** GH #304: hard cap on a spool's embedded dryCycles array — same
+ * unbounded-growth concern as usageHistory. The `$slice: -N` modifier
+ * on the `$push` keeps only the most recent N entries atomically. */
+const MAX_DRY_CYCLES = 1000;
+
 /**
  * POST /api/filaments/{id}/spools/{spoolId}/dry-cycles — log a dry cycle.
  *
@@ -50,7 +55,10 @@ export async function POST(
     const { id, spoolId } = await params;
     const filament = await Filament.findOneAndUpdate(
       { _id: id, _deletedAt: null, "spools._id": spoolId },
-      { $push: { "spools.$.dryCycles": entry } },
+      // GH #304: $slice: -N keeps only the most recent MAX_DRY_CYCLES
+      // entries, so a looping client can't grow the filament document
+      // toward the 16MB BSON limit.
+      { $push: { "spools.$.dryCycles": { $each: [entry], $slice: -MAX_DRY_CYCLES } } },
       { returnDocument: "after" },
     ).lean();
     if (!filament) {
