@@ -390,30 +390,39 @@ export async function POST(
     await Filament.findByIdAndUpdate(filament._id, { $set: update });
 
     // GH #265 (Codex P1): persist an inheriting variant's calibration
-    // change on its parent with an ATOMIC per-entry write. Try to $set
-    // the matching calibration sub-document in place; if no entry
-    // exists yet, $push a new one. This never rewrites the parent's
-    // whole `calibrations` array, so two variants syncing the same
-    // parent concurrently can't drop each other's entries.
+    // change on its parent with an ATOMIC per-entry write — never a
+    // read-modify-write of the parent's whole `calibrations` array, so
+    // two variants syncing the same parent concurrently can't drop each
+    // other's entries.
     if (parentCalibrationWrite) {
       const { nozzleId, fields } = parentCalibrationWrite;
       const setEntry: Record<string, number | null> = {};
       for (const [k, v] of Object.entries(fields)) {
         setEntry[`calibrations.$.${k}`] = v;
       }
+      const elemMatch = { calibrations: { $elemMatch: { nozzle: nozzleId, printer: null } } };
+      // 1) Update the matching calibration sub-document in place.
       const res = await Filament.updateOne(
-        {
-          _id: calTarget._id,
-          calibrations: { $elemMatch: { nozzle: nozzleId, printer: null } },
-        },
+        { _id: calTarget._id, ...elemMatch },
         { $set: setEntry },
       );
       if (res.matchedCount === 0) {
-        // No nozzle-matching entry yet — append one.
-        await Filament.updateOne(
-          { _id: calTarget._id },
+        // 2) No entry yet — append one, but CONDITIONALLY: the filter
+        // requires the array to still lack a matching element, so two
+        // concurrent requests can't both $push a duplicate
+        // (nozzle, printer:null) entry (Codex P1).
+        const inserted = await Filament.updateOne(
+          { _id: calTarget._id, calibrations: { $not: { $elemMatch: { nozzle: nozzleId, printer: null } } } },
           { $push: { calibrations: { nozzle: nozzleId, printer: null, ...fields } } },
         );
+        if (inserted.matchedCount === 0) {
+          // 3) A concurrent request inserted the entry first — apply our
+          // fields to it in place so this sync isn't silently lost.
+          await Filament.updateOne(
+            { _id: calTarget._id, ...elemMatch },
+            { $set: setEntry },
+          );
+        }
       }
     }
 
