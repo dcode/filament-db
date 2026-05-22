@@ -54,6 +54,13 @@ const nextConfig: NextConfig = {
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
       "connect-src 'self'",
+      // GH #250 — the filament detail page renders an embeddable vendor
+      // TDS document in an <iframe> once /api/embed-check confirms the
+      // vendor permits framing. Without an explicit frame-src that load
+      // falls back to default-src 'self' and the browser blocks it, so
+      // the "view TDS" feature silently fails. Restrict to https so only
+      // TLS-served documents can be framed.
+      "frame-src https:",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",

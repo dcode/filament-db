@@ -1043,7 +1043,11 @@ app.whenReady().then(async () => {
         // Next.js streams the RSC payload via inline <script> tags and
         // the theme-init bootstrap is inline; migrating those to a
         // per-request nonce is tracked separately in #225.
-        "Content-Security-Policy": ["default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:;"],
+        // GH #250: `frame-src https:` lets the filament detail page embed
+        // an embeddable vendor TDS document in an <iframe>; without it the
+        // load falls back to default-src 'self' and is blocked even after
+        // /api/embed-check confirms the vendor allows framing.
+        "Content-Security-Policy": ["default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:; frame-src https:;"],
       },
     });
   });
