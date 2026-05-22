@@ -174,6 +174,16 @@ for (const [name, val] of Object.entries(OPT_TAG)) {
 
 // ── Low-level CBOR helpers ──────────────────────────────────────────
 
+/**
+ * Clamp a temperature to a non-negative integer before CBOR encoding
+ * (GH #274). `encodeCBORUint` rejects negatives and mis-encodes
+ * fractional values; temperatures can arrive negative/fractional from
+ * imports or manual edits.
+ */
+function clampTemp(value: number): number {
+  return Math.max(0, Math.round(value));
+}
+
 /** Encode a CBOR unsigned integer (major type 0) and push bytes to `buf`. */
 export function encodeCBORUint(buf: number[], value: number): void {
   if (value < 0) throw new RangeError("CBOR unsigned int must be >= 0");
@@ -618,15 +628,18 @@ function buildMainMap(input: OpenPrintTagInput): number[] {
     encodeCBORUint(buf, input.shoreHardnessD);
   }
 
-  // Temperatures – all type: int, unit: °C
+  // Temperatures – all type: int, unit: °C.
+  // GH #274: encodeCBORUint throws RangeError on any value < 0, and a
+  // non-integer would encode a bad byte. Temperatures can arrive
+  // negative or fractional from a bad import, AI-extracted garbage, or a
+  // manual edit — clamp every value through clampTemp() (max(0, round))
+  // before it reaches the encoder so a bad input can't crash the whole
+  // NFC-write path.
   if (input.nozzleTemp != null) {
     // Use nozzle temp as max, derive min as temp - 20
-    const maxTemp = input.nozzleTemp;
-    const minTemp = Math.max(
-      0,
-      (input.nozzleTempFirstLayer ?? maxTemp) - 20,
-    );
-    const preheatTemp = Math.max(0, minTemp - 20);
+    const maxTemp = clampTemp(input.nozzleTemp);
+    const minTemp = clampTemp((input.nozzleTempFirstLayer ?? maxTemp) - 20);
+    const preheatTemp = clampTemp(minTemp - 20);
 
     encodeCBORKey(buf, OPT_KEY.MIN_PRINT_TEMPERATURE);
     encodeCBORUint(buf, minTemp);
@@ -637,8 +650,8 @@ function buildMainMap(input: OpenPrintTagInput): number[] {
   }
 
   if (input.bedTemp != null) {
-    const maxBed = input.bedTemp;
-    const minBed = input.bedTempFirstLayer ?? Math.max(0, maxBed - 10);
+    const maxBed = clampTemp(input.bedTemp);
+    const minBed = clampTemp(input.bedTempFirstLayer ?? maxBed - 10);
 
     encodeCBORKey(buf, OPT_KEY.MIN_BED_TEMPERATURE);
     encodeCBORUint(buf, Math.min(minBed, maxBed));
@@ -648,7 +661,7 @@ function buildMainMap(input: OpenPrintTagInput): number[] {
 
   if (input.chamberTemp != null && input.chamberTemp > 0) {
     encodeCBORKey(buf, OPT_KEY.CHAMBER_TEMPERATURE);
-    encodeCBORUint(buf, input.chamberTemp);
+    encodeCBORUint(buf, clampTemp(input.chamberTemp));
   }
 
   // material_abbreviation (max 7 chars)

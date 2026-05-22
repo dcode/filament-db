@@ -103,26 +103,36 @@ function decodeCBORItem(
     offset += 2;
   } else if (additional === 26) {
     if (offset + 4 > data.length) throw new Error("CBOR decode: unexpected end of data reading 4-byte argument");
+    // GH #275: the `|` chain is signed 32-bit arithmetic — a value with
+    // the high bit set would otherwise come out negative (a negative
+    // array/map count silently decodes an empty container; a negative
+    // uint returns a wrong value). The trailing `>>> 0` coerces the
+    // whole assembly back to an unsigned 32-bit integer.
     argument =
-      ((data[offset] << 24) >>> 0) |
-      (data[offset + 1] << 16) |
-      (data[offset + 2] << 8) |
-      data[offset + 3];
+      (((data[offset] << 24) >>> 0) |
+        (data[offset + 1] << 16) |
+        (data[offset + 2] << 8) |
+        data[offset + 3]) >>>
+      0;
     offset += 4;
   } else if (additional === 27) {
     if (offset + 8 > data.length) throw new Error("CBOR decode: unexpected end of data reading 8-byte argument");
-    // 64-bit - read as two 32-bit values
+    // 64-bit - read as two 32-bit values. GH #275: each half is coerced
+    // unsigned (`>>> 0`) for the same signed-arithmetic reason as the
+    // 4-byte case above.
     const hi =
-      ((data[offset] << 24) >>> 0) |
-      (data[offset + 1] << 16) |
-      (data[offset + 2] << 8) |
-      data[offset + 3];
+      (((data[offset] << 24) >>> 0) |
+        (data[offset + 1] << 16) |
+        (data[offset + 2] << 8) |
+        data[offset + 3]) >>>
+      0;
     offset += 4;
     const lo =
-      ((data[offset] << 24) >>> 0) |
-      (data[offset + 1] << 16) |
-      (data[offset + 2] << 8) |
-      data[offset + 3];
+      (((data[offset] << 24) >>> 0) |
+        (data[offset + 1] << 16) |
+        (data[offset + 2] << 8) |
+        data[offset + 3]) >>>
+      0;
     offset += 4;
     argument = hi * 0x100000000 + lo;
   } else if (additional === 31) {
@@ -375,8 +385,16 @@ export function decodeOpenPrintTagBinary(data: Uint8Array): DecodedOpenPrintTag 
       .filter(Boolean);
   }
 
-  // Decode auxiliary region if present
-  if (meta.AUX_REGION_OFFSET != null && meta.AUX_REGION_OFFSET < data.length) {
+  // Decode auxiliary region if present. GH #311: AUX_REGION_OFFSET comes
+  // from untrusted tag bytes — require a non-negative integer strictly
+  // inside the buffer, otherwise decodeCBORItem would read at a negative
+  // index (→ undefined → silently-wrong decode instead of a clean skip).
+  if (
+    meta.AUX_REGION_OFFSET != null &&
+    Number.isInteger(meta.AUX_REGION_OFFSET) &&
+    meta.AUX_REGION_OFFSET >= 0 &&
+    meta.AUX_REGION_OFFSET < data.length
+  ) {
     try {
       const [auxRaw] = decodeCBORItem(data, meta.AUX_REGION_OFFSET);
       const auxMap = auxRaw as Record<string, unknown>;

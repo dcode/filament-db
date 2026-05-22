@@ -311,10 +311,15 @@ function parseNdefRecord(
   offset: number,
   messageLen: number,
 ): Uint8Array {
-  const messageEnd = offset + messageLen;
+  // GH #313: bound every read against the enclosing TLV's end, not the
+  // whole tag image. A crafted record could otherwise declare a
+  // payloadLength that fits inside `data.length` but spills past the
+  // NDEF message TLV, pulling in trailing bytes from outside it. Clamp
+  // messageEnd to the buffer so it's also a hard upper bound on reads.
+  const messageEnd = Math.min(offset + messageLen, data.length);
 
   while (offset < messageEnd) {
-    if (offset + 2 > data.length) {
+    if (offset + 2 > messageEnd) {
       throw new Error("NDEF record truncated: not enough bytes for record header");
     }
 
@@ -327,10 +332,10 @@ function parseNdefRecord(
 
     let payloadLength: number;
     if (isShortRecord) {
-      if (offset >= data.length) throw new Error("NDEF record truncated: missing payload length");
+      if (offset >= messageEnd) throw new Error("NDEF record truncated: missing payload length");
       payloadLength = data[offset++];
     } else {
-      if (offset + 4 > data.length) throw new Error("NDEF record truncated: incomplete payload length");
+      if (offset + 4 > messageEnd) throw new Error("NDEF record truncated: incomplete payload length");
       payloadLength =
         ((data[offset] << 24) |
         (data[offset + 1] << 16) |
@@ -341,12 +346,12 @@ function parseNdefRecord(
 
     let idLength = 0;
     if (hasIdLength) {
-      if (offset >= data.length) throw new Error("NDEF record truncated: missing ID length");
+      if (offset >= messageEnd) throw new Error("NDEF record truncated: missing ID length");
       idLength = data[offset++];
     }
 
-    if (offset + typeLength + idLength + payloadLength > data.length) {
-      throw new Error("NDEF record truncated: type + id + payload exceeds available data");
+    if (offset + typeLength + idLength + payloadLength > messageEnd) {
+      throw new Error("NDEF record truncated: type + id + payload exceeds the NDEF message TLV");
     }
 
     // Read type

@@ -72,7 +72,21 @@ function readString(buf: Buffer, start: number, length: number): string {
  * Sector trailers (blocks 3, 7, 11, ...) are excluded.
  */
 export function parseBambuBlocks(blocks: (Buffer | undefined)[]): BambuTagData {
-  const block = (n: number): Buffer => blocks[n] ?? Buffer.alloc(16);
+  // GH #314: every block is normalised to exactly 16 bytes before the
+  // fixed-offset readUInt16LE / readFloatLE calls below. A
+  // successful-but-short MIFARE read (a malformed-but-authenticated
+  // response) is stored as-is; without this, an offset read past the
+  // end of a short buffer throws an unhandled RangeError out of the
+  // parser. A missing block → all-zero; a short block → zero-padded;
+  // an over-long block → truncated.
+  const block = (n: number): Buffer => {
+    const b = blocks[n];
+    if (!b) return Buffer.alloc(16);
+    if (b.length === 16) return b;
+    const normalised = Buffer.alloc(16);
+    b.copy(normalised, 0, 0, Math.min(b.length, 16));
+    return normalised;
+  };
 
   // Block 1: Material Variant ID (0-7) + Material ID (8-15)
   const b1 = block(1);
