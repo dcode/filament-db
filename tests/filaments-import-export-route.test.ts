@@ -173,7 +173,8 @@ filament_vendor = New
       await Filament.create({ name: "Export PLA", vendor: "T", type: "PLA" });
       const res = await exportFilaments();
       expect(res.status).toBe(200);
-      expect(res.headers.get("Content-Type")).toBe("text/plain");
+      // GH #341 aligned this with /api/filaments/prusaslicer (charset=utf-8)
+      expect(res.headers.get("Content-Type")).toMatch(/^text\/plain(;\s*charset=utf-8)?$/);
       expect(res.headers.get("Content-Disposition")).toMatch(/attachment.*\.ini/);
       const text = await res.text();
       expect(text).toMatch(/Export PLA/);

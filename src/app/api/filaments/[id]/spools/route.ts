@@ -76,7 +76,11 @@ export async function POST(
     if (!filament) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
-    return NextResponse.json(filament);
+    // GH #341: align with the other create endpoints (nozzles, printers,
+    // bed-types, locations, filaments, print-history) which all return 201
+    // on a successful POST. This used to return 200 which violates the
+    // documented REST semantics and trips polite HTTP clients.
+    return NextResponse.json(filament, { status: 201 });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: "Failed to add spool", detail: message }, { status: 500 });

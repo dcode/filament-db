@@ -63,7 +63,7 @@ describe("POST /api/filaments/[id]/spools — body validation (GH #203)", () => 
     const res = await createSpool(postReq(String(f._id), { totalWeight: 1000 }), {
       params: Promise.resolve({ id: String(f._id) }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(201);
     const fresh = await Filament.findById(f._id);
     expect(fresh.spools).toHaveLength(1);
     expect(fresh.spools[0].totalWeight).toBe(1000);
@@ -74,7 +74,7 @@ describe("POST /api/filaments/[id]/spools — body validation (GH #203)", () => 
     const res = await createSpool(postReq(String(f._id), { label: "Drybox A" }), {
       params: Promise.resolve({ id: String(f._id) }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(201);
     const fresh = await Filament.findById(f._id);
     expect(fresh.spools[0].label).toBe("Drybox A");
   });
@@ -87,7 +87,7 @@ describe("POST /api/filaments/[id]/spools — body validation (GH #203)", () => 
     const res = await createSpool(postReq(String(f._id), { locationId: String(loc._id) }), {
       params: Promise.resolve({ id: String(f._id) }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(201);
     const fresh = await Filament.findById(f._id);
     expect(String(fresh.spools[0].locationId)).toBe(String(loc._id));
   });
@@ -104,7 +104,7 @@ describe("POST /api/filaments/[id]/spools — body validation (GH #203)", () => 
       }),
       { params: Promise.resolve({ id: String(f._id) }) },
     );
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(201);
     const fresh = await Filament.findById(f._id);
     const s = fresh.spools[0];
     expect(s.label).toBe("Yellow");

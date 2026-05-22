@@ -127,3 +127,24 @@ export function checkFileSize(file: File): NextResponse | null {
   }
   return null;
 }
+
+/**
+ * GH #338: short-circuit a route when the body isn't `multipart/form-data`,
+ * before the downstream `await request.formData()` throws the runtime's
+ * "Content-Type was not one of …" error — which the catch-all error
+ * handlers then map to 500. A wrong/missing content type is a CLIENT
+ * input error and belongs at 400 with a clear message.
+ *
+ * Returns `null` when the request is multipart; an `errorResponse(...)`
+ * otherwise, ready to short-circuit the handler.
+ */
+export function assertMultipartFormData(request: Request): NextResponse | null {
+  const contentType = (request.headers.get("content-type") || "").toLowerCase();
+  if (!contentType.includes("multipart/form-data")) {
+    return errorResponse(
+      "Upload the file as multipart/form-data (Content-Type: multipart/form-data with a 'file' field).",
+      400,
+    );
+  }
+  return null;
+}

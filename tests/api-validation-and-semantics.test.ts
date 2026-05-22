@@ -1,0 +1,304 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+
+/**
+ * Route-level regression guards for the validation / semantics PR
+ * (#337 numeric validation, #338 import HTTP semantics, #339 spools/import
+ * multipart, #340 print-history GET/PUT, #341 spool POST 201).
+ *
+ * These all hit real route handlers; the model-reset pattern matches the
+ * other route tests in this repo (re-register the schemas in beforeEach
+ * because tests/setup.ts wipes mongoose.models between tests).
+ */
+describe("PR A — API validation & semantics", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+
+  beforeEach(async () => {
+    const nozzleMod = await import("@/models/Nozzle");
+    const filamentMod = await import("@/models/Filament");
+    const printerMod = await import("@/models/Printer");
+    const phMod = await import("@/models/PrintHistory");
+    // Re-register every model the routes under test populate from —
+    // tests/setup.ts wipes mongoose.models between tests.
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozzleMod.default.schema);
+    if (!mongoose.models.Filament) mongoose.model("Filament", filamentMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", printerMod.default.schema);
+    if (!mongoose.models.PrintHistory) mongoose.model("PrintHistory", phMod.default.schema);
+    Filament = mongoose.models.Filament;
+  });
+
+  function jsonReq(url: string, body: unknown, method: "POST" | "PUT" = "POST") {
+    return new NextRequest(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // ─── #337: numeric range validation ────────────────────────────────
+
+  describe("GH #337 — rejects physically nonsensical numeric values", () => {
+    it("nozzle diameter <= 0 → 400", async () => {
+      const { POST } = await import("@/app/api/nozzles/route");
+      const res = await POST(jsonReq("http://localhost/api/nozzles", {
+        name: "QA-Neg", diameter: -5, type: "Brass",
+      }));
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/diameter/i);
+    });
+
+    it("nozzle diameter = 0 → 400", async () => {
+      const { POST } = await import("@/app/api/nozzles/route");
+      const res = await POST(jsonReq("http://localhost/api/nozzles", {
+        name: "QA-Zero", diameter: 0, type: "Brass",
+      }));
+      expect(res.status).toBe(400);
+    });
+
+    it("filament negative diameter / density / cost → 400", async () => {
+      const { POST } = await import("@/app/api/filaments/route");
+      for (const bad of [
+        { diameter: -1 },
+        { density: -2 },
+        { cost: -99 },
+      ]) {
+        const res = await POST(jsonReq("http://localhost/api/filaments", {
+          name: `QA-Bad-${Object.keys(bad)[0]}`, vendor: "x", type: "PLA", ...bad,
+        }));
+        expect(res.status).toBe(400);
+      }
+    });
+
+    it("filament temperatures out of range → 400", async () => {
+      const { POST } = await import("@/app/api/filaments/route");
+      const tooHot = await POST(jsonReq("http://localhost/api/filaments", {
+        name: "QA-Hot", vendor: "x", type: "PLA",
+        temperatures: { nozzle: 9999 },
+      }));
+      expect(tooHot.status).toBe(400);
+      const negBed = await POST(jsonReq("http://localhost/api/filaments", {
+        name: "QA-NegBed", vendor: "x", type: "PLA",
+        temperatures: { bed: -50 },
+      }));
+      expect(negBed.status).toBe(400);
+    });
+
+    it("valid physical values still pass", async () => {
+      const { POST } = await import("@/app/api/filaments/route");
+      const res = await POST(jsonReq("http://localhost/api/filaments", {
+        name: "QA-Valid", vendor: "x", type: "PLA",
+        diameter: 1.75, density: 1.24, cost: 24,
+        temperatures: { nozzle: 210, bed: 60 },
+      }));
+      expect(res.status).toBe(201);
+    });
+  });
+
+  // ─── #338: import endpoints 400 (not 500) on wrong content-type ────
+
+  describe("GH #338 — import endpoints reject non-multipart with 400", () => {
+    async function postText(route: { POST: (r: NextRequest) => Promise<Response> }, url: string) {
+      const req = new NextRequest(url, {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: "definitely not multipart",
+      });
+      return route.POST(req);
+    }
+
+    it("/api/filaments/parse-ini → 400", async () => {
+      const route = await import("@/app/api/filaments/parse-ini/route");
+      const res = await postText(route, "http://localhost/api/filaments/parse-ini");
+      expect(res.status).toBe(400);
+    });
+    it("/api/filaments/import → 400", async () => {
+      const route = await import("@/app/api/filaments/import/route");
+      const res = await postText(route, "http://localhost/api/filaments/import");
+      expect(res.status).toBe(400);
+    });
+    it("/api/filaments/import-csv → 400", async () => {
+      const route = await import("@/app/api/filaments/import-csv/route");
+      const res = await postText(route, "http://localhost/api/filaments/import-csv");
+      expect(res.status).toBe(400);
+    });
+    it("/api/filaments/import-xlsx → 400", async () => {
+      const route = await import("@/app/api/filaments/import-xlsx/route");
+      const res = await postText(route, "http://localhost/api/filaments/import-xlsx");
+      expect(res.status).toBe(400);
+    });
+  });
+
+  // ─── #339: spools/import accepts multipart uploads ────────────────
+
+  describe("GH #339 — /api/spools/import handles multipart/form-data uploads", () => {
+    it("parses a multipart CSV upload (raw fallback used to mis-parse the MIME envelope)", async () => {
+      // Pre-create a matching filament so the row resolves.
+      await Filament.create({
+        name: "QA Mat", vendor: "QA", type: "PLA", diameter: 1.75,
+      });
+
+      const { POST } = await import("@/app/api/spools/import/route");
+      const csv = "filament,vendor,label,totalWeight\nQA Mat,QA,QA Spool,1000\n";
+      const form = new FormData();
+      form.append("file", new File([csv], "spools.csv", { type: "text/csv" }));
+      const req = new NextRequest("http://localhost/api/spools/import", {
+        method: "POST",
+        body: form,
+      });
+      const res = await POST(req);
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.imported).toBe(1);
+      expect(body.failed).toBe(0);
+    });
+
+    it("multipart without a 'file' field → 400 with a clear message", async () => {
+      const { POST } = await import("@/app/api/spools/import/route");
+      const form = new FormData();
+      form.append("notfile", "x");
+      const req = new NextRequest("http://localhost/api/spools/import", {
+        method: "POST",
+        body: form,
+      });
+      const res = await POST(req);
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/file/i);
+    });
+  });
+
+  // ─── #340: print-history GET-by-id + PUT ──────────────────────────
+
+  describe("GH #340 — /api/print-history/[id] GET + PUT", () => {
+    async function makeJob() {
+      const fil = await Filament.create({
+        name: "PH Mat", vendor: "QA", type: "PLA", diameter: 1.75,
+        netFilamentWeight: 1000, spoolWeight: 200,
+      });
+      // push a spool so the POST has somewhere to deduct from
+      fil.spools.push({ label: "S1", totalWeight: 1000 });
+      await fil.save();
+      const spoolId = fil.spools[0]._id.toString();
+
+      const { POST: createJob } = await import("@/app/api/print-history/route");
+      const res = await createJob(jsonReq("http://localhost/api/print-history", {
+        jobLabel: "Original label",
+        notes: "first notes",
+        usage: [{ filamentId: fil._id.toString(), spoolId, grams: 25 }],
+      }));
+      expect(res.status).toBe(201);
+      return await res.json();
+    }
+
+    it("GET returns the entry", async () => {
+      const job = await makeJob();
+      const { GET } = await import("@/app/api/print-history/[id]/route");
+      const res = await GET(
+        new NextRequest(`http://localhost/api/print-history/${job._id}`),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobLabel).toBe("Original label");
+    });
+
+    it("GET on a bad id → 400", async () => {
+      const { GET } = await import("@/app/api/print-history/[id]/route");
+      const res = await GET(
+        new NextRequest("http://localhost/api/print-history/not-an-id"),
+        { params: Promise.resolve({ id: "not-an-id" }) },
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("GET on a missing id → 404", async () => {
+      const { GET } = await import("@/app/api/print-history/[id]/route");
+      const missing = "000000000000000000000000";
+      const res = await GET(
+        new NextRequest(`http://localhost/api/print-history/${missing}`),
+        { params: Promise.resolve({ id: missing }) },
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it("PUT updates jobLabel and notes; spool weight is untouched", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {
+          jobLabel: "Edited label", notes: "edited notes",
+        }, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobLabel).toBe("Edited label");
+      expect(body.notes).toBe("edited notes");
+
+      // spool weight should still be the post-charge value (1000 - 25 = 975)
+      const fil = await Filament.findById(body.usage[0].filamentId).lean();
+      const spool = fil.spools[0];
+      expect(spool.totalWeight).toBe(975);
+    });
+
+    it("PUT rejects usage[] edits with 400", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {
+          jobLabel: "x", usage: [{ filamentId: job.usage[0].filamentId, grams: 999 }],
+        }, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/usage/i);
+    });
+
+    it("PUT rejects unknown fields with 400", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {
+          jobLabel: "x", _purged: true,
+        }, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/_purged/);
+    });
+
+    it("PUT with empty body → 400", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {}, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(400);
+    });
+
+  });
+
+  // ─── #341: spool POST returns 201 (was 200) ───────────────────────
+
+  describe("GH #341 — spool POST returns 201", () => {
+    it("POST /api/filaments/[id]/spools → 201 on success", async () => {
+      const fil = await Filament.create({
+        name: "SP Mat", vendor: "QA", type: "PLA", diameter: 1.75,
+      });
+      const { POST } = await import("@/app/api/filaments/[id]/spools/route");
+      const res = await POST(
+        jsonReq(`http://localhost/api/filaments/${fil._id}/spools`, {
+          label: "S1", totalWeight: 1000,
+        }),
+        { params: Promise.resolve({ id: fil._id.toString() }) },
+      );
+      expect(res.status).toBe(201);
+    });
+  });
+});

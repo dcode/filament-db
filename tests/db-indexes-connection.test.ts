@@ -134,9 +134,15 @@ describe("DB index correctness + embedded-array bounds", () => {
     });
 
     it("rolls off the oldest dryCycles entry once the 1000-entry cap is hit", async () => {
+      // GH #337 added `min: 0` / `max: 300` on dryCycles.tempC, so the
+      // original `-999` sentinel no longer passes validation. Use a
+      // distinctive in-range value instead — the cap-roll behaviour we're
+      // checking doesn't care about the temperature value, only that the
+      // *oldest* entry gets dropped after the cap is hit.
+      const SENTINEL = 1; // anything unique vs. the others (50)
       const seeded = Array.from({ length: 1000 }, (_, i) => ({
         date: new Date(2020, 0, 1 + (i % 365)),
-        tempC: i === 0 ? -999 : 50, // sentinel temp on the oldest entry
+        tempC: i === 0 ? SENTINEL : 50, // sentinel temp on the oldest entry
         durationMin: 60,
         notes: "",
       }));
@@ -156,7 +162,7 @@ describe("DB index correctness + embedded-array bounds", () => {
       const fresh = await Filament.findById(f._id).lean();
       const cycles = fresh.spools[0].dryCycles;
       expect(cycles).toHaveLength(1000); // $slice: -1000 kept it capped
-      expect(cycles.some((c: { tempC: number }) => c.tempC === -999)).toBe(false);
+      expect(cycles.some((c: { tempC: number }) => c.tempC === SENTINEL)).toBe(false);
     });
   });
 });

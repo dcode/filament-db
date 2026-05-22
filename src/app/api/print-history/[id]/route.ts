@@ -1,8 +1,147 @@
 import { NextRequest, NextResponse } from "next/server";
+import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
 import PrintHistory from "@/models/PrintHistory";
 import Filament from "@/models/Filament";
-import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
+import Printer from "@/models/Printer";
+import { errorResponseFromCaught, getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
+
+/**
+ * GH #340: GET /api/print-history/{id} — fetch a single job by id,
+ * matching the list endpoint's population (printer name + filament
+ * name/vendor/type/color per usage row). Every other resource in the
+ * app supports GET-by-id; this closes the consistency gap.
+ *
+ * `_deletedAt: null` filter so a tombstoned job isn't resurrected.
+ */
+export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    await dbConnect();
+    const { id } = await params;
+    if (!mongoose.isValidObjectId(id)) {
+      return errorResponse("Invalid id", 400);
+    }
+    // Touch the Printer model so populate("printerId", ...) resolves even
+    // when this is the first route to hit it after mongoose model reset
+    // (see tests/setup.ts caveat).
+    void Printer.modelName;
+    const entry = await PrintHistory.findOne({ _id: id, _deletedAt: null })
+      .populate("printerId", "name")
+      .populate("usage.filamentId", "name vendor type color")
+      .lean();
+    if (!entry) {
+      return errorResponse("Not found", 404);
+    }
+    return NextResponse.json(entry);
+  } catch (err) {
+    return errorResponseFromCaught(err, "Failed to load print history entry");
+  }
+}
+
+/**
+ * GH #340: PUT /api/print-history/{id} — edit a job's metadata fields
+ * (jobLabel, notes, startedAt, source, printerId). Without this the
+ * only way to correct a typo in a label is delete + recreate, which
+ * refunds and re-charges spool weight twice — exactly the bookkeeping
+ * the DELETE handler below is at pains to keep balanced.
+ *
+ * We intentionally do NOT accept changes to `usage[]` here. Adjusting
+ * gram counts would require a refund-and-recharge dance against every
+ * spool referenced by both the old and new usage lists, with the same
+ * parent-lookup/clamp logic as DELETE — that's tracked separately so
+ * this fix can land without touching the inventory math. A request that
+ * includes `usage` is rejected with a clear message.
+ */
+const EDITABLE_FIELDS = ["jobLabel", "notes", "startedAt", "source", "printerId"] as const;
+const VALID_SOURCES = new Set(["manual", "prusaslicer", "orcaslicer", "bambu", "other"]);
+
+export async function PUT(
+  request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  let body: Record<string, unknown>;
+  try {
+    body = (await request.json()) as Record<string, unknown>;
+  } catch {
+    return errorResponse("Invalid JSON in request body", 400);
+  }
+  if (!body || typeof body !== "object") {
+    return errorResponse("Request body must be an object", 400);
+  }
+  if ("usage" in body) {
+    return errorResponse(
+      "Editing usage[] requires delete + recreate so spool weights stay reconciled. PUT only accepts metadata fields (jobLabel, notes, startedAt, source, printerId).",
+      400,
+    );
+  }
+
+  try {
+    await dbConnect();
+    const { id } = await params;
+    if (!mongoose.isValidObjectId(id)) {
+      return errorResponse("Invalid id", 400);
+    }
+
+    const update: Record<string, unknown> = {};
+    if (typeof body.jobLabel === "string") {
+      const trimmed = body.jobLabel.trim();
+      if (!trimmed) return errorResponse("jobLabel cannot be empty", 400);
+      update.jobLabel = trimmed;
+    }
+    if (typeof body.notes === "string") update.notes = body.notes;
+    if (typeof body.startedAt === "string" || body.startedAt instanceof Date) {
+      const d = new Date(body.startedAt as string);
+      if (Number.isNaN(d.getTime())) return errorResponse("startedAt is not a valid date", 400);
+      update.startedAt = d;
+    }
+    if (typeof body.source === "string") {
+      if (!VALID_SOURCES.has(body.source)) {
+        return errorResponse(`source must be one of: ${[...VALID_SOURCES].join(", ")}`, 400);
+      }
+      update.source = body.source;
+    }
+    if ("printerId" in body) {
+      if (body.printerId === null) {
+        update.printerId = null;
+      } else if (typeof body.printerId === "string" && mongoose.isValidObjectId(body.printerId)) {
+        update.printerId = body.printerId;
+      } else {
+        return errorResponse("printerId must be a valid ObjectId or null", 400);
+      }
+    }
+
+    // Refuse unknown fields rather than silently dropping them — a stray
+    // `_purged: true` or `_deletedAt: null` in the body should not slip
+    // through and surprise the caller.
+    const unknownKeys = Object.keys(body).filter(
+      (k) => !(EDITABLE_FIELDS as readonly string[]).includes(k),
+    );
+    if (unknownKeys.length > 0) {
+      return errorResponse(
+        `Unknown field(s): ${unknownKeys.join(", ")}. Editable: ${EDITABLE_FIELDS.join(", ")}.`,
+        400,
+      );
+    }
+    if (Object.keys(update).length === 0) {
+      return errorResponse("Request body must include at least one editable field", 400);
+    }
+
+    const updated = await PrintHistory.findOneAndUpdate(
+      { _id: id, _deletedAt: null },
+      { $set: update },
+      { returnDocument: "after", runValidators: true },
+    ).lean();
+    if (!updated) {
+      return errorResponse("Not found", 404);
+    }
+    return NextResponse.json(updated);
+  } catch (err) {
+    return errorResponseFromCaught(err, "Failed to update print history entry");
+  }
+}
 
 /**
  * DELETE /api/print-history/{id} — remove a print history entry and refund

@@ -37,7 +37,7 @@ import { unsanitizeCsvCell } from "@/lib/csvWriter";
 export async function POST(request: NextRequest) {
   let csvText: string;
 
-  const contentType = request.headers.get("content-type") || "";
+  const contentType = (request.headers.get("content-type") || "").toLowerCase();
   try {
     if (contentType.includes("application/json")) {
       const body = await request.json();
@@ -45,6 +45,19 @@ export async function POST(request: NextRequest) {
         return errorResponse("Body must be { csv: string } for JSON requests", 400);
       }
       csvText = body.csv;
+    } else if (contentType.includes("multipart/form-data")) {
+      // GH #339: the in-app importer (SpoolCsvImportDialog) reads the file
+      // client-side and POSTs it as raw text/csv, but every other import
+      // route in the app takes a multipart upload. Without this branch a
+      // `-F "file=@..."` curl call would land in the raw-text fallback
+      // below, parse the MIME envelope as CSV, and 400 with the misleading
+      // "CSV is missing required column: filament".
+      const formData = await request.formData();
+      const file = formData.get("file");
+      if (!(file instanceof File)) {
+        return errorResponse("multipart upload must include a 'file' field", 400);
+      }
+      csvText = await file.text();
     } else {
       csvText = await request.text();
     }
