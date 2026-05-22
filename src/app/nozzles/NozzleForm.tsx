@@ -15,7 +15,7 @@ interface NozzleFormData {
   highFlow: boolean;
   hardened: boolean;
   notes: string;
-  printerIds: string[];
+  printerId: string;
 }
 
 interface NozzleInitialData {
@@ -57,7 +57,7 @@ export default function NozzleForm({ initialData, onSubmit, onDirtyChange }: Pro
     highFlow: initialData?.highFlow || false,
     hardened: initialData?.hardened || false,
     notes: initialData?.notes || "",
-    printerIds: initialData?.printers?.map((p) => p._id) || [],
+    printerId: initialData?.printers?.[0]?._id || "",
   });
   const [printers, setPrinters] = useState<PrinterOption[]>([]);
   const [saving, setSaving] = useState(false);
@@ -95,13 +95,8 @@ export default function NozzleForm({ initialData, onSubmit, onDirtyChange }: Pro
     setDirty(true);
   };
 
-  const togglePrinter = (id: string) => {
-    setForm((f) => ({
-      ...f,
-      printerIds: f.printerIds.includes(id)
-        ? f.printerIds.filter((x) => x !== id)
-        : [...f.printerIds, id],
-    }));
+  const selectPrinter = (id: string) => {
+    setForm((f) => ({ ...f, printerId: id }));
     setDirty(true);
   };
 
@@ -123,7 +118,7 @@ export default function NozzleForm({ initialData, onSubmit, onDirtyChange }: Pro
         highFlow: form.highFlow,
         hardened: form.hardened,
         notes: form.notes,
-        printerIds: form.printerIds,
+        printerIds: form.printerId ? [form.printerId] : [],
       });
       savedRef.current = true;
       setDirty(false);
@@ -219,19 +214,38 @@ export default function NozzleForm({ initialData, onSubmit, onDirtyChange }: Pro
           <p className="text-xs text-gray-400">{t("nozzles.form.noPrinters")}</p>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <label
+              className={`flex items-center gap-2 p-2 rounded border cursor-pointer text-sm ${
+                form.printerId === ""
+                  ? "border-blue-500 bg-blue-50 dark:bg-blue-950"
+                  : "border-gray-200 dark:border-gray-700"
+              }`}
+            >
+              <input
+                type="radio"
+                name="installed-printer"
+                checked={form.printerId === ""}
+                onChange={() => selectPrinter("")}
+                className="w-4 h-4"
+              />
+              <span className="text-gray-500 dark:text-gray-400">
+                {t("nozzles.form.notInstalled")}
+              </span>
+            </label>
             {printers.map((p) => (
               <label
                 key={p._id}
                 className={`flex items-center gap-2 p-2 rounded border cursor-pointer text-sm ${
-                  form.printerIds.includes(p._id)
+                  form.printerId === p._id
                     ? "border-blue-500 bg-blue-50 dark:bg-blue-950"
                     : "border-gray-200 dark:border-gray-700"
                 }`}
               >
                 <input
-                  type="checkbox"
-                  checked={form.printerIds.includes(p._id)}
-                  onChange={() => togglePrinter(p._id)}
+                  type="radio"
+                  name="installed-printer"
+                  checked={form.printerId === p._id}
+                  onChange={() => selectPrinter(p._id)}
                   className="w-4 h-4"
                 />
                 <span>{p.name}</span>

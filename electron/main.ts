@@ -74,6 +74,10 @@ let isQuitting = false;
 let mainWindow: BrowserWindow | null = null;
 let serverProcess: UtilityProcess | null = null;
 let nfcService: NfcService | null = null;
+/** Guards initNfc() so the deferred init runs only once even though it's
+ * wired to every window's "show" event (macOS dock-reopen creates a new
+ * window each time). */
+let nfcInitStarted = false;
 let syncService: SyncService | null = null;
 const PORT = parseInt(process.env.PORT || "3456", 10);
 
@@ -153,6 +157,14 @@ function createWindow(urlPath = "/") {
   mainWindow.once("ready-to-show", () => {
     diag("ready-to-show — showing window");
     mainWindow?.show();
+  });
+
+  // Kick off NFC init once the window is actually visible — never before,
+  // so a stalling pcsclite() native call can't strand the user with no
+  // window (GH #238). Fires from either the ready-to-show path or the
+  // safety-net timeout below; initNfc() is idempotent.
+  mainWindow.once("show", () => {
+    void initNfc();
   });
 
   // Safety-net: if ready-to-show never fires (renderer hung, did-fail-load,
@@ -810,6 +822,75 @@ function isSmartCardServiceRunning(timeoutMs = 5000): Promise<boolean> {
   });
 }
 
+/**
+ * Initialize the NFC service. Deferred until the main window is visible
+ * (wired to the window's "show" event) — `new NfcService()` calls
+ * `pcsclite()`, whose native constructor runs a synchronous
+ * `SCardEstablishContext`. On some hosts (Windows ARM64 with SCardSvr
+ * stopped, and apparently some Raspberry Pi OS setups — GH #238) that
+ * call can stall the main thread. Running it only after the window has
+ * painted means a misbehaving PC/SC stack can never be the reason the
+ * user is left staring at a phantom background process (GH #176/#238).
+ *
+ * Idempotent via the `nfcInitStarted` guard — every createWindow() wires
+ * a "show" listener, but the service is created only once per process.
+ */
+async function initNfc(): Promise<void> {
+  if (nfcInitStarted) return;
+  nfcInitStarted = true;
+
+  // Skipped on Windows when SCardSvr is stopped — pcsclite()'s sync
+  // SCardEstablishContext blocks the main thread there (GH #176). On
+  // Linux/Mac the probe is a no-op and the service is attempted as before.
+  const skipNfcReason =
+    process.platform === "win32" && !(await isSmartCardServiceRunning())
+      ? "Smart Card service (SCardSvr) is not running on this Windows host"
+      : null;
+  if (skipNfcReason) {
+    diag(`skipping NFC init: ${skipNfcReason}`);
+    return;
+  }
+
+  try {
+    nfcService = new NfcService();
+    let prevTagPresent = false;
+    let lastAutoReadAt = 0;
+    const AUTO_READ_COOLDOWN_MS = 4000;
+    nfcService.on("statusChange", (status) => {
+      mainWindow?.webContents.send("nfc-status-changed", status);
+
+      if (status.tagPresent && !prevTagPresent && nfcService) {
+        const now = Date.now();
+        if (now - lastAutoReadAt < AUTO_READ_COOLDOWN_MS) {
+          prevTagPresent = status.tagPresent;
+          return;
+        }
+        // Set timestamp BEFORE async read to prevent concurrent triggers
+        lastAutoReadAt = now;
+        nfcService.readTag()
+          .then((data) => {
+            mainWindow?.webContents.send("nfc-tag-detected", { data });
+          })
+          .catch((err) => {
+            // Blank/erased tags have no NDEF data — tell the renderer so it
+            // can show an "empty tag" indication instead of silently ignoring.
+            if (err.message?.includes("No NDEF TLV") || err.message?.includes("No NDEF record")) {
+              mainWindow?.webContents.send("nfc-tag-detected", { empty: true });
+              return;
+            }
+            mainWindow?.webContents.send("nfc-tag-detected", { error: err.message });
+          });
+      }
+      prevTagPresent = status.tagPresent;
+    });
+    nfcService.on("error", (err) => {
+      console.error("NFC error:", err.message);
+    });
+  } catch (err) {
+    console.error("NFC initialization failed (reader may not be available):", err);
+  }
+}
+
 app.whenReady().then(async () => {
   diag("app ready");
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
@@ -882,11 +963,9 @@ app.whenReady().then(async () => {
     }
   }
 
-  // Create the window BEFORE touching NFC. `pcsclite()` can wedge the V8
-  // event loop synchronously on Windows when SCardSvr is unavailable
-  // (default state on Windows ARM64) — defense in depth: even if the
-  // SCardSvr probe below fails to detect that case, the user still sees a
-  // window instead of a phantom background process (GH #176).
+  // Create the window. NFC init is deferred to the window's "show" event
+  // (see initNfc + createWindow) so a stalling PC/SC stack can't keep the
+  // window from ever appearing (GH #176/#238).
   if (!connectionMode && !store.get("mongodbUri")) {
     createWindow("/setup");
   } else {
@@ -894,57 +973,6 @@ app.whenReady().then(async () => {
       process.env.MONGODB_URI = mongoUri;
     }
     createWindow("/");
-  }
-
-  // Initialize NFC service. Skipped on Windows when SCardSvr is stopped —
-  // pcsclite()'s sync SCardEstablishContext blocks the main thread there
-  // (GH #176). On Linux/Mac the probe is a no-op and the service is
-  // attempted unconditionally as before.
-  const skipNfcReason =
-    process.platform === "win32" && !(await isSmartCardServiceRunning())
-      ? "Smart Card service (SCardSvr) is not running on this Windows host"
-      : null;
-  if (skipNfcReason) {
-    diag(`skipping NFC init: ${skipNfcReason}`);
-  } else {
-    try {
-      nfcService = new NfcService();
-      let prevTagPresent = false;
-      let lastAutoReadAt = 0;
-      const AUTO_READ_COOLDOWN_MS = 4000;
-      nfcService.on("statusChange", (status) => {
-        mainWindow?.webContents.send("nfc-status-changed", status);
-
-        if (status.tagPresent && !prevTagPresent && nfcService) {
-          const now = Date.now();
-          if (now - lastAutoReadAt < AUTO_READ_COOLDOWN_MS) {
-            prevTagPresent = status.tagPresent;
-            return;
-          }
-          // Set timestamp BEFORE async read to prevent concurrent triggers
-          lastAutoReadAt = now;
-          nfcService.readTag()
-            .then((data) => {
-              mainWindow?.webContents.send("nfc-tag-detected", { data });
-            })
-            .catch((err) => {
-              // Blank/erased tags have no NDEF data — tell the renderer so it
-              // can show an "empty tag" indication instead of silently ignoring.
-              if (err.message?.includes("No NDEF TLV") || err.message?.includes("No NDEF record")) {
-                mainWindow?.webContents.send("nfc-tag-detected", { empty: true });
-                return;
-              }
-              mainWindow?.webContents.send("nfc-tag-detected", { error: err.message });
-            });
-        }
-        prevTagPresent = status.tagPresent;
-      });
-      nfcService.on("error", (err) => {
-        console.error("NFC error:", err.message);
-      });
-    } catch (err) {
-      console.error("NFC initialization failed (reader may not be available):", err);
-    }
   }
 
   app.on("activate", () => {

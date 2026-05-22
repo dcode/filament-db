@@ -18,7 +18,18 @@ export async function startLocalMongo(): Promise<string> {
     fs.mkdirSync(dbPath, { recursive: true });
   }
 
+  // MongoDB ships no native Windows arm64 build — only x86_64. Without this
+  // override, mongodb-memory-server derives the arch from os.arch() ("arm64"
+  // → "aarch64") and tries to download a nonexistent
+  // mongodb-windows-aarch64-*.zip. Windows on ARM runs the x64 binary fine
+  // under emulation, so pin the download to x86_64. (GH #240)
+  const binary =
+    process.platform === "win32" && process.arch === "arm64"
+      ? { arch: "x86_64" }
+      : undefined;
+
   mongod = await MongoMemoryServer.create({
+    binary,
     instance: {
       dbPath,
       storageEngine: "wiredTiger",
