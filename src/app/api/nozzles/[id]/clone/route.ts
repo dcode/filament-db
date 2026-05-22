@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Nozzle from "@/models/Nozzle";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
-import { nextCloneName } from "@/lib/nozzleConflicts";
+import { nextCloneName, clonePeerNamePattern } from "@/lib/nozzleConflicts";
 
 /**
  * POST /api/nozzles/{id}/clone
@@ -37,10 +37,12 @@ export async function POST(
 
     // Pick the next available "Name #N" suffix among non-deleted nozzles
     // so the clone is visually distinguishable from its siblings in the
-    // /nozzles list.
+    // /nozzles list. GH #298: the pattern is anchored at both ends, so
+    // it matches only the base name + its numbered clones — not
+    // unrelated siblings that share a prefix.
     const peers = await Nozzle.find({
       _deletedAt: null,
-      name: { $regex: `^${escapeRegExp(source.name)}` },
+      name: { $regex: clonePeerNamePattern(source.name) },
     })
       .select("name")
       .lean();
@@ -65,13 +67,4 @@ export async function POST(
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to clone nozzle");
   }
-}
-
-/**
- * Regex-escape a string so it can be safely embedded in a Mongo `$regex`
- * filter. Names like "0.4mm" contain a `.` which would otherwise match
- * any char.
- */
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

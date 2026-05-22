@@ -649,4 +649,66 @@ describe("SyncService — v1.12 sync expansion", () => {
       expect(remoteRow?._purged).toBe(true);
     });
   });
+
+  // ── GH #317 — conflict-resolution edge cases ──────────────────────────
+
+  describe("#317 — conflict resolution", () => {
+    it("a soft-delete wins over a same-millisecond remote update (no resurrection)", async () => {
+      // The exact tie the bug hit: a row deleted locally at time T while
+      // the remote copy's updatedAt is also T (a delete right after an
+      // edit, equal-ms). Pre-fix the `>` comparison fell through to the
+      // else branch and resurrected the row.
+      const T = new Date("2026-01-01T12:00:00.000Z");
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+
+      await localDb.collection("bedtypes").insertOne({
+        name: "Tie Plate", material: "PEI", notes: "",
+        syncId: "tie-syncid",
+        _deletedAt: T, createdAt: T, updatedAt: T,
+      });
+      await remoteDb.collection("bedtypes").insertOne({
+        name: "Tie Plate", material: "PEI", notes: "",
+        syncId: "tie-syncid",
+        _deletedAt: null, createdAt: T, updatedAt: T,
+      });
+
+      sync = makeSync();
+      await sync.sync();
+
+      // Delete must win the tie on BOTH sides — the row stays deleted.
+      const localRow = await localDb.collection("bedtypes").findOne({ syncId: "tie-syncid" });
+      const remoteRow = await remoteDb.collection("bedtypes").findOne({ syncId: "tie-syncid" });
+      expect(localRow?._deletedAt).not.toBeNull();
+      expect(remoteRow?._deletedAt).not.toBeNull();
+    });
+
+    it("a doc missing updatedAt does not stall the merge (NaN-safe)", async () => {
+      // Pre-fix: `new Date(undefined).getTime()` is NaN, every
+      // comparison is false, and the row never syncs. The local row has
+      // a real updatedAt, the remote one has none — local must win and
+      // propagate to remote.
+      const localDb = localClient.db("filament-db");
+      const remoteDb = remoteClient.db("filament-db");
+
+      await localDb.collection("bedtypes").insertOne({
+        name: "NaN Plate", material: "LOCAL-WINS", notes: "",
+        syncId: "nan-syncid",
+        _deletedAt: null, createdAt: new Date(), updatedAt: new Date(),
+      });
+      await remoteDb.collection("bedtypes").insertOne({
+        name: "NaN Plate", material: "stale", notes: "",
+        syncId: "nan-syncid",
+        _deletedAt: null, createdAt: new Date(),
+        // updatedAt intentionally absent
+      });
+
+      sync = makeSync();
+      await sync.sync();
+
+      // Local (the only side with a timestamp) wins — remote is updated.
+      const remoteRow = await remoteDb.collection("bedtypes").findOne({ syncId: "nan-syncid" });
+      expect(remoteRow?.material).toBe("LOCAL-WINS");
+    });
+  });
 });

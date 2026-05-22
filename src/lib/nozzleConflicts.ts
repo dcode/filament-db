@@ -132,22 +132,41 @@ export class NozzleConflictError extends Error {
   }
 }
 
+/** Regex-escape a string for safe embedding in a RegExp / Mongo `$regex`
+ * (names like "0.4mm" contain a `.` that would otherwise match any char). */
+export function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * A `$regex` / RegExp source that matches exactly a nozzle's base name,
+ * OR that base name followed by a numbered clone suffix (" #<digits>")
+ * — and nothing else.
+ *
+ * GH #298: anchored at BOTH ends. A prefix-only anchor (`^base`) made
+ * cloning "E3D" pull in unrelated siblings like "E3D V6" / "E3D Revo",
+ * and a peer such as "E3D Revo #5" pushed the clone counter to "#6"
+ * for a completely different nozzle.
+ */
+export function clonePeerNamePattern(baseName: string): string {
+  return `^${escapeRegExp(baseName)}( #\\d+)?$`;
+}
+
 /**
  * Pick the next available "Name #N" for a clone of an existing nozzle.
- * Walks active nozzles whose name starts with `baseName`, scrapes the
- * trailing "#N" suffix, picks max + 1. If no clones exist yet returns
- * "<baseName> #2" (the original is implicitly "#1").
+ * Only the exact base name and its numbered clones ("Name #N") count;
+ * unrelated siblings are ignored (GH #298). If no clones exist yet
+ * returns "<baseName> #2" (the original is implicitly "#1").
  */
 export function nextCloneName(
   baseName: string,
   existingNames: string[],
 ): string {
-  const numberSuffixRe = /\s+#(\d+)$/;
+  // Matches ONLY "<baseName> #<digits>" exactly — both ends anchored.
+  const cloneSuffixRe = new RegExp(`^${escapeRegExp(baseName)} #(\\d+)$`);
   let maxN = 1; // the original counts as #1
   for (const name of existingNames) {
-    if (name === baseName) continue; // the original
-    if (!name.startsWith(baseName)) continue;
-    const m = name.slice(baseName.length).match(numberSuffixRe);
+    const m = cloneSuffixRe.exec(name);
     if (m) {
       const n = parseInt(m[1], 10);
       if (Number.isFinite(n) && n > maxN) maxN = n;
