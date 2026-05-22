@@ -9,19 +9,56 @@ import { errorResponse, getErrorMessage, isClientInputErrorMessage, MAX_UPLOAD_S
 let storedApiKey: string | null = null;
 let storedProvider: AiProvider = "gemini";
 
+const VALID_PROVIDERS: readonly AiProvider[] = ["gemini", "claude", "openai"];
+
+function isValidProvider(p: unknown): p is AiProvider {
+  return typeof p === "string" && (VALID_PROVIDERS as readonly string[]).includes(p);
+}
+
+/** The env API key for a specific provider, if set. */
+function envKeyForProvider(provider: AiProvider): string | undefined {
+  switch (provider) {
+    case "gemini":
+      return process.env.GEMINI_API_KEY;
+    case "claude":
+      return process.env.ANTHROPIC_API_KEY;
+    case "openai":
+      return process.env.OPENAI_API_KEY;
+  }
+}
+
+/** Provider implied by whichever env key is present, in priority order. */
+function providerFromEnv(): AiProvider | null {
+  if (process.env.ANTHROPIC_API_KEY) return "claude";
+  if (process.env.OPENAI_API_KEY) return "openai";
+  if (process.env.GEMINI_API_KEY) return "gemini";
+  return null;
+}
+
+/**
+ * GH #251: single source of truth for which provider a request uses,
+ * shared by GET (config reporting) and POST (extraction) so the UI never
+ * shows one provider while extraction silently runs another.
+ *
+ * Priority:
+ *   1. an explicit, valid provider on the request
+ *   2. the provider saved via PUT (web mode), when a key was stored
+ *   3. the provider implied by whichever env key is present
+ *   4. "gemini" as a last resort
+ */
+function resolveProvider(bodyProvider?: unknown): AiProvider {
+  if (isValidProvider(bodyProvider)) return bodyProvider;
+  if (storedApiKey) return storedProvider;
+  return providerFromEnv() ?? "gemini";
+}
+
 /** GET /api/tds — check if an AI API key is configured */
 export async function GET() {
-  const envKey = process.env.GEMINI_API_KEY || process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY;
-  const configured = !!(envKey || storedApiKey);
-
-  // Detect provider from env if no stored provider
-  let provider = storedProvider;
-  if (!storedApiKey && envKey) {
-    if (process.env.ANTHROPIC_API_KEY) provider = "claude";
-    else if (process.env.OPENAI_API_KEY) provider = "openai";
-    else provider = "gemini";
-  }
-
+  const provider = resolveProvider();
+  // `configured` reflects whether a key is actually usable for the
+  // *reported* provider — not just "some env key exists" — so the UI
+  // can't claim it's set up when POST would 401.
+  const configured = !!resolveApiKey(undefined, provider);
   return NextResponse.json({ configured, provider });
 }
 
@@ -40,7 +77,7 @@ export async function PUT(request: NextRequest) {
       return errorResponse("API key is required", 400);
     }
 
-    const validProvider = ["gemini", "claude", "openai"].includes(provider) ? provider as AiProvider : "gemini";
+    const validProvider: AiProvider = isValidProvider(provider) ? provider : "gemini";
 
     // Validate the key
     const valid = await validateApiKey(validProvider, apiKey);
@@ -64,24 +101,22 @@ export async function DELETE() {
 }
 
 /**
- * Resolve the API key from various sources.
+ * Resolve the API key for the chosen provider.
+ *   1. an explicit key on the request
+ *   2. the env key for *that* provider
+ *   3. the stored key — but ONLY when it was saved for the same provider.
+ *
+ * GH #251: step 3 used to return `storedApiKey` unconditionally, which
+ * could hand a Gemini key to a Claude/OpenAI endpoint when the request
+ * asked for a different provider than the one the key was saved under.
  */
 function resolveApiKey(bodyKey: string | undefined, provider: AiProvider): string | null {
   if (bodyKey) return bodyKey;
 
-  switch (provider) {
-    case "gemini":
-      if (process.env.GEMINI_API_KEY) return process.env.GEMINI_API_KEY;
-      break;
-    case "claude":
-      if (process.env.ANTHROPIC_API_KEY) return process.env.ANTHROPIC_API_KEY;
-      break;
-    case "openai":
-      if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
-      break;
-  }
+  const envKey = envKeyForProvider(provider);
+  if (envKey) return envKey;
 
-  return storedApiKey;
+  return storedProvider === provider ? storedApiKey : null;
 }
 
 /** POST /api/tds — extract filament data from a TDS URL or uploaded file */
@@ -105,9 +140,7 @@ export async function POST(request: NextRequest) {
         return errorResponse(`File too large (${sizeMB} MB). Maximum is 10 MB.`, 413);
       }
 
-      const provider: AiProvider = (bodyProvider && ["gemini", "claude", "openai"].includes(bodyProvider))
-        ? bodyProvider as AiProvider
-        : storedProvider || "gemini";
+      const provider = resolveProvider(bodyProvider);
 
       const apiKey = resolveApiKey(bodyKey || undefined, provider);
       if (!apiKey) {
@@ -143,8 +176,7 @@ export async function POST(request: NextRequest) {
       return errorResponse("URL is required", 400);
     }
 
-    const provider: AiProvider = (bodyProvider && ["gemini", "claude", "openai"].includes(bodyProvider))
-      ? bodyProvider as AiProvider : storedProvider || "gemini";
+    const provider = resolveProvider(bodyProvider);
     const apiKey = resolveApiKey(bodyKey, provider);
 
     if (!apiKey) {
