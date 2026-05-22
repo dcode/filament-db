@@ -45,6 +45,17 @@ describe("assertSameOriginRequest", () => {
       assertSameOriginRequest(reqWith({ origin: "http://localhost:3456", host: "localhost:3456" })),
     ).toBeNull();
   });
+
+  it("allows an Origin/Host pair differing only by an explicit default port", () => {
+    // Codex review: matching raw host[:port] strings false-rejected a
+    // legitimate request when one side spelled out the default port.
+    expect(
+      assertSameOriginRequest(reqWith({ origin: "https://app.example", host: "app.example:443" })),
+    ).toBeNull();
+    expect(
+      assertSameOriginRequest(reqWith({ origin: "https://app.example:443", host: "app.example" })),
+    ).toBeNull();
+  });
 });
 
 describe("destructive route — snapshot/delete CSRF guard", () => {
