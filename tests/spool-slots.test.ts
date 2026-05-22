@@ -322,6 +322,28 @@ describe("spool ↔ printer-slot assignment (GH #242)", () => {
       expect(res.status).toBe(400);
     });
 
+    it("PUT returns 400 when the spool is retired", async () => {
+      const fil = await Filament.create({
+        name: "PLA retired",
+        vendor: "V",
+        type: "PLA",
+        spools: [{ label: "S", retired: true }],
+      });
+      const printer = await Printer.create({
+        name: "P",
+        manufacturer: "X",
+        printerModel: "P",
+        amsSlots: [{ slotName: "S1" }],
+      });
+      const res = await putAssignment(
+        ...req(fil.spools[0]._id, "PUT", {
+          printerId: String(printer._id),
+          slotId: String(printer.amsSlots[0]._id),
+        }),
+      );
+      expect(res.status).toBe(400);
+    });
+
     it("PUT returns 404 for a spool that does not exist", async () => {
       const printer = await Printer.create({
         name: "P",
