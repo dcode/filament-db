@@ -440,4 +440,41 @@ describe("snapshot route — Location + PrintHistory round-trip", () => {
       restoredLoc._id.toString(),
     );
   });
+
+  it("rejects a snapshot with an invalid document and rolls back (GH #259/#333)", async () => {
+    // Pre-existing data that must survive a failed restore.
+    await Filament.create({ name: "Survivor PLA", vendor: "T", type: "PLA" });
+
+    const snapshot = {
+      version: 4,
+      createdAt: new Date().toISOString(),
+      collections: {
+        // `vendor` is a required field — this document fails schema
+        // validation, so the `ordered: true` insertMany throws.
+        filaments: [{ name: "Invalid Filament", type: "PLA" }],
+        nozzles: [],
+        printers: [],
+        bedTypes: [],
+        locations: [],
+        printHistory: [],
+        sharedCatalogs: [],
+      },
+    };
+
+    const res = await POST(
+      new NextRequest("http://localhost/api/snapshot", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(snapshot),
+      }),
+    );
+    // The restore must NOT silently succeed on an invalid import.
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toMatch(/rolled back/i);
+
+    // Pre-existing data was restored; the invalid document never landed.
+    const all = await Filament.find({}).lean();
+    expect(all).toHaveLength(1);
+    expect(all[0].name).toBe("Survivor PLA");
+  });
 });
