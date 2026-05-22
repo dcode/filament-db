@@ -681,6 +681,7 @@ Returns:
 | `GET` | `/api/nozzles/:id` | Get a single nozzle by ID |
 | `PUT` | `/api/nozzles/:id` | Update a nozzle by ID |
 | `DELETE` | `/api/nozzles/:id` | Soft-delete a nozzle (blocked if referenced by filaments) |
+| `POST` | `/api/nozzles/:id/clone` | Clone a nozzle into a new physical-instance row |
 
 ### GET /api/nozzles
 
@@ -701,6 +702,10 @@ Update a nozzle. Send a JSON body with the fields to update.
 ### DELETE /api/nozzles/:id
 
 Soft-delete a nozzle by ID (sets `_deletedAt` timestamp). Cannot delete a nozzle that is referenced by filaments or installed on any printer. Returns `{ message: "Deleted" }`.
+
+### POST /api/nozzles/:id/clone
+
+Clone an existing nozzle into a new row. The clone copies every spec field (diameter, type, high-flow, hardened, notes) under a `Name #N` suffix, with a fresh `_id`. Used by the printer form's move-or-clone conflict resolution when a physical nozzle is already installed in another printer. The clone is **not** auto-attached to any printer — the caller assigns it. Returns the new nozzle with `201`.
 
 ---
 
@@ -1198,6 +1203,49 @@ A single request is capped at 10,000 rows by `parseCsv`; beyond that the request
 Mirror of `GET /api/filaments/export-csv` for spool inventory. Streams every active spool from every active filament as a single CSV with one row per spool. Columns include `filament`, `vendor`, `label`, `totalWeight`, `lotNumber`, `purchaseDate`, `openedDate`, `location`, and `retired`. Soft-deleted filaments and retired-only spools are excluded by default. Suitable for round-tripping through `POST /api/spools/import` when migrating between instances.
 
 Response headers: `Content-Type: text/csv` and `Content-Disposition: attachment; filename="spools-YYYY-MM-DD.csv"`.
+
+---
+
+## Spool Printer-Slot Assignment
+
+Tracks which printer AMS/MMU slot a spool currently occupies. This is **distinct from** the spool's Location (`locationId`): the Location is the spool's semi-permanent storage "home"; the slot is its transient position while loaded in a printer. A spool can occupy at most one slot at a time.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/spools/:spoolId/assignment` | Get the spool's current printer-slot assignment |
+| `PUT` | `/api/spools/:spoolId/assignment` | Assign the spool to a printer slot |
+| `DELETE` | `/api/spools/:spoolId/assignment` | Clear the spool from any slot |
+
+These endpoints write only `Printer.amsSlots[].spoolId`; they never modify the spool's `locationId`.
+
+### GET /api/spools/:spoolId/assignment
+
+Returns `{ "assignment": … }`, where `assignment` is `null` when the spool is in no slot, otherwise the printer + slot holding it:
+
+```json
+{
+  "assignment": {
+    "printerId": "…",
+    "printerName": "Bambu Labs H2D",
+    "slotId": "…",
+    "slotName": "AMS Slot 1",
+    "filamentId": "…"
+  }
+}
+```
+
+### PUT /api/spools/:spoolId/assignment
+
+Body: `{ "printerId": "…", "slotId": "…" }`. Assigns the spool to that slot, first clearing it from any other slot it occupied — a spool is one physical object. Returns the fresh `{ "assignment": … }`.
+
+- `400` — malformed body, or the spool is retired (retired spools cannot be loaded into a printer)
+- `404` — the spool, printer, or slot does not exist
+
+### DELETE /api/spools/:spoolId/assignment
+
+Clears the spool from whatever slot it is in. Idempotent — returns `{ "assignment": null }` even when the spool was already unassigned.
+
+> **Hybrid-sync limitation:** `Printer.amsSlots[].spoolId` is cleared on cross-side sync remap (spool subdocuments have no stable cross-side id). Slot assignments are reliable only in single-database (cloud-only or offline-only) deployments.
 
 ---
 

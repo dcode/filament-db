@@ -5,6 +5,7 @@ import Filament from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 import { findNozzleConflicts } from "@/lib/nozzleConflicts";
+import { clearSpoolsFromOtherPrinters } from "@/lib/spoolSlots";
 
 export async function GET(
   _request: NextRequest,
@@ -91,6 +92,18 @@ export async function PUT(
     if (!printer) {
       return errorResponse("Not found", 404);
     }
+
+    // GH #242 — a spool is one physical object. If this printer now claims
+    // spools in its slots, clear those spools out of every other printer
+    // so the one-slot-per-spool invariant holds regardless of which form
+    // wrote the assignment.
+    const claimedSpoolIds = (printer.amsSlots ?? [])
+      .map((s) => s.spoolId)
+      .filter((x): x is NonNullable<typeof x> => x != null);
+    if (claimedSpoolIds.length > 0) {
+      await clearSpoolsFromOtherPrinters(Printer, claimedSpoolIds, id);
+    }
+
     return NextResponse.json(printer);
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to update printer");

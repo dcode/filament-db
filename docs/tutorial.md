@@ -97,7 +97,7 @@ If you have multiple printers (e.g. a Prusa Core One and a Bambu H2D), define th
    - **Manufacturer** -- e.g. `Prusa`
    - **Model** -- e.g. `Core One`
    - The **Name** auto-generates as `Prusa Core One` (editable)
-4. Under **Installed Nozzles**, check the nozzles available on this printer (you can come back to this after creating nozzles in Step 4).
+4. Under **Installed Nozzles**, check the nozzles installed on this printer (you can come back to this after creating nozzles in Step 4). A printer can have several, but each physical nozzle lives in only one printer at a time.
 5. Click **Create Printer**.
 6. Repeat for each printer you own.
 
@@ -115,6 +115,7 @@ Before adding filaments you need at least one nozzle profile so you can assign p
    - **Type** -- Brass, Hardened Steel, Stainless Steel, Copper, ObXidian, Diamondback, etc.
    - **High Flow** -- check if this is a high-flow nozzle
    - **Hardened** -- check if it can print abrasive materials
+   - **Installed in** -- optionally pick the single printer this nozzle is installed in (or leave it as **Not installed in a printer**); you can set this later
    - **Notes** -- optional free-text
 4. Click **Create Nozzle**.
 5. Repeat for each nozzle you own. You can always add more later.
@@ -445,6 +446,7 @@ Each filament can track multiple physical spools with individual weights.
 2. Click **"+ Add Spool"** to add a new spool with an optional label and weight.
 3. Each spool shows its label, total weight, and a delete button.
 4. The tracker aggregates stats across all spools (total weight, computed length from density and diameter).
+5. Each spool can also be assigned a **Location** (its storage home) and a **Printer slot** (the AMS/MMU position it is currently loaded in — a spool occupies one slot at a time).
 
 If a filament has a single `totalWeight` but no spools yet, click **"Migrate to spool tracking"** to convert it.
 
@@ -600,6 +602,7 @@ Missing locations are auto-created, so you don't need to seed locations in advan
 | Export NFC binary | Detail page > Export OPT |
 | Track spools | Detail page > Spool Tracker > + Add Spool |
 | Assign spool to a location | Spool detail > Location dropdown |
+| Assign spool to a printer slot | Spool detail > Printer slot picker |
 | Log manual spool usage | Spool detail > Log usage |
 | Log a dry cycle | Spool detail > + Log dry cycle |
 | View usage analytics | Top nav > Analytics |

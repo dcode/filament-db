@@ -110,6 +110,7 @@ export default function FilamentDetail() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [showPrusamentImport, setShowPrusamentImport] = useState(false);
   const [locations, setLocations] = useState<{ _id: string; name: string; kind: string }[]>([]);
+  const [printers, setPrinters] = useState<PrinterLite[]>([]);
 
   // Clear NFC write timeout on unmount
   useEffect(() => {
@@ -136,6 +137,18 @@ export default function FilamentDetail() {
     fetch("/api/locations", { signal: ac.signal })
       .then((r) => (r.ok ? r.json() : []))
       .then(setLocations)
+      .catch(() => {});
+    return () => ac.abort();
+  }, []);
+
+  // Load printers once so each spool card can show its AMS-slot picker.
+  // The response carries every amsSlots[].spoolId, so a spool's current
+  // slot is derived client-side — no per-spool round trip (GH #242).
+  useEffect(() => {
+    const ac = new AbortController();
+    fetch("/api/printers", { signal: ac.signal })
+      .then((r) => (r.ok ? r.json() : []))
+      .then(setPrinters)
       .catch(() => {});
     return () => ac.abort();
   }, []);
@@ -389,6 +402,32 @@ export default function FilamentDetail() {
       }
     } catch {
       toast(t("detail.spool.updateFailed"), "error");
+    }
+  };
+
+  // GH #242 — assign or clear a spool's printer AMS slot. Writes only
+  // Printer documents (never the spool's locationId), then re-fetches
+  // printers so every card's derived assignment stays consistent — moving
+  // a spool into a slot must visibly clear it from its previous slot.
+  const handleAssignSlot = async (
+    spoolId: string,
+    target: { printerId: string; slotId: string } | null,
+  ) => {
+    try {
+      const res = await fetch(`/api/spools/${spoolId}/assignment`, {
+        method: target ? "PUT" : "DELETE",
+        headers: target ? { "Content-Type": "application/json" } : undefined,
+        body: target ? JSON.stringify(target) : undefined,
+      });
+      if (res.ok) {
+        const pr = await fetch("/api/printers");
+        if (pr.ok) setPrinters(await pr.json());
+        toast(t(target ? "detail.spool.slotAssigned" : "detail.spool.slotCleared"));
+      } else {
+        toast(t(target ? "detail.spool.slotAssignFailed" : "detail.spool.slotClearFailed"), "error");
+      }
+    } catch {
+      toast(t(target ? "detail.spool.slotAssignFailed" : "detail.spool.slotClearFailed"), "error");
     }
   };
 
@@ -799,6 +838,8 @@ export default function FilamentDetail() {
                     spool={spool}
                     filament={filament}
                     locations={locations}
+                    printers={printers}
+                    onAssignSlot={(target) => handleAssignSlot(spool._id, target)}
                     onUpdateWeight={(weight) => handleUpdateSpool(spool._id, { totalWeight: weight })}
                     onUpdateLabel={(label) => handleUpdateSpool(spool._id, { label })}
                     onUpdateLocation={(locationId) => handleUpdateSpool(spool._id, { locationId })}
@@ -1250,6 +1291,15 @@ export default function FilamentDetail() {
   );
 }
 
+/** Minimal printer shape the spool cards need for the AMS-slot picker.
+ * `amsSlots` is optional — printer documents created before the field
+ * existed come back from a lean query without it. */
+type PrinterLite = {
+  _id: string;
+  name: string;
+  amsSlots?: { _id: string; slotName: string; spoolId: string | null }[];
+};
+
 interface SpoolCardProps {
   spool: Filament["spools"][number] & {
     locationId?: string | null;
@@ -1260,6 +1310,8 @@ interface SpoolCardProps {
   };
   filament: Filament;
   locations: { _id: string; name: string; kind: string }[];
+  printers: PrinterLite[];
+  onAssignSlot: (target: { printerId: string; slotId: string } | null) => void;
   onUpdateWeight: (weight: number) => void;
   onUpdateLabel: (label: string) => void;
   onUpdateLocation: (locationId: string | null) => void;
@@ -1277,6 +1329,8 @@ function SpoolCard({
   spool,
   filament,
   locations,
+  printers,
+  onAssignSlot,
   onUpdateWeight,
   onUpdateLabel,
   onUpdateLocation,
@@ -1302,6 +1356,25 @@ function SpoolCard({
   const photoInputRef = useRef<HTMLInputElement>(null);
 
   const remaining = computeRemaining(filament, spool.totalWeight);
+
+  // GH #242 — the spool's current AMS slot, derived from the printers
+  // list (the reverse of Printer.amsSlots[].spoolId).
+  const currentSlot = (() => {
+    for (const p of printers) {
+      for (const s of p.amsSlots ?? []) {
+        if (s.spoolId && String(s.spoolId) === String(spool._id)) {
+          return { printerName: p.name, slotName: s.slotName };
+        }
+      }
+    }
+    return null;
+  })();
+  const slotOptions = printers.flatMap((p) =>
+    (p.amsSlots ?? []).map((s) => ({
+      value: `${p._id}|${s._id}`,
+      label: `${p.name} · ${s.slotName}`,
+    })),
+  );
 
   const handleSave = async () => {
     const val = parseFloat(weightInput);
@@ -1457,6 +1530,47 @@ function SpoolCard({
           {showMore ? t("detail.spool.less") : t("detail.spool.more")}
         </button>
       </div>
+
+      {/* Printer slot — the spool's current loaded position, distinct
+          from its Location (home). GH #242. */}
+      <div className="mt-2 flex items-center gap-2 text-xs flex-wrap">
+        <label className="text-gray-500">{t("detail.spool.printerSlot")}:</label>
+        {currentSlot ? (
+          <>
+            <span className="px-2 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200">
+              {currentSlot.printerName} · {currentSlot.slotName}
+            </span>
+            <button
+              type="button"
+              onClick={() => onAssignSlot(null)}
+              className="px-2 py-0.5 rounded border border-gray-300 dark:border-gray-600 text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+            >
+              {t("detail.spool.clearSlot")}
+            </button>
+          </>
+        ) : slotOptions.length === 0 ? (
+          <span className="text-gray-400">{t("detail.spool.noPrinterSlots")}</span>
+        ) : (
+          <select
+            className="px-2 py-0.5 border border-gray-300 dark:border-gray-600 rounded bg-transparent disabled:opacity-50"
+            value=""
+            disabled={spool.retired}
+            title={spool.retired ? t("detail.spool.retiredCannotAssign") : undefined}
+            onChange={(e) => {
+              const [printerId, slotId] = e.target.value.split("|");
+              if (printerId && slotId) onAssignSlot({ printerId, slotId });
+            }}
+          >
+            <option value="">{t("detail.spool.assignSlot")}</option>
+            {slotOptions.map((o) => (
+              <option key={o.value} value={o.value}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+      <p className="mt-1 text-[11px] text-gray-400">{t("detail.spool.printerSlotHint")}</p>
 
       {showMore && (
         <div className="mt-3 pt-3 border-t border-gray-200 dark:border-gray-700 space-y-3 text-sm">
