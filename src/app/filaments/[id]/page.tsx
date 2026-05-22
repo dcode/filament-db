@@ -1467,7 +1467,14 @@ function SpoolCard({
             />
           ) : (
             <button
-              onClick={() => setEditingLabel(true)}
+              // GH #263: re-seed labelInput from the current prop when
+              // the editor opens. `labelInput` is useState-initialised
+              // from `spool.label` only once; SpoolCard is keyed by a
+              // stable `spool._id`, so after any sibling spool mutation
+              // the parent re-renders this card with a fresh `spool`
+              // prop WITHOUT remounting — leaving `labelInput` stale.
+              // Editing then would write or show the old value.
+              onClick={() => { setLabelInput(spool.label); setEditingLabel(true); }}
               className="text-sm font-medium hover:text-blue-600 transition-colors"
               title={t("detail.spool.clickToRename")}
             >
