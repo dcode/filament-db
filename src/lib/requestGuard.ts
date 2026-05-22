@@ -1,17 +1,20 @@
 import { NextRequest, NextResponse } from "next/server";
 import { errorResponse } from "@/lib/apiErrorHandler";
 
-/** Extract the bare, lower-cased hostname from a `host`, `host:port`,
- * `[ipv6]` or `[ipv6]:port` value — i.e. strip the port and any IPv6
- * brackets so two equivalent authorities compare equal. */
-function hostnameOf(value: string): string {
+/** Split a `host`, `host:port`, `[ipv6]` or `[ipv6]:port` value into a
+ * lower-cased hostname and its (possibly empty) port. */
+function splitAuthority(value: string): { hostname: string; port: string } {
   const v = value.trim();
   if (v.startsWith("[")) {
     const end = v.indexOf("]");
-    return (end !== -1 ? v.slice(1, end) : v.slice(1)).toLowerCase();
+    const hostname = (end !== -1 ? v.slice(1, end) : v.slice(1)).toLowerCase();
+    const port = end !== -1 && v[end + 1] === ":" ? v.slice(end + 2) : "";
+    return { hostname, port };
   }
   const colon = v.indexOf(":");
-  return (colon !== -1 ? v.slice(0, colon) : v).toLowerCase();
+  return colon !== -1
+    ? { hostname: v.slice(0, colon).toLowerCase(), port: v.slice(colon + 1) }
+    : { hostname: v.toLowerCase(), port: "" };
 }
 
 /**
@@ -57,25 +60,35 @@ export function assertSameOriginRequest(request: NextRequest): NextResponse | nu
   const origin = request.headers.get("origin");
   if (origin) {
     const hostHeader = request.headers.get("host");
-    let originHostname: string;
+    if (!hostHeader) {
+      return errorResponse(
+        "Cross-origin request to a protected route was rejected.",
+        403,
+      );
+    }
+    let originUrl: URL;
     try {
-      originHostname = new URL(origin).hostname;
+      originUrl = new URL(origin);
     } catch {
       return errorResponse(
         "Cross-origin request to a protected route was rejected.",
         403,
       );
     }
-    // Compare HOSTNAMES only. `Host` is `hostname[:port]`; matching the
-    // raw `host[:port]` string false-rejects a legitimate same-origin
-    // request whenever one side carries an explicit default port
-    // (`Origin: https://app` vs `Host: app:443`) — common behind a
-    // reverse proxy. A genuine cross-origin request that shares the
-    // hostname but differs in scheme or port reads `same-site` to the
-    // Sec-Fetch-Site check above, so hostname equality is sufficient
-    // here (Codex review).
-    const hostHostname = hostHeader ? hostnameOf(hostHeader) : "";
-    if (!hostHostname || hostnameOf(originHostname) !== hostHostname) {
+    // Compare the full authority — hostname AND port. A hostname-only
+    // check is too lenient: when `Sec-Fetch-Site` is absent (older
+    // browsers, embedded webviews, intermediaries that strip Fetch
+    // Metadata) a cross-origin request from the SAME host but a
+    // different port would otherwise slip through (Codex review).
+    // Ports are normalised against the Origin's scheme default, so an
+    // explicit `:443`/`:80` on one side and an omitted default on the
+    // other still compare equal — no false-reject behind a proxy.
+    const defaultPort = originUrl.protocol === "https:" ? "443" : "80";
+    const originHostname = originUrl.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const originPort = originUrl.port || defaultPort;
+    const hostParts = splitAuthority(hostHeader);
+    const hostPort = hostParts.port || defaultPort;
+    if (originHostname !== hostParts.hostname || originPort !== hostPort) {
       return errorResponse(
         "Cross-origin request to a protected route was rejected.",
         403,

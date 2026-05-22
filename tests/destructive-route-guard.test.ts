@@ -56,6 +56,15 @@ describe("assertSameOriginRequest", () => {
       assertSameOriginRequest(reqWith({ origin: "https://app.example:443", host: "app.example" })),
     ).toBeNull();
   });
+
+  it("rejects a same-host different-port Origin (CSRF gap with no Sec-Fetch-Site)", () => {
+    // Codex review: a hostname-only check would let a page on
+    // localhost:8080 POST to the API on localhost:3456 — a real
+    // cross-origin request. The port must be part of the comparison.
+    expect(
+      assertSameOriginRequest(reqWith({ origin: "http://localhost:8080", host: "localhost:3456" })),
+    ).not.toBeNull();
+  });
 });
 
 describe("destructive route — snapshot/delete CSRF guard", () => {
