@@ -1127,14 +1127,22 @@ app.on("before-quit", (event) => {
 
   // GH #316: never let a hung mongod.stop() strand the app. Race the
   // local-Mongo shutdown against a hard timeout — whichever finishes
-  // first triggers the exit. `app.exit(0)` (not `app.quit()`) so a
-  // second before-quit can't re-enter and re-preventDefault.
+  // first re-triggers the quit.
+  //
+  // GH #315 (Codex P1): use `app.quit()`, NOT `app.exit(0)`. The
+  // `isQuitting` guard at the top of this handler already stops a
+  // second before-quit from re-preventDefault-ing, so the original
+  // reason for forcing `app.exit` doesn't hold — and `app.exit(0)`
+  // hard-skips the rest of the quit lifecycle: renderer `beforeunload`
+  // handlers (the unsaved-changes prompt) never fire, and the
+  // auto-updater's install-on-quit never runs. `app.quit()` preserves
+  // both.
   const QUIT_TIMEOUT_MS = 5000;
-  let exited = false;
+  let finished = false;
   const finish = () => {
-    if (exited) return;
-    exited = true;
-    app.exit(0);
+    if (finished) return;
+    finished = true;
+    app.quit();
   };
   stopLocalMongo().finally(finish);
   setTimeout(finish, QUIT_TIMEOUT_MS);
