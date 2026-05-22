@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import BedType from "@/models/BedType";
 import Filament from "@/models/Filament";
+import Printer from "@/models/Printer";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 
 export async function GET(
@@ -72,6 +73,23 @@ export async function DELETE(
     if (referencingCount > 0) {
       return errorResponse(
         `Cannot delete this bed type — it is referenced by ${referencingCount} filament${referencingCount !== 1 ? "s" : ""}. Remove it from those filaments first.`,
+        400,
+      );
+    }
+
+    // Prevent deleting a bed type that is installed on any printer.
+    // `installedBedTypes` was added when bed types became printer-
+    // attachable — without this guard the bed type could be soft-deleted
+    // while printers still hold its ObjectId, leaving dangling refs that
+    // the populate(..., match: { _deletedAt: null }) silently drops.
+    // Mirrors the printer-reference guard in the nozzle DELETE handler.
+    const printerCount = await Printer.countDocuments({
+      _deletedAt: null,
+      installedBedTypes: id,
+    });
+    if (printerCount > 0) {
+      return errorResponse(
+        `Cannot delete this bed type — it is installed on ${printerCount} printer${printerCount !== 1 ? "s" : ""}. Remove it from those printers first.`,
         400,
       );
     }

@@ -173,6 +173,50 @@ describe("/api/bed-types", () => {
       expect(res.status).toBe(200);
     });
 
+    it("refuses if a printer still installs it (Codex P2 on PR #248)", async () => {
+      // Bed types became printer-attachable via Printer.installedBedTypes.
+      // Deleting one while a printer still references it would leave a
+      // dangling ObjectId that populated reads silently drop — so the
+      // DELETE handler must guard printer refs too, mirroring nozzles.
+      const Printer = mongoose.models.Printer;
+      const bed = await BedType.create({ name: "Textured PEI", material: "PEI" });
+      await Printer.create({
+        name: "Core One",
+        manufacturer: "Prusa",
+        printerModel: "Core One",
+        installedBedTypes: [bed._id],
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/installed on .* printer/i);
+      // The bed type was not soft-deleted.
+      const after = await BedType.findById(bed._id);
+      expect(after._deletedAt).toBeNull();
+    });
+
+    it("ignores soft-deleted printers when checking printer refs", async () => {
+      const Printer = mongoose.models.Printer;
+      const bed = await BedType.create({ name: "Cool Plate", material: "Glass" });
+      await Printer.create({
+        name: "Trashed Printer",
+        manufacturer: "Prusa",
+        printerModel: "Core One",
+        installedBedTypes: [bed._id],
+        _deletedAt: new Date(),
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(200);
+    });
+
     it("soft-deletes a bed type with no references", async () => {
       const bed = await BedType.create({ name: "Standalone", material: "Glass" });
       const res = await deleteBedType(
