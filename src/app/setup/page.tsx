@@ -17,14 +17,27 @@ export default function SetupPage() {
   const [showUri, setShowUri] = useState(false);
   // GH #287 (Codex review): the post-success "/" redirect is deferred
   // 800ms so the success banner paints. Track the timer so it can be
-  // cancelled on unmount — otherwise navigating away within that window
-  // lets the stale timer hijack the user to "/" from the new page.
+  // cancelled — otherwise navigating away within that window lets the
+  // stale timer hijack the user to "/" from wherever they ended up.
   const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearRedirectTimer = () => {
+    if (redirectTimerRef.current) {
+      clearTimeout(redirectTimerRef.current);
+      redirectTimerRef.current = null;
+    }
+  };
   useEffect(() => {
-    return () => {
-      if (redirectTimerRef.current) clearTimeout(redirectTimerRef.current);
-    };
+    return () => clearRedirectTimer();
   }, []);
+
+  // Switch the wizard step. A mode change does NOT unmount the page
+  // component, so the unmount cleanup above wouldn't catch a pending
+  // redirect — clear it on every mode switch (e.g. the in-page Back
+  // buttons) so a stale redirect can't fire while still on /setup.
+  const changeMode = (next: ConnectionMode) => {
+    clearRedirectTimer();
+    setMode(next);
+  };
 
   const handleAtlasConnect = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -76,7 +89,8 @@ export default function SetupPage() {
         // Redirect home with a hard reload so the server process picks
         // up the freshly-saved connection; the brief delay lets the
         // success message paint first. The timer is cleared on unmount
-        // so it can't fire from a stale page context.
+        // and on any mode switch so it can't fire from a stale context.
+        clearRedirectTimer();
         redirectTimerRef.current = setTimeout(() => {
           window.location.href = "/";
         }, 800);
@@ -124,7 +138,7 @@ export default function SetupPage() {
           <div className="space-y-3">
             {/* Atlas (Cloud) */}
             <button
-              onClick={() => setMode("atlas")}
+              onClick={() => changeMode("atlas")}
               className="w-full text-left p-4 border border-gray-600 rounded-lg hover:border-blue-500 hover:bg-blue-500/5 transition-colors"
             >
               <div className="flex items-start gap-3">
@@ -141,7 +155,7 @@ export default function SetupPage() {
             {/* Hybrid */}
             {isElectron && (
               <button
-                onClick={() => setMode("hybrid")}
+                onClick={() => changeMode("hybrid")}
                 className="w-full text-left p-4 border border-gray-600 rounded-lg hover:border-purple-500 hover:bg-purple-500/5 transition-colors"
               >
                 <div className="flex items-start gap-3">
@@ -159,7 +173,7 @@ export default function SetupPage() {
             {/* Offline Only */}
             {isElectron && (
               <button
-                onClick={() => setMode("offline")}
+                onClick={() => changeMode("offline")}
                 className="w-full text-left p-4 border border-gray-600 rounded-lg hover:border-green-500 hover:bg-green-500/5 transition-colors"
               >
                 <div className="flex items-start gap-3">
@@ -215,7 +229,7 @@ export default function SetupPage() {
 
           <div className="flex gap-3">
             <button
-              onClick={() => setMode("")}
+              onClick={() => changeMode("")}
               className="flex-1 px-4 py-2 text-sm text-gray-300 hover:text-white border border-gray-600 rounded hover:border-gray-500"
             >
               {t("common.back")}
@@ -307,7 +321,7 @@ export default function SetupPage() {
           <div className="flex gap-3">
             <button
               type="button"
-              onClick={() => { setMode(""); setError(""); setSuccess(""); }}
+              onClick={() => { changeMode(""); setError(""); setSuccess(""); }}
               className="px-4 py-2 text-sm text-gray-300 hover:text-white border border-gray-600 rounded hover:border-gray-500"
             >
               {t("common.back")}
