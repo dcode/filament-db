@@ -123,7 +123,13 @@ export function parseCsv(
   for (let r = 1; r < trimmed.length; r++) {
     // Skip fully-empty rows (common when a file ends with a blank line)
     if (trimmed[r].every((v) => v === "")) continue;
-    const obj: Record<string, string> = {};
+    // GH #296: build the row with a null prototype. With a plain `{}`,
+    // a header literally named `__proto__` would trigger the prototype
+    // setter instead of creating an own property — silently dropping
+    // that column's data and mutating the object's prototype. A
+    // null-prototype object has no such setter; `__proto__` /
+    // `constructor` / `prototype` become ordinary own keys.
+    const obj: Record<string, string> = Object.create(null);
     for (let c = 0; c < headers.length; c++) {
       obj[headers[c]] = trimmed[r][c] ?? "";
     }

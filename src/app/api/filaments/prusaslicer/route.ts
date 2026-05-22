@@ -127,6 +127,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // GH #297: cap the bundle size — a huge bundle would otherwise drive
+    // unbounded sequential writes. Mirrors parseCsv's 10k maxRows.
+    const MAX_IMPORT_FILAMENTS = 10_000;
+    if (parsed.length > MAX_IMPORT_FILAMENTS) {
+      return NextResponse.json(
+        {
+          error: `Import too large: ${parsed.length} sections exceeds the ${MAX_IMPORT_FILAMENTS} limit.`,
+        },
+        { status: 400 },
+      );
+    }
+
     let created = 0;
     let updated = 0;
     const names: string[] = [];
@@ -134,11 +146,6 @@ export async function POST(request: NextRequest) {
     for (const f of parsed) {
       // Skip internal/abstract presets (PrusaSlicer uses *name* convention)
       if (f.name.startsWith("*") && f.name.endsWith("*")) continue;
-
-      const existing = await Filament.findOne({
-        name: f.name,
-        _deletedAt: null,
-      });
 
       const doc = {
         name: f.name,
@@ -154,12 +161,35 @@ export async function POST(request: NextRequest) {
         settings: f.settings,
       };
 
-      if (existing) {
-        await Filament.updateOne({ _id: existing._id }, { $set: doc });
+      const active = await Filament.findOne({ name: f.name, _deletedAt: null });
+      if (active) {
+        await Filament.updateOne(
+          { _id: active._id },
+          { $set: doc },
+          { runValidators: true, context: "query" },
+        );
         updated++;
       } else {
-        await Filament.create(doc);
-        created++;
+        // GH #297: a trashed (non-purged) filament owning this name is
+        // resurrected-and-updated rather than shadowed by a duplicate
+        // active row — a duplicate would strand the trashed one (its
+        // restore would 409 forever on the name conflict).
+        const trashed = await Filament.findOne({
+          name: f.name,
+          _deletedAt: { $ne: null },
+          _purged: { $ne: true },
+        });
+        if (trashed) {
+          await Filament.updateOne(
+            { _id: trashed._id },
+            { $set: { ...doc, _deletedAt: null } },
+            { runValidators: true, context: "query" },
+          );
+          updated++;
+        } else {
+          await Filament.create(doc);
+          created++;
+        }
       }
 
       names.push(f.name);

@@ -284,7 +284,14 @@ export async function upsertImportRows(
       for (const [tempKey, tempVal] of Object.entries(temps)) {
         $set[`temperatures.${tempKey}`] = tempVal;
       }
-      await Filament.updateOne({ _id: existing._id }, { $set });
+      // GH #276: runValidators so a CSV updating an existing filament
+      // (e.g. `cost = -50`) can't bypass the schema validators — the
+      // sibling resurrect path below was already hardened the same way.
+      await Filament.updateOne(
+        { _id: existing._id },
+        { $set },
+        { runValidators: true, context: "query" },
+      );
       updated++;
     } else {
       const softDeleted = deletedByName.get(row.name);

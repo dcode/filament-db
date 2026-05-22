@@ -26,6 +26,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // GH #297: cap the bundle size — mirrors parseCsv's 10k maxRows.
+    // A huge bundle would otherwise drive unbounded sequential writes.
+    const MAX_IMPORT_FILAMENTS = 10_000;
+    if (filaments.length > MAX_IMPORT_FILAMENTS) {
+      return NextResponse.json(
+        {
+          error: `Import too large: ${filaments.length} profiles exceeds the ${MAX_IMPORT_FILAMENTS} limit.`,
+        },
+        { status: 400 },
+      );
+    }
+
     await dbConnect();
 
     let created = 0;
@@ -35,16 +47,43 @@ export async function POST(request: NextRequest) {
     for (const filament of filaments) {
       try {
         const { name, ...rest } = filament;
-        const existing = await Filament.findOneAndUpdate(
-          { name, _deletedAt: null },
-          { $set: rest, $setOnInsert: { name } },
-          { upsert: true, returnDocument: "before" },
-        );
-        if (existing) {
+
+        // Update an existing active filament with this name.
+        const active = await Filament.findOne({ name, _deletedAt: null });
+        if (active) {
+          // GH #308: runValidators so the update branch enforces the
+          // same schema constraints (cost.min, etc.) as a create.
+          await Filament.updateOne(
+            { _id: active._id },
+            { $set: rest },
+            { runValidators: true, context: "query" },
+          );
           updated++;
-        } else {
-          created++;
+          continue;
         }
+
+        // GH #297: if a TRASHED (non-purged) filament owns this name,
+        // resurrect-and-update it rather than creating a second active
+        // row. Creating a duplicate would strand the trashed one — its
+        // restore would then 409 on the name conflict, forever. Mirrors
+        // the resurrect behaviour of the CSV importer.
+        const trashed = await Filament.findOne({
+          name,
+          _deletedAt: { $ne: null },
+          _purged: { $ne: true },
+        });
+        if (trashed) {
+          await Filament.updateOne(
+            { _id: trashed._id },
+            { $set: { ...rest, _deletedAt: null } },
+            { runValidators: true, context: "query" },
+          );
+          updated++;
+          continue;
+        }
+
+        await Filament.create({ name, ...rest });
+        created++;
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         errors.push(`${filament.name}: ${msg}`);

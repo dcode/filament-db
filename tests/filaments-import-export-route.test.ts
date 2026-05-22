@@ -111,11 +111,13 @@ filament_diameter = 1.75
       expect(updated.vendor).toBe("NewVendor");
     });
 
-    it("does not match a soft-deleted filament when upserting (creates a new one instead)", async () => {
-      // A filament with this name is in the trash. Importing the same name
-      // should create a brand-new active filament rather than reviving the
-      // trashed one (the partial unique index permits coexistence).
-      await Filament.create({
+    it("resurrects a soft-deleted filament when upserting (no duplicate)", async () => {
+      // GH #297: a filament with this name is in the trash. Importing the
+      // same name resurrects-and-updates the trashed row rather than
+      // creating a second active row that would shadow it — a duplicate
+      // would strand the trashed one (its restore would 409 forever on
+      // the name conflict).
+      const trashed = await Filament.create({
         name: "Trashed PLA",
         vendor: "Old",
         type: "PLA",
@@ -132,12 +134,12 @@ filament_vendor = New
       );
       expect(res.status).toBe(200);
 
-      const all = await Filament.find({ name: "Trashed PLA" }).sort({ _deletedAt: 1 });
-      // We now have 2: the trashed (oldest, _deletedAt is a Date) and the new active one
-      expect(all).toHaveLength(2);
-      const active = all.find((f: { _deletedAt: unknown }) => f._deletedAt === null);
-      expect(active).toBeTruthy();
-      expect(active.vendor).toBe("New");
+      const all = await Filament.find({ name: "Trashed PLA" });
+      // Only one row — the trashed one was revived, not duplicated.
+      expect(all).toHaveLength(1);
+      expect(String(all[0]._id)).toBe(String(trashed._id));
+      expect(all[0]._deletedAt).toBeNull();
+      expect(all[0].vendor).toBe("New");
     });
   });
 
