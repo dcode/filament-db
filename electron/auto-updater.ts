@@ -41,7 +41,17 @@ let initialized = false;
 
 function emit(update: Partial<UpdateInfo>) {
   currentState = { ...currentState, ...update };
-  mainWindow?.webContents.send("update-status", currentState);
+  // The window may have been closed since this reference was captured —
+  // on macOS the app keeps running and the periodic check still fires.
+  // Touching `webContents` on a destroyed window throws "Object has been
+  // destroyed" (GH #239), so verify the window is still alive first.
+  if (
+    mainWindow &&
+    !mainWindow.isDestroyed() &&
+    !mainWindow.webContents.isDestroyed()
+  ) {
+    mainWindow.webContents.send("update-status", currentState);
+  }
 }
 
 export function initAutoUpdater(win: BrowserWindow) {
@@ -111,8 +121,8 @@ export function initAutoUpdater(win: BrowserWindow) {
       "{version}",
       version,
     );
-    const choice = await dialog.showMessageBox(mainWindow!, {
-      type: "info",
+    const dialogOptions = {
+      type: "info" as const,
       title: strings?.title ?? "Install update",
       message,
       detail:
@@ -124,7 +134,14 @@ export function initAutoUpdater(win: BrowserWindow) {
       ],
       defaultId: 0,
       cancelId: 1,
-    });
+    };
+    // Parent the dialog to the window only if it's still alive; a destroyed
+    // window throws "Object has been destroyed" (GH #239).
+    const liveWindow =
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const choice = liveWindow
+      ? await dialog.showMessageBox(liveWindow, dialogOptions)
+      : await dialog.showMessageBox(dialogOptions);
     if (choice.response === 0) {
       setImmediate(() => autoUpdater.quitAndInstall(false, true));
     }
