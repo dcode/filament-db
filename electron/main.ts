@@ -472,7 +472,17 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
       const backoffMs = Math.min(serverRestartCount * 2000, 30_000);
       diag(`server crashed (code=${code}); restart ${serverRestartCount}/${MAX_SERVER_RESTARTS} in ${backoffMs}ms`);
       setTimeout(() => {
-        if (isQuitting) return;
+        // GH #315 (Codex review): re-check the SAME guard the exit
+        // handler used, but now at timer-fire time. Between the crash
+        // and this delayed restart (backoff up to 30s) an intentional
+        // restart — e.g. save-config's stopServer() + startProduction-
+        // Server() — may already have replaced `serverProcess`.
+        // Restarting anyway would fork a duplicate server (EADDRINUSE)
+        // and leave `serverProcess` pointing at the wrong instance.
+        // `serverProcess !== thisProc` also covers a bare stopServer()
+        // (serverProcess === null): an intentional stop must not be
+        // undone by a stale crash timer.
+        if (isQuitting || serverProcess !== thisProc) return;
         startProductionServer((store.get("mongodbUri") as string) || undefined)
           .then(() => {
             diag("server restarted successfully after crash");
