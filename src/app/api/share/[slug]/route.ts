@@ -17,27 +17,39 @@ export async function GET(
     await dbConnect();
     const { slug } = await params;
 
-    // GH #272: look the catalog up first, then increment viewCount only
-    // for a valid, non-expired hit. The pre-fix handler `$inc`'d on every
-    // GET *before* the expiry check, so expired catalogs kept accruing
-    // views and any caller could inflate the count by hammering the slug.
-    // Filter on _deletedAt: null so an unpublished (soft-deleted) slug
-    // returns 404 rather than 200.
-    const catalog = await SharedCatalog.findOne({ slug, _deletedAt: null });
+    // GH #272: increment viewCount only for a valid, non-expired hit.
+    // The pre-fix handler `$inc`'d on every GET *before* the expiry
+    // check, so expired catalogs kept accruing views.
+    //
+    // A single atomic findOneAndUpdate carries the validity predicates
+    // (_deletedAt + non-expired) into the WRITE itself — so a catalog
+    // that expires or is unpublished between read and write is not
+    // incremented (Codex review) — and `returnDocument: "after"` gives
+    // back the freshly-incremented count, accurate under concurrent
+    // viewers (no read-modify-write skew).
+    const now = new Date();
+    const catalog = await SharedCatalog.findOneAndUpdate(
+      {
+        slug,
+        _deletedAt: null,
+        $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+      },
+      { $inc: { viewCount: 1 } },
+      { returnDocument: "after" },
+    );
+
     if (!catalog) {
+      // No valid hit. Distinguish an expired catalog (410) from a
+      // genuinely missing/unpublished one (404) with a read-only
+      // lookup — this path does NOT increment anything.
+      const existing = await SharedCatalog.findOne({ slug, _deletedAt: null })
+        .select("expiresAt")
+        .lean();
+      if (existing && existing.expiresAt && existing.expiresAt < now) {
+        return errorResponse("Shared catalog has expired", 410);
+      }
       return errorResponse("Shared catalog not found", 404);
     }
-    if (catalog.expiresAt && catalog.expiresAt < new Date()) {
-      return errorResponse("Shared catalog has expired", 410);
-    }
-
-    // Targeted `$inc` — atomic and collision-safe under concurrent
-    // viewers, so simultaneous hits don't drop updates the way a
-    // read-modify-write (findOne + save) would.
-    await SharedCatalog.updateOne(
-      { _id: catalog._id },
-      { $inc: { viewCount: 1 } },
-    );
 
     return NextResponse.json({
       slug: catalog.slug,
@@ -45,7 +57,7 @@ export async function GET(
       description: catalog.description,
       createdAt: catalog.createdAt,
       expiresAt: catalog.expiresAt,
-      viewCount: (catalog.viewCount ?? 0) + 1,
+      viewCount: catalog.viewCount,
       payload: catalog.payload,
     });
   } catch (err) {
