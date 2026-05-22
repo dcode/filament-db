@@ -28,9 +28,14 @@ describe("/api/printers", () => {
     const printerMod = await import("@/models/Printer");
     const nozzleMod = await import("@/models/Nozzle");
     const filamentMod = await import("@/models/Filament");
+    // BedType must be registered too — the printers routes now
+    // .populate("installedBedTypes"), and setup.ts wipes mongoose.models
+    // between tests.
+    const bedTypeMod = await import("@/models/BedType");
     if (!mongoose.models.Printer) mongoose.model("Printer", printerMod.default.schema);
     if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozzleMod.default.schema);
     if (!mongoose.models.Filament) mongoose.model("Filament", filamentMod.default.schema);
+    if (!mongoose.models.BedType) mongoose.model("BedType", bedTypeMod.default.schema);
     Printer = mongoose.models.Printer;
     Nozzle = mongoose.models.Nozzle;
     Filament = mongoose.models.Filament;

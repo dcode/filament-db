@@ -72,9 +72,12 @@ interface SyncResult {
 /**
  * Bidirectional sync engine between local MongoDB and Atlas.
  * Uses last-write-wins conflict resolution based on updatedAt timestamps.
- * Nozzles, printers, locations, and bedtypes are synced first so filaments
- * (and their embedded spools) can have their references remapped onto the
- * target DB's IDs. Printhistories and sharedcatalogs sync after filaments.
+ * Reference-only collections (nozzles, bedtypes, locations) and printers
+ * are synced before filaments so filaments (and their embedded spools)
+ * can have their references remapped onto the target DB's IDs. Order:
+ * nozzles → bedtypes → printers → locations → filaments. bedtypes sync
+ * before printers because printers carry installedBedTypes refs.
+ * Printhistories and sharedcatalogs sync after filaments.
  *
  * Known limitation: spool subdocuments inside Filament don't have stable
  * cross-side identifiers. Anything that references a spool by id —
@@ -178,11 +181,35 @@ export class SyncService extends EventEmitter {
       const localNozzleBySyncId = new Map(localNozzles.filter(n => n.syncId).map(n => [n.syncId as string, n._id]));
       const remoteNozzleBySyncId = new Map(remoteNozzles.filter(n => n.syncId).map(n => [n.syncId as string, n._id]));
 
-      // Sync printers (filament calibrations reference them)
+      // Sync bedtypes before printers AND before filaments: printers now
+      // carry installedBedTypes refs (and filament calibrations carry
+      // calibrations[].bedType), so the bedType docs + syncId maps must
+      // exist before either of those collections is remapped. BedType has
+      // no outgoing references of its own, so it's safe to sync this
+      // early. Same partial-unique-name index trap as locations — bed
+      // types existed before sync was added to this collection set, and
+      // duplicate names on first sync would E11000 the cycle. Reconcile
+      // by name first to unify the syncIds.
+      this.updateStatus({ progress: "Syncing bed types..." });
+      await this.reconcileBedTypesByName(localDb, remoteDb);
+      const bedTypeResult = await this.syncCollection(localDb, remoteDb, "bedtypes");
+
+      // Build bedType syncId→ID maps for printer + filament remap
+      const localBedTypes = await localDb.collection("bedtypes").find({ _deletedAt: null }).toArray();
+      const remoteBedTypes = await remoteDb.collection("bedtypes").find({ _deletedAt: null }).toArray();
+      const localBedTypeBySyncId = new Map(localBedTypes.filter(b => b.syncId).map(b => [b.syncId as string, b._id]));
+      const remoteBedTypeBySyncId = new Map(remoteBedTypes.filter(b => b.syncId).map(b => [b.syncId as string, b._id]));
+
+      // Sync printers (filament calibrations reference them; printers
+      // themselves reference nozzles + bedtypes, both synced above).
       this.updateStatus({ progress: "Syncing printers..." });
       const printerResult = await this.syncCollection(
         localDb, remoteDb, "printers",
-        (doc, direction) => this.remapPrinterRefs(doc, direction, localNozzleBySyncId, remoteNozzleBySyncId)
+        (doc, direction) => this.remapPrinterRefs(
+          doc, direction,
+          localNozzleBySyncId, remoteNozzleBySyncId,
+          localBedTypeBySyncId, remoteBedTypeBySyncId,
+        )
       );
 
       // Build printer syncId→ID maps for filament calibration reference remapping
@@ -224,21 +251,6 @@ export class SyncService extends EventEmitter {
       await this.repairDanglingSpoolLocations(
         localDb, remoteDb, localLocationBySyncId, remoteLocationBySyncId,
       );
-
-      // Sync bedtypes before filaments so calibrations[].bedType can be
-      // remapped. Same partial-unique-name index trap as locations — bed
-      // types existed before sync was added in this collection set, and
-      // duplicate names on first sync would E11000 the cycle. Reconcile
-      // by name first to unify the syncIds.
-      this.updateStatus({ progress: "Syncing bed types..." });
-      await this.reconcileBedTypesByName(localDb, remoteDb);
-      const bedTypeResult = await this.syncCollection(localDb, remoteDb, "bedtypes");
-
-      // Build bedType syncId→ID maps for filament calibration remap
-      const localBedTypes = await localDb.collection("bedtypes").find({ _deletedAt: null }).toArray();
-      const remoteBedTypes = await remoteDb.collection("bedtypes").find({ _deletedAt: null }).toArray();
-      const localBedTypeBySyncId = new Map(localBedTypes.filter(b => b.syncId).map(b => [b.syncId as string, b._id]));
-      const remoteBedTypeBySyncId = new Map(remoteBedTypes.filter(b => b.syncId).map(b => [b.syncId as string, b._id]));
 
       // Backfill filament syncIds before building maps (syncCollection does this too, but we need maps first)
       await this.backfillSyncIds(localDb.collection("filaments"));
@@ -881,23 +893,46 @@ export class SyncService extends EventEmitter {
     direction: "toLocal" | "toRemote",
     localNozzleBySyncId: Map<string, ObjectId>,
     remoteNozzleBySyncId: Map<string, ObjectId>,
+    localBedTypeBySyncId: Map<string, ObjectId>,
+    remoteBedTypeBySyncId: Map<string, ObjectId>,
   ): Document {
-    const sourceMap = direction === "toLocal" ? remoteNozzleBySyncId : localNozzleBySyncId;
-    const targetMap = direction === "toLocal" ? localNozzleBySyncId : remoteNozzleBySyncId;
-
-    const sourceIdToSyncId = new Map<string, string>();
-    for (const [syncId, id] of sourceMap) {
-      sourceIdToSyncId.set(id.toString(), syncId);
-    }
-
-    if (Array.isArray(doc.installedNozzles)) {
-      doc.installedNozzles = doc.installedNozzles
+    // Remap an array of cross-DB ObjectId refs: source-side id → syncId →
+    // target-side id. Refs that don't resolve (no syncId, or the target
+    // doc isn't synced yet) are dropped — same as the original
+    // installedNozzles handling.
+    const remapRefArray = (
+      ids: unknown,
+      sourceMap: Map<string, ObjectId>,
+      targetMap: Map<string, ObjectId>,
+    ): ObjectId[] | undefined => {
+      if (!Array.isArray(ids)) return undefined;
+      const sourceIdToSyncId = new Map<string, string>();
+      for (const [syncId, id] of sourceMap) {
+        sourceIdToSyncId.set(id.toString(), syncId);
+      }
+      return ids
         .map((id: ObjectId) => {
           const syncId = sourceIdToSyncId.get(id.toString());
           return syncId ? targetMap.get(syncId) : null;
         })
-        .filter(Boolean);
-    }
+        .filter(Boolean) as ObjectId[];
+    };
+
+    const nozzleSource = direction === "toLocal" ? remoteNozzleBySyncId : localNozzleBySyncId;
+    const nozzleTarget = direction === "toLocal" ? localNozzleBySyncId : remoteNozzleBySyncId;
+    const remappedNozzles = remapRefArray(doc.installedNozzles, nozzleSource, nozzleTarget);
+    if (remappedNozzles !== undefined) doc.installedNozzles = remappedNozzles;
+
+    // installedBedTypes — same cross-DB remap as installedNozzles. Bed
+    // types are a shared catalog (one bed type, many printers), but the
+    // ObjectId still differs per database, so the ref must be translated
+    // through syncId just like nozzles. bedtypes are synced before
+    // printers (see the sync order in performSync) so the target docs
+    // already exist when this runs.
+    const bedSource = direction === "toLocal" ? remoteBedTypeBySyncId : localBedTypeBySyncId;
+    const bedTarget = direction === "toLocal" ? localBedTypeBySyncId : remoteBedTypeBySyncId;
+    const remappedBedTypes = remapRefArray(doc.installedBedTypes, bedSource, bedTarget);
+    if (remappedBedTypes !== undefined) doc.installedBedTypes = remappedBedTypes;
 
     return doc;
   }

@@ -25,9 +25,13 @@ describe("/api/bed-types", () => {
     const bedMod = await import("@/models/BedType");
     const filMod = await import("@/models/Filament");
     const nozMod = await import("@/models/Nozzle");
+    // Printer is needed by the bed-types GET — it reverse-looks-up which
+    // printers reference each bed type for the "Available On" column.
+    const prtMod = await import("@/models/Printer");
     if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
     if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
     if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
     BedType = mongoose.models.BedType;
     Filament = mongoose.models.Filament;
     Nozzle = mongoose.models.Nozzle;
@@ -159,6 +163,50 @@ describe("/api/bed-types", () => {
         vendor: "T",
         type: "PLA",
         calibrations: [{ nozzle: noz._id, bedType: bed._id }],
+        _deletedAt: new Date(),
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(200);
+    });
+
+    it("refuses if a printer still installs it (Codex P2 on PR #248)", async () => {
+      // Bed types became printer-attachable via Printer.installedBedTypes.
+      // Deleting one while a printer still references it would leave a
+      // dangling ObjectId that populated reads silently drop — so the
+      // DELETE handler must guard printer refs too, mirroring nozzles.
+      const Printer = mongoose.models.Printer;
+      const bed = await BedType.create({ name: "Textured PEI", material: "PEI" });
+      await Printer.create({
+        name: "Core One",
+        manufacturer: "Prusa",
+        printerModel: "Core One",
+        installedBedTypes: [bed._id],
+      });
+
+      const res = await deleteBedType(
+        new NextRequest(`http://localhost/api/bed-types/${bed._id}`, { method: "DELETE" }),
+        { params: Promise.resolve({ id: String(bed._id) }) },
+      );
+      expect(res.status).toBe(400);
+      const body = await res.json();
+      expect(body.error).toMatch(/installed on .* printer/i);
+      // The bed type was not soft-deleted.
+      const after = await BedType.findById(bed._id);
+      expect(after._deletedAt).toBeNull();
+    });
+
+    it("ignores soft-deleted printers when checking printer refs", async () => {
+      const Printer = mongoose.models.Printer;
+      const bed = await BedType.create({ name: "Cool Plate", material: "Glass" });
+      await Printer.create({
+        name: "Trashed Printer",
+        manufacturer: "Prusa",
+        printerModel: "Core One",
+        installedBedTypes: [bed._id],
         _deletedAt: new Date(),
       });
 

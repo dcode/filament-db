@@ -4,6 +4,7 @@ import Printer from "@/models/Printer";
 import { findNozzleConflicts } from "@/lib/nozzleConflicts";
 import { clearSpoolsFromOtherPrinters } from "@/lib/spoolSlots";
 import Nozzle from "@/models/Nozzle";
+import BedType from "@/models/BedType";
 import { getErrorMessage, errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function GET(request: NextRequest) {
@@ -23,6 +24,7 @@ export async function GET(request: NextRequest) {
     const printers = await Printer.find(filter)
       .sort({ manufacturer: 1, name: 1 })
       .populate({ path: "installedNozzles", match: { _deletedAt: null } })
+      .populate({ path: "installedBedTypes", match: { _deletedAt: null } })
       .lean();
     return NextResponse.json(printers);
   } catch (err) {
@@ -80,6 +82,20 @@ export async function POST(request: NextRequest) {
           },
           { status: 409 },
         );
+      }
+    }
+
+    // Validate that all referenced bed-type IDs exist and are active.
+    // Unlike nozzles, bed types are a shared catalog — a surface like
+    // "Textured PEI" can be on many printers at once — so there is no
+    // conflict check, only an existence check.
+    if (body.installedBedTypes?.length > 0) {
+      const activeBedCount = await BedType.countDocuments({
+        _id: { $in: body.installedBedTypes },
+        _deletedAt: null,
+      });
+      if (activeBedCount !== body.installedBedTypes.length) {
+        return errorResponse("One or more selected bed types no longer exist.", 400);
       }
     }
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import BedType from "@/models/BedType";
+import Printer from "@/models/Printer";
 import { getErrorMessage, errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function GET(request: NextRequest) {
@@ -14,7 +15,29 @@ export async function GET(request: NextRequest) {
     if (material) filter.material = material;
 
     const bedTypes = await BedType.find(filter).sort({ name: 1 }).lean();
-    return NextResponse.json(bedTypes);
+
+    // Attach the list of printers each bed type is available on, mirroring
+    // the nozzle list's "Installed In" enrichment. Bed types are a shared
+    // catalog, so a single bed type can appear on many printers — the
+    // reverse lookup runs through Printer.installedBedTypes.
+    const printers = await Printer.find({ _deletedAt: null })
+      .select("_id name installedBedTypes")
+      .lean();
+    const bedTypeIdToPrinters = new Map<string, { _id: string; name: string }[]>();
+    for (const p of printers) {
+      for (const bid of p.installedBedTypes || []) {
+        const key = String(bid);
+        const list = bedTypeIdToPrinters.get(key) ?? [];
+        list.push({ _id: String(p._id), name: p.name });
+        bedTypeIdToPrinters.set(key, list);
+      }
+    }
+    const enriched = bedTypes.map((b) => ({
+      ...b,
+      printers: bedTypeIdToPrinters.get(String(b._id)) ?? [],
+    }));
+
+    return NextResponse.json(enriched);
   } catch (err) {
     return errorResponse("Failed to fetch bed types", 500, getErrorMessage(err));
   }

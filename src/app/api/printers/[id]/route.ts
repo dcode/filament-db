@@ -6,6 +6,7 @@ import Nozzle from "@/models/Nozzle";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 import { findNozzleConflicts } from "@/lib/nozzleConflicts";
 import { clearSpoolsFromOtherPrinters } from "@/lib/spoolSlots";
+import BedType from "@/models/BedType";
 
 export async function GET(
   _request: NextRequest,
@@ -16,6 +17,7 @@ export async function GET(
     const { id } = await params;
     const printer = await Printer.findOne({ _id: id, _deletedAt: null })
       .populate({ path: "installedNozzles", match: { _deletedAt: null } })
+      .populate({ path: "installedBedTypes", match: { _deletedAt: null } })
       .lean();
     if (!printer) {
       return errorResponse("Not found", 404);
@@ -81,6 +83,19 @@ export async function PUT(
           },
           { status: 409 },
         );
+      }
+    }
+
+    // Validate bed-type refs. Bed types are a shared catalog (a surface
+    // spec can be on many printers) so this is an existence check only —
+    // no conflict detection, unlike the nozzle block above.
+    if (body.installedBedTypes?.length > 0) {
+      const activeBedCount = await BedType.countDocuments({
+        _id: { $in: body.installedBedTypes },
+        _deletedAt: null,
+      });
+      if (activeBedCount !== body.installedBedTypes.length) {
+        return errorResponse("One or more selected bed types no longer exist.", 400);
       }
     }
 

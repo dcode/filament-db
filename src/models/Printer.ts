@@ -21,6 +21,12 @@ export interface IPrinter extends Document {
   manufacturer: string;
   printerModel: string;
   installedNozzles: mongoose.Types.ObjectId[];
+  /** Bed surfaces this printer can use (GH — printer↔bed-type association).
+   * Unlike `installedNozzles`, which are physical instances (one nozzle =
+   * one printer, enforced since #232), bed types are a SHARED catalog: a
+   * surface spec like "Textured PEI" can legitimately be referenced by
+   * many printers at once. No conflict detection applies here. */
+  installedBedTypes: mongoose.Types.ObjectId[];
   notes: string;
   // v1.11 additions — expanded printer profile
   /** Build volume in mm. Null means unspecified. */
@@ -47,6 +53,7 @@ const PrinterSchema = new Schema<IPrinter>(
     manufacturer: { type: String, required: true, index: true },
     printerModel: { type: String, required: true },
     installedNozzles: [{ type: Schema.Types.ObjectId, ref: "Nozzle" }],
+    installedBedTypes: [{ type: Schema.Types.ObjectId, ref: "BedType" }],
     notes: { type: String, default: "" },
     buildVolume: {
       x: { type: Number, default: null, min: 0 },
