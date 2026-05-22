@@ -48,7 +48,11 @@ export async function POST(request: NextRequest) {
     const sizeError = checkFileSize(file);
     if (sizeError) return sizeError;
 
-    const content = await file.text();
+    // GH #309: strip a leading UTF-8 BOM (U+FEFF). Excel-saved CSVs —
+    // and the app's own xlsx exports — begin with a BOM; left in place
+    // it becomes part of the first header cell, fails HEADER_MAP, and
+    // the required-column check rejects an otherwise-valid file.
+    const content = (await file.text()).replace(/^\uFEFF/, "");
     const lines = content.split(/\r?\n/).filter((l) => l.trim() !== "");
 
     if (lines.length < 2) {

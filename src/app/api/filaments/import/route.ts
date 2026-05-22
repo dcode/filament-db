@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
 import { parseIniFilaments } from "@/lib/parseIni";
-import { checkFileSize } from "@/lib/apiErrorHandler";
+import { checkFileSize, isDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function POST(request: NextRequest) {
   try {
@@ -26,6 +26,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    // GH #297: cap the bundle size — mirrors parseCsv's 10k maxRows.
+    // A huge bundle would otherwise drive unbounded sequential writes.
+    const MAX_IMPORT_FILAMENTS = 10_000;
+    if (filaments.length > MAX_IMPORT_FILAMENTS) {
+      return NextResponse.json(
+        {
+          error: `Import too large: ${filaments.length} profiles exceeds the ${MAX_IMPORT_FILAMENTS} limit.`,
+        },
+        { status: 400 },
+      );
+    }
+
     await dbConnect();
 
     let created = 0;
@@ -35,15 +47,54 @@ export async function POST(request: NextRequest) {
     for (const filament of filaments) {
       try {
         const { name, ...rest } = filament;
-        const existing = await Filament.findOneAndUpdate(
+
+        // GH #327 (Codex): each branch is a single atomic operation so
+        // there is no findOne→write window for a concurrent soft-delete
+        // or insert to slip through. `runValidators` keeps the update
+        // path enforcing the same schema constraints as a create (#308).
+
+        // 1) Update an existing ACTIVE filament with this name.
+        const activeUpdated = await Filament.findOneAndUpdate(
           { name, _deletedAt: null },
-          { $set: rest, $setOnInsert: { name } },
-          { upsert: true, returnDocument: "before" },
+          { $set: rest },
+          { runValidators: true, context: "query", returnDocument: "after" },
         );
-        if (existing) {
+        if (activeUpdated) {
           updated++;
-        } else {
+          continue;
+        }
+
+        // 2) GH #297: if a TRASHED (non-purged) filament owns this name,
+        // resurrect-and-update it rather than creating a second active
+        // row — a duplicate would strand the trashed one (its restore
+        // would 409 on the name conflict forever).
+        const trashedResurrected = await Filament.findOneAndUpdate(
+          { name, _deletedAt: { $ne: null }, _purged: { $ne: true } },
+          { $set: { ...rest, _deletedAt: null } },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (trashedResurrected) {
+          updated++;
+          continue;
+        }
+
+        // 3) No active or trashed row — create. A concurrent import of
+        // the same new name can still race two requests into create();
+        // the partial-unique index throws E11000 for the loser. Treat
+        // that as "another request just created it" and resolve it as
+        // an update, so identical parallel imports stay idempotent.
+        try {
+          await Filament.create({ name, ...rest });
           created++;
+        } catch (createErr) {
+          if (!isDuplicateKeyError(createErr)) throw createErr;
+          const raced = await Filament.findOneAndUpdate(
+            { name, _deletedAt: null },
+            { $set: rest },
+            { runValidators: true, context: "query", returnDocument: "after" },
+          );
+          if (!raced) throw createErr;
+          updated++;
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

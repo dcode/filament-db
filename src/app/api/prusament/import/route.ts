@@ -4,6 +4,48 @@ import Filament from "@/models/Filament";
 import type { PrusamentScrapeResult } from "../route";
 
 /**
+ * GH #307: validate a renderer-supplied Prusament spool payload before
+ * any DB write. The spool's `totalWeight` reaches the Filament via a
+ * `$push`, which skips the subdocument validators the dedicated spool
+ * routes rely on — so a non-numeric weight or a garbage colour would
+ * otherwise be persisted. Returns a rejection reason, or null when ok.
+ */
+function validatePrusamentSpool(spool: unknown): string | null {
+  if (!spool || typeof spool !== "object") {
+    return "spool must be an object";
+  }
+  const s = spool as Record<string, unknown>;
+  if (typeof s.spoolId !== "string" || s.spoolId.trim() === "") {
+    return "spool.spoolId is required";
+  }
+  for (const field of [
+    "diameter",
+    "lengthMeters",
+    "netWeight",
+    "totalWeight",
+    "spoolWeight",
+  ]) {
+    const v = s[field];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      return `spool.${field} must be a non-negative number`;
+    }
+  }
+  if (typeof s.colorHex !== "string" || !/^#[0-9a-fA-F]{6}$/.test(s.colorHex)) {
+    return "spool.colorHex must be a #RRGGBB hex colour";
+  }
+  if (typeof s.material !== "string" || s.material.trim() === "") {
+    return "spool.material is required";
+  }
+  if (typeof s.colorName !== "string") {
+    return "spool.colorName must be a string";
+  }
+  if (typeof s.manufactureDate !== "string") {
+    return "spool.manufactureDate must be a string";
+  }
+  return null;
+}
+
+/**
  * POST /api/prusament/import
  *
  * Imports a scraped Prusament spool into the database.
@@ -32,11 +74,10 @@ export async function POST(request: NextRequest) {
   const action: string = body.action; // "create" or "add-spool"
   const filamentId: string | undefined = body.filamentId;
 
-  if (!spool?.spoolId) {
-    return NextResponse.json(
-      { error: "Missing spool data" },
-      { status: 400 },
-    );
+  // GH #307: full shape validation — not just a spoolId truthiness check.
+  const spoolError = validatePrusamentSpool(spool);
+  if (spoolError) {
+    return NextResponse.json({ error: spoolError }, { status: 400 });
   }
 
   if (action && action !== "create" && action !== "add-spool") {
