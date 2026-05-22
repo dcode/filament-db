@@ -478,14 +478,19 @@ export default function OpenPrintTagBrowser() {
 
   // ── Handlers ───────────────────────────────────────────────────────
 
-  const toggleSelect = (slug: string) => {
+  // GH #291: `useCallback` keeps `toggleSelect` stable so the memoized
+  // `rowProps` below doesn't change identity every render — react-window
+  // re-renders a row whenever `rowProps` identity changes, and an
+  // unstable callback there means every mounted virtualized row
+  // re-renders on every keystroke in the search box.
+  const toggleSelect = useCallback((slug: string) => {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(slug)) next.delete(slug);
       else next.add(slug);
       return next;
     });
-  };
+  }, []);
 
   const selectAllVisible = () => {
     setSelected((prev) => {
@@ -496,6 +501,20 @@ export default function OpenPrintTagBrowser() {
   };
 
   const deselectAll = () => setSelected(new Set());
+
+  // GH #291: memoize the react-window rowProps so its identity only
+  // changes when something a row actually renders from changes — not on
+  // every parent render (e.g. a keystroke in the search box).
+  const rowProps = useMemo(
+    () => ({
+      materials: filteredMaterials,
+      selectedSlugs: selected,
+      expandedSlug: expanded,
+      toggleSelect,
+      setExpanded,
+    }),
+    [filteredMaterials, selected, expanded, toggleSelect],
+  );
 
   const handleImport = async () => {
     if (selected.size === 0) return;
@@ -798,13 +817,7 @@ export default function OpenPrintTagBrowser() {
                     ? EXPANDED_ROW_HEIGHT_PX
                     : ROW_HEIGHT_PX
                 }
-                rowProps={{
-                  materials: filteredMaterials,
-                  selectedSlugs: selected,
-                  expandedSlug: expanded,
-                  toggleSelect,
-                  setExpanded,
-                }}
+                rowProps={rowProps}
                 overscanCount={5}
                 style={{ height: "100%" }}
               />

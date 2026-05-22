@@ -180,6 +180,11 @@ export default function Home() {
   const { toast } = useToast();
 
   const fetchFilamentsRef = useRef<AbortController | null>(null);
+  // GH #292: dedicated controller for the post-import filter-options
+  // refresh, aborted on unmount so it can't setState after the page is
+  // gone or race the main list fetch un-cancellably.
+  const filterOptionsAcRef = useRef<AbortController | null>(null);
+  useEffect(() => () => filterOptionsAcRef.current?.abort(), []);
 
   // Debounce search input by 300ms
   useEffect(() => {
@@ -233,6 +238,29 @@ export default function Home() {
       setLoading(false);
     }
   }, [debouncedSearch, typeFilter, vendorFilter, toast, t]);
+
+  // Refresh the type / vendor filter dropdowns from the full, unfiltered
+  // filament list. fetchFilaments only recomputes these when no filter
+  // is active, so an import performed while a filter is on would leave
+  // the dropdowns stale without this. GH #292: own AbortController so it
+  // doesn't race the main list fetch un-cancellably or setState after
+  // unmount.
+  const refreshFilterOptions = useCallback(async () => {
+    filterOptionsAcRef.current?.abort();
+    const ac = new AbortController();
+    filterOptionsAcRef.current = ac;
+    try {
+      const res = await fetch("/api/filaments", { signal: ac.signal });
+      if (!res.ok) return;
+      const all = await res.json();
+      if (ac.signal.aborted) return;
+      setTypes([...new Set(all.map((f: Filament) => f.type))].sort() as string[]);
+      setVendors([...new Set(all.map((f: Filament) => f.vendor))].sort() as string[]);
+    } catch (err) {
+      // Non-fatal — the list itself still refreshed via fetchFilaments.
+      if (err instanceof DOMException && err.name === "AbortError") return;
+    }
+  }, []);
 
   // Close import/export dropdown on outside click
   useEffect(() => {
@@ -431,10 +459,7 @@ export default function Home() {
       if (res.ok) {
         toast(data.message);
         fetchFilaments();
-        const allRes = await fetch("/api/filaments");
-        const allData = await allRes.json();
-        setTypes([...new Set(allData.map((f: Filament) => f.type))].sort() as string[]);
-        setVendors([...new Set(allData.map((f: Filament) => f.vendor))].sort() as string[]);
+        refreshFilterOptions();
       } else {
         toast(t("filaments.importFailed", { error: data.error }), "error");
       }

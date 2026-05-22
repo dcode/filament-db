@@ -23,20 +23,41 @@ export default function AnalyticsPage() {
   const [days, setDays] = useState<number>(30);
   const [data, setData] = useState<AnalyticsData | null>(null);
   const [loading, setLoading] = useState(true);
+  // GH #288: a failed fetch used to leave `data` null + `loading` false
+  // and render a blank page indistinguishable from "no data". Track an
+  // explicit error so the user gets a message + retry, like the dashboard.
+  const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     const ac = new AbortController();
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-lifecycle flag
     setLoading(true);
     fetch(`/api/analytics?days=${days}`, { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : null))
+      .then((r) =>
+        r.ok
+          ? r.json()
+          : Promise.reject(new Error(r.statusText || `HTTP ${r.status}`)),
+      )
       .then((d) => {
-        if (d) setData(d);
+        setData(d);
+        setError(null);
         setLoading(false);
       })
-      .catch(() => setLoading(false));
+      .catch((err) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        console.error("Failed to load analytics:", err);
+        setError(t("analytics.loadError"));
+        setLoading(false);
+      });
     return () => ac.abort();
-  }, [days]);
+  }, [days, reloadKey, t]);
+
+  /** Clear the error and re-run the fetch effect. */
+  const retry = () => {
+    setError(null);
+    setReloadKey((k) => k + 1);
+  };
 
   const maxDayGrams = useMemo(() => {
     if (!data) return 0;
@@ -80,7 +101,20 @@ export default function AnalyticsPage() {
 
       {loading && !data && <p className="text-sm text-gray-500">{t("common.loading")}</p>}
 
-      {data && (
+      {error && !loading && (
+        <div className="border border-gray-200 dark:border-gray-800 rounded p-6 text-center">
+          <p className="text-sm text-red-600 dark:text-red-400 mb-3">{error}</p>
+          <button
+            type="button"
+            onClick={retry}
+            className="px-3 py-1.5 text-sm rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:border-gray-400"
+          >
+            {t("common.retry")}
+          </button>
+        </div>
+      )}
+
+      {data && !error && (
         <>
           {/* Totals */}
           <div className="grid grid-cols-3 gap-3 mb-8">

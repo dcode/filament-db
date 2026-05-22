@@ -72,15 +72,25 @@ export default function SyncStatusIndicator() {
     const api = window.electronAPI;
     if (!api?.getSyncStatus) return;
 
+    // GH #319: the IPC calls below resolve asynchronously; guard every
+    // setState behind an `active` flag so a fast unmount can't trigger a
+    // "setState on an unmounted component" warning.
+    let active = true;
+
     api.getConfig().then((config) => {
+      if (!active) return;
       setMode(config.connectionMode);
       // For atlas mode, check actual Atlas connectivity
       if (config.connectionMode === "atlas" && api.checkAtlasConnectivity) {
-        api.checkAtlasConnectivity().then(r => setAtlasReachable(r.connected));
+        api.checkAtlasConnectivity().then((r) => {
+          if (active) setAtlasReachable(r.connected);
+        });
       }
     });
 
-    api.getSyncStatus().then(setStatus);
+    api.getSyncStatus().then((s) => {
+      if (active) setStatus(s);
+    });
 
     const unsub1 = api.onSyncStatusChange(setStatus);
     const unsub2 = api.onConnectionModeFallback(() => {
@@ -88,6 +98,7 @@ export default function SyncStatusIndicator() {
     });
 
     return () => {
+      active = false;
       unsub1();
       unsub2();
     };
@@ -98,10 +109,16 @@ export default function SyncStatusIndicator() {
     if (mode !== "atlas" || isFallback) return;
     const api = window.electronAPI;
     if (!api?.checkAtlasConnectivity) return;
+    let active = true;
     const id = setInterval(() => {
-      api.checkAtlasConnectivity().then(r => setAtlasReachable(r.connected));
+      api.checkAtlasConnectivity().then((r) => {
+        if (active) setAtlasReachable(r.connected);
+      });
     }, 60000); // check every 60s
-    return () => clearInterval(id);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
   }, [mode, isFallback]);
 
   // Periodically refresh the "Synced Xm ago" label

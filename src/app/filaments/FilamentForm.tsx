@@ -295,32 +295,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
     parentId: initialData?.parentId?._id || initialData?.parentId || "",
   });
   const [saving, setSaving] = useState(false);
-  const [dirty, setDirty] = useState(false);
   const savedRef = useRef(false);
-
-  // Warn on unsaved changes when navigating away
-  useEffect(() => {
-    const handler = (e: BeforeUnloadEvent) => {
-      if (dirty && !savedRef.current) {
-        e.preventDefault();
-      }
-    };
-    window.addEventListener("beforeunload", handler);
-    return () => window.removeEventListener("beforeunload", handler);
-  }, [dirty]);
-
-  // Track dirty state on any form field change via useEffect
-  const initialFormRef = useRef(JSON.stringify(form));
-  useEffect(() => {
-    if (JSON.stringify(form) !== initialFormRef.current) {
-      setDirty(true);
-    }
-  }, [form]);
-
-  // Notify parent of dirty state changes
-  useEffect(() => {
-    onDirtyChange?.(dirty);
-  }, [dirty, onDirtyChange]);
+  // GH #286: dirty state is derived below, once `calibrations` and
+  // `presets` are declared — see the `dirty` block after those.
 
   const [showAdvanced, setShowAdvanced] = useState(() => {
     // Auto-expand if any advanced fields have values
@@ -501,6 +478,40 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
   };
 
   const [presets, setPresets] = useState<PresetEntry[]>(getInitialPresets);
+
+  // GH #286: derive dirtiness from a snapshot of *all* editable state —
+  // form fields, calibrations, and presets. The previous effect watched
+  // only `form`, so a calibration- or preset-only edit navigated away
+  // with no unsaved-changes warning — silent loss of exactly the tedious
+  // data this app exists to capture — and it one-way latched `dirty` to
+  // true, so reverting an edit still warned. Deriving the value during
+  // render makes it both two-way and complete. `baselineRef` is
+  // re-pointed after a successful save so the saved state becomes the
+  // new clean baseline.
+  const dirtySnapshot = useMemo(
+    () => JSON.stringify({ form, calibrations, presets }),
+    [form, calibrations, presets],
+  );
+  // The clean baseline. Seeded once with the initial snapshot via the
+  // lazy useState initializer; re-pointed after a successful save.
+  const [dirtyBaseline, setDirtyBaseline] = useState(dirtySnapshot);
+  const dirty = dirtySnapshot !== dirtyBaseline;
+
+  // Warn on unsaved changes when navigating away (browser-level).
+  useEffect(() => {
+    const handler = (e: BeforeUnloadEvent) => {
+      if (dirty && !savedRef.current) {
+        e.preventDefault();
+      }
+    };
+    window.addEventListener("beforeunload", handler);
+    return () => window.removeEventListener("beforeunload", handler);
+  }, [dirty]);
+
+  // Notify the parent (useUnsavedChanges) of dirty-state changes.
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   const addPreset = () => {
     setPresets((prev) => [
@@ -723,7 +734,8 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         settings,
       });
       savedRef.current = true;
-      setDirty(false);
+      // GH #286: re-baseline so the just-saved state counts as clean.
+      setDirtyBaseline(JSON.stringify({ form, calibrations, presets }));
     } finally {
       setSaving(false);
     }

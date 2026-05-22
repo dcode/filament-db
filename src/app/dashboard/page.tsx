@@ -46,18 +46,34 @@ export default function DashboardPage() {
   useCurrency(); // reserved for per-vendor cost summaries later
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     const ac = new AbortController();
     fetch("/api/dashboard", { signal: ac.signal })
-      .then((r) => (r.ok ? r.json() : Promise.reject(r.statusText)))
+      .then((r) =>
+        r.ok
+          ? r.json()
+          : Promise.reject(new Error(r.statusText || `HTTP ${r.status}`)),
+      )
       .then(setData)
       .catch((err) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
-        setError(String(err));
+        // GH #289: `r.statusText` is often empty on HTTP/2, so the old
+        // `setError(String(err))` rendered a raw, untranslated, sometimes
+        // "undefined" string. Log the real cause for debugging; show the
+        // user a translated message like every other page.
+        console.error("Failed to load dashboard:", err);
+        setError(t("dashboard.loadError"));
       });
     return () => ac.abort();
-  }, []);
+  }, [reloadKey, t]);
+
+  /** Clear the error and re-run the fetch effect. */
+  const retry = () => {
+    setError(null);
+    setReloadKey((k) => k + 1);
+  };
 
   /** Spool labels imported from Prusament come through as
    * `<instanceId> (<ISO timestamp>)`. The ISO chunk reads as raw
@@ -74,7 +90,14 @@ export default function DashboardPage() {
   if (error) {
     return (
       <main className="w-full px-4 py-8">
-        <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
+        <p className="text-sm text-red-600 dark:text-red-400 mb-3">{error}</p>
+        <button
+          type="button"
+          onClick={retry}
+          className="px-3 py-1.5 text-sm rounded border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:border-gray-400"
+        >
+          {t("common.retry")}
+        </button>
       </main>
     );
   }

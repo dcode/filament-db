@@ -66,12 +66,26 @@ export default function PrusamentImportDialog({
     targetFilamentId || "",
   );
   const dialogRef = useRef<HTMLDivElement>(null);
+  // GH #319: abort the in-flight request on unmount / on a new submit.
+  const acRef = useRef<AbortController | null>(null);
+  useEffect(() => () => acRef.current?.abort(), []);
 
-  // Focus trap & escape
+  // GH #320/#329: focus capture, initial focus, and restore run once —
+  // on mount and unmount only. Keying this to `onClose` (an inline
+  // parent callback) made the cleanup fire on every parent re-render,
+  // bouncing focus out of the still-open modal. Empty deps tie restore
+  // to a real unmount.
   useEffect(() => {
-    if (!dialogRef.current) return;
-    dialogRef.current.focus();
+    const prevFocus = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => prevFocus?.focus?.();
+  }, []);
+
+  // Tab trap + Escape. Re-bound when `onClose` changes — no focus
+  // side-effects, so a parent re-render is harmless here.
+  useEffect(() => {
     const dialog = dialogRef.current;
+    if (!dialog) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
       if (e.key !== "Tab") return;
@@ -98,9 +112,22 @@ export default function PrusamentImportDialog({
     return () => document.removeEventListener("keydown", handleKey);
   }, [onClose]);
 
+  // GH #320: move focus into the newly-rendered step on a wizard
+  // transition so keyboard / screen-reader users follow the flow.
+  // Prefer a field over the header's close button (which is first in
+  // DOM order) so the input step lands on the spool-id input.
+  useEffect(() => {
+    const root = dialogRef.current;
+    if (!root) return;
+    const el =
+      root.querySelector<HTMLElement>("input, select, textarea") ??
+      root.querySelector<HTMLElement>("button, [href]");
+    el?.focus();
+  }, [step]);
+
   const handleLookup = async () => {
     const input = spoolInput.trim();
-    if (!input) return;
+    if (!input || loading) return;
 
     // Extract spool ID from URL or bare ID
     let id = input;
@@ -115,15 +142,19 @@ export default function PrusamentImportDialog({
 
     setLoading(true);
     setError("");
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
 
     try {
       const res = await fetch(
         `/api/prusament?spoolId=${encodeURIComponent(id)}`,
+        { signal: ac.signal },
       );
       const data = await res.json();
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         setError(data.error || t("prusament.import.lookupFailed"));
-        setLoading(false);
         return;
       }
 
@@ -132,7 +163,9 @@ export default function PrusamentImportDialog({
       // Find matching filaments by material type
       const filRes = await fetch(
         `/api/filaments?type=${encodeURIComponent(data.material)}`,
+        { signal: ac.signal },
       );
+      if (ac.signal.aborted) return;
       if (filRes.ok) {
         const filaments = await filRes.json();
         setMatches(filaments);
@@ -155,10 +188,11 @@ export default function PrusamentImportDialog({
       }
 
       setStep("preview");
-    } catch {
+    } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setError(t("prusament.import.networkError"));
     } finally {
-      setLoading(false);
+      if (!ac.signal.aborted) setLoading(false);
     }
   };
 
@@ -166,6 +200,9 @@ export default function PrusamentImportDialog({
     if (!spool) return;
     setStep("importing");
     setError("");
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
 
     try {
       const res = await fetch("/api/prusament/import", {
@@ -177,9 +214,11 @@ export default function PrusamentImportDialog({
           filamentId:
             action === "add-spool" ? selectedFilamentId : undefined,
         }),
+        signal: ac.signal,
       });
 
       const data = await res.json();
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         setError(data.error || t("prusament.import.importFailed"));
         setStep("preview");
@@ -187,7 +226,8 @@ export default function PrusamentImportDialog({
       }
 
       onImported(data.message);
-    } catch {
+    } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setError(t("prusament.import.networkErrorDuringImport"));
       setStep("preview");
     }

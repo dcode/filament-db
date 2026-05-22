@@ -30,13 +30,28 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [importProgress, setImportProgress] = useState("");
   const dialogRef = useRef<HTMLDivElement>(null);
+  // GH #319: abort the in-flight request on unmount / on a new submit so
+  // setState can't fire after unmount and a stale slow response can't
+  // overwrite newer state.
+  const acRef = useRef<AbortController | null>(null);
+  useEffect(() => () => acRef.current?.abort(), []);
 
-  // Focus trap
+  // GH #320/#329: focus capture, initial focus, and restore run once —
+  // on mount and unmount only. This MUST NOT be keyed to `onClose`: that
+  // callback is created inline by parent pages, so a parent re-render
+  // changes its identity, fires this cleanup, and bounces focus out of
+  // the still-open modal. Empty deps tie restore to a real unmount.
   useEffect(() => {
-    if (!dialogRef.current) return;
-    dialogRef.current.focus();
+    const prevFocus = document.activeElement as HTMLElement | null;
+    dialogRef.current?.focus();
+    return () => prevFocus?.focus?.();
+  }, []);
 
+  // Tab trap + Escape. Re-bound when `onClose` changes — cheap, and with
+  // no focus side-effects so a parent re-render is harmless here.
+  useEffect(() => {
     const dialog = dialogRef.current;
+    if (!dialog) return;
     const handleTab = (e: KeyboardEvent) => {
       if (e.key === "Escape") { onClose(); return; }
       if (e.key !== "Tab") return;
@@ -62,29 +77,43 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
     return () => document.removeEventListener("keydown", handleTab);
   }, [onClose]);
 
+  // GH #320: move focus into the newly-rendered step on a wizard
+  // transition so keyboard / screen-reader users follow the flow.
+  useEffect(() => {
+    const el = dialogRef.current?.querySelector<HTMLElement>(
+      'input, select, textarea, button, [href]',
+    );
+    el?.focus();
+  }, [step]);
+
   const handleConnect = async () => {
-    if (!uri.trim()) return;
+    if (!uri.trim() || connecting) return;
     setConnecting(true);
     setError("");
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
     try {
       const res = await fetch("/api/filaments/import-atlas", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uri }),
+        signal: ac.signal,
       });
       const data = await res.json();
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         setError(data.error || t("atlas.import.connectionFailed"));
-        setConnecting(false);
         return;
       }
       setFilaments(data.filaments || []);
       setSelected(new Set((data.filaments || []).map((f: RemoteFilament) => f._id)));
       setStep("select");
-    } catch {
+    } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setError(t("atlas.import.networkError"));
     } finally {
-      setConnecting(false);
+      if (!ac.signal.aborted) setConnecting(false);
     }
   };
 
@@ -109,13 +138,18 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
     setStep("importing");
     setImportProgress(t("atlas.import.importing"));
     setError("");
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
     try {
       const res = await fetch("/api/filaments/import-atlas", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ uri, filamentIds: [...selected] }),
+        signal: ac.signal,
       });
       const data = await res.json();
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         setError(data.error || t("atlas.import.importFailed"));
         setImportProgress("");
@@ -123,7 +157,8 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
         return;
       }
       onImported(data.message);
-    } catch {
+    } catch (err) {
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
       setError(t("atlas.import.networkErrorDuringImport"));
       setImportProgress("");
       setStep("select");
