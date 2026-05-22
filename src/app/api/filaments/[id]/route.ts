@@ -274,7 +274,15 @@ export async function POST(
       ownCalibrations.length > 0 || !calParent ? filament : calParent;
     const compatTarget =
       ownCompatNozzles.length > 0 || !calParent ? filament : calParent;
-    let calibrationParentUpdate: unknown[] | null = null;
+    // GH #265 (Codex P1): when the calibration belongs on the PARENT
+    // (an inheriting variant), we record just the nozzle + fields here
+    // and apply them with an atomic per-entry write after the main
+    // update — never a read-modify-write of the parent's whole
+    // `calibrations` array, which would lose a concurrent sibling's
+    // write.
+    let parentCalibrationWrite:
+      | { nozzleId: string; fields: Record<string, number | null> }
+      | null = null;
 
     // Update per-nozzle calibration data when nozzle_diameter is provided.
     // PrusaSlicer passes ?nozzle_diameter=0.4&high_flow=0|1 so the API
@@ -329,28 +337,29 @@ export async function POST(
 
           if (matchingNozzle) {
             const nozzleId = String(matchingNozzle._id);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const calibrations = [...((calTarget.calibrations as any[]) || [])];
-            const idx = calibrations.findIndex(
-              (cal) => String(cal.nozzle) === nozzleId && !cal.printer,
-            );
-            if (idx >= 0) {
-              // Update existing calibration entry
-              Object.assign(calibrations[idx], calFields);
-            } else {
-              // Create new calibration entry for this nozzle
-              calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
-            }
             // GH #265: write to whichever document owns this filament's
-            // effective calibrations. When `calTarget` is the filament
-            // itself (standalone, or a variant that overrides
-            // calibrations) it goes in this request's `update`; when
-            // `calTarget` is the parent (an inheriting variant) it's
-            // applied to the parent separately so inheritance is kept.
+            // effective calibrations.
             if (String(calTarget._id) === String(filament._id)) {
+              // The filament itself owns calibrations (standalone, or a
+              // variant that overrides them) — fold the change into this
+              // request's own single $set on this document.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const calibrations = [...((calTarget.calibrations as any[]) || [])];
+              const idx = calibrations.findIndex(
+                (cal) => String(cal.nozzle) === nozzleId && !cal.printer,
+              );
+              if (idx >= 0) {
+                Object.assign(calibrations[idx], calFields);
+              } else {
+                calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
+              }
               update.calibrations = calibrations;
             } else {
-              calibrationParentUpdate = calibrations;
+              // An inheriting variant — the calibration belongs on the
+              // parent. Defer to an atomic per-entry write (below) so a
+              // concurrent sibling sync of the same parent can't be
+              // clobbered by a whole-array overwrite.
+              parentCalibrationWrite = { nozzleId, fields: calFields };
             }
           }
         }
@@ -380,12 +389,32 @@ export async function POST(
 
     await Filament.findByIdAndUpdate(filament._id, { $set: update });
 
-    // GH #265: persist a variant's calibration change on its parent so
-    // the variant keeps inheriting it (see the note above).
-    if (calibrationParentUpdate) {
-      await Filament.findByIdAndUpdate(calTarget._id, {
-        $set: { calibrations: calibrationParentUpdate },
-      });
+    // GH #265 (Codex P1): persist an inheriting variant's calibration
+    // change on its parent with an ATOMIC per-entry write. Try to $set
+    // the matching calibration sub-document in place; if no entry
+    // exists yet, $push a new one. This never rewrites the parent's
+    // whole `calibrations` array, so two variants syncing the same
+    // parent concurrently can't drop each other's entries.
+    if (parentCalibrationWrite) {
+      const { nozzleId, fields } = parentCalibrationWrite;
+      const setEntry: Record<string, number | null> = {};
+      for (const [k, v] of Object.entries(fields)) {
+        setEntry[`calibrations.$.${k}`] = v;
+      }
+      const res = await Filament.updateOne(
+        {
+          _id: calTarget._id,
+          calibrations: { $elemMatch: { nozzle: nozzleId, printer: null } },
+        },
+        { $set: setEntry },
+      );
+      if (res.matchedCount === 0) {
+        // No nozzle-matching entry yet — append one.
+        await Filament.updateOne(
+          { _id: calTarget._id },
+          { $push: { calibrations: { nozzle: nozzleId, printer: null, ...fields } } },
+        );
+      }
     }
 
     return NextResponse.json({

@@ -41,11 +41,15 @@ export async function GET(
     if (!catalog) {
       // No valid hit. Distinguish an expired catalog (410) from a
       // genuinely missing/unpublished one (404) with a read-only
-      // lookup — this path does NOT increment anything.
+      // lookup — this path does NOT increment anything. The expiry
+      // test is `<= now` to match the increment query's `$gt: now`
+      // exactly: a catalog whose expiresAt is precisely `now` is
+      // excluded from the valid-hit query, so it must report 410 here
+      // (Codex review — consistent boundary semantics).
       const existing = await SharedCatalog.findOne({ slug, _deletedAt: null })
         .select("expiresAt")
         .lean();
-      if (existing && existing.expiresAt && existing.expiresAt < now) {
+      if (existing && existing.expiresAt && existing.expiresAt <= now) {
         return errorResponse("Shared catalog has expired", 410);
       }
       return errorResponse("Shared catalog not found", 404);
