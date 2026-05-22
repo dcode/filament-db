@@ -34,6 +34,11 @@ export async function startLocalMongo(): Promise<string> {
       dbPath,
       storageEngine: "wiredTiger",
       launchTimeout: 60000,
+      // GH #318: pin the bind address to loopback explicitly. The
+      // embedded database is unauthenticated; relying on the library's
+      // default bind would silently expose it to the LAN if a future
+      // mongodb-memory-server release changed that default.
+      ip: "127.0.0.1",
     },
   });
 

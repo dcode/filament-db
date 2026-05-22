@@ -8,6 +8,7 @@ import { NfcService } from "./nfc-service";
 import { startLocalMongo, stopLocalMongo } from "./local-mongo";
 import { SyncService, SyncStatus, getDbNameFromUri } from "./sync-service";
 import { initAutoUpdater } from "./auto-updater";
+import { assertTrustedSender, validateMongoUri } from "./ipc-security";
 
 // ── Diagnostic log ──
 // Writes lifecycle and crash events to a file in userData so users on
@@ -73,6 +74,11 @@ const isDev = !app.isPackaged;
 let isQuitting = false;
 let mainWindow: BrowserWindow | null = null;
 let serverProcess: UtilityProcess | null = null;
+/** GH #315: crash-restart attempt counter. Reset to 0 each time a
+ * server reaches a healthy startup; capped so an immediately-crashing
+ * server can't tight-loop forever. */
+let serverRestartCount = 0;
+const MAX_SERVER_RESTARTS = 5;
 let nfcService: NfcService | null = null;
 /** Guards initNfc() so the deferred init runs only once even though it's
  * wired to every window's "show" event (macOS dock-reopen creates a new
@@ -151,6 +157,13 @@ function createWindow(urlPath = "/") {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // GH #262: run the renderer in the OS-level sandbox. The preload
+      // only uses contextBridge + ipcRenderer, both of which are
+      // sandbox-safe, so nothing in the renderer path needs Node access.
+      // This contains any XSS in user-supplied filament data / community
+      // DB content / TDS-extracted HTML so it can't reach beyond the
+      // renderer process.
+      sandbox: true,
     },
   });
 
@@ -406,17 +419,80 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
       }
     });
 
+    // Capture the process this closure owns — `serverProcess` is
+    // reassigned on every (re)start, so the crash-restart guard below
+    // must compare against the module-level current process, not this.
+    const thisProc = serverProcess;
+
     serverProcess.on("spawn", () => {
       diag("server spawned");
       // Wait for the server to respond to HTTP requests
-      waitForServer(PORT).then(resolve).catch(reject);
+      waitForServer(PORT)
+        .then(() => {
+          // GH #315: a healthy startup resets the crash counter, so a
+          // server that runs fine for a while and then crashes still
+          // gets a fresh set of restart attempts.
+          serverRestartCount = 0;
+          resolve();
+        })
+        .catch(reject);
     });
 
     serverProcess.on("exit", (code) => {
       diag(`server exit code=${code}`);
+      // Startup-phase failure: reject so the caller surfaces it. Harmless
+      // once the promise has already resolved (reject on a settled
+      // promise is a no-op).
       if (code !== 0) {
         reject(new Error(`Server exited with code ${code}`));
       }
+
+      // GH #315: crash-restart. Attached to EVERY spawned process (not
+      // just the first), so a crash after the first restart is still
+      // handled. Skipped when:
+      //   - the app is quitting (intentional shutdown), or
+      //   - this exited process is no longer the current one — it was
+      //     replaced by an intentional stopServer() + restart (e.g. a
+      //     save-config connection change), so restarting it would
+      //     spawn a duplicate server.
+      if (isQuitting || thisProc !== serverProcess) return;
+      if (code === 0 || code === null) return; // clean exit, not a crash
+
+      if (serverRestartCount >= MAX_SERVER_RESTARTS) {
+        diag(`server crash-restart cap reached (${MAX_SERVER_RESTARTS})`);
+        dialog.showErrorBox(
+          "Server Crashed",
+          `The embedded web server crashed repeatedly (${MAX_SERVER_RESTARTS} restart attempts) and has been left stopped.`,
+        );
+        return;
+      }
+      serverRestartCount++;
+      // Linear backoff, capped — avoids a tight loop on a server that
+      // crashes immediately every time.
+      const backoffMs = Math.min(serverRestartCount * 2000, 30_000);
+      diag(`server crashed (code=${code}); restart ${serverRestartCount}/${MAX_SERVER_RESTARTS} in ${backoffMs}ms`);
+      setTimeout(() => {
+        // GH #315 (Codex review): re-check the SAME guard the exit
+        // handler used, but now at timer-fire time. Between the crash
+        // and this delayed restart (backoff up to 30s) an intentional
+        // restart — e.g. save-config's stopServer() + startProduction-
+        // Server() — may already have replaced `serverProcess`.
+        // Restarting anyway would fork a duplicate server (EADDRINUSE)
+        // and leave `serverProcess` pointing at the wrong instance.
+        // `serverProcess !== thisProc` also covers a bare stopServer()
+        // (serverProcess === null): an intentional stop must not be
+        // undone by a stale crash timer.
+        if (isQuitting || serverProcess !== thisProc) return;
+        startProductionServer((store.get("mongodbUri") as string) || undefined)
+          .then(() => {
+            diag("server restarted successfully after crash");
+            mainWindow?.reload();
+          })
+          .catch((restartErr) => {
+            console.error("Server restart failed:", restartErr);
+            diag(`server restart failed: ${restartErr instanceof Error ? restartErr.message : String(restartErr)}`);
+          });
+      }, backoffMs);
     });
   });
 }
@@ -424,9 +500,23 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
 /** Maximum wait time (ms) for IPC calls before they're considered timed out. */
 const IPC_TIMEOUT_MS = 15_000;
 
+/** Upper bound on a renderer-supplied NFC write payload (GH #278). The
+ * largest tag this app targets (SLIX2) holds ~320 bytes; 4 KB is a
+ * generous ceiling that still rejects a memory-pressure payload before
+ * any allocation happens. */
+const MAX_NFC_PAYLOAD_BYTES = 4096;
+
 /**
  * Wraps an async IPC handler with a timeout to prevent hanging calls
  * when the server becomes unresponsive.
+ *
+ * GH #279: the timeout only *rejects the promise* — it does not cancel
+ * the underlying operation. Use it ONLY for genuinely bounded calls
+ * (NFC read/write/format, where exceeding 15s means the reader is
+ * stuck). Do NOT use it for inherently long-running work such as sync,
+ * which keeps mutating data after the race is lost; long-running
+ * operations should report progress through their own status channel
+ * instead.
  */
 function withIpcTimeout<T>(fn: () => Promise<T>, label: string): Promise<T> {
   return Promise.race([
@@ -559,7 +649,7 @@ ipcMain.handle("get-config", () => {
   };
 });
 
-ipcMain.handle("save-config", async (_event, config: {
+ipcMain.handle("save-config", async (event, config: {
   mongodbUri?: string;
   connectionMode?: ConnectionMode;
   atlasUri?: string;
@@ -570,6 +660,17 @@ ipcMain.handle("save-config", async (_event, config: {
   customCurrencies?: string;
   locale?: string;
 }) => {
+  assertTrustedSender(event, "save-config");
+
+  // GH #300: any connection string reaching the store / child-process
+  // env must be a real mongodb URI with no local-file TLS options.
+  for (const candidate of [config.atlasUri, config.mongodbUri]) {
+    if (candidate !== undefined) {
+      const reason = validateMongoUri(candidate);
+      if (reason) return { success: false, error: reason };
+    }
+  }
+
   // Update individual fields
   if (config.connectionMode !== undefined) {
     store.set("connectionMode", config.connectionMode);
@@ -653,7 +754,8 @@ ipcMain.handle("save-config", async (_event, config: {
   return { success: true };
 });
 
-ipcMain.handle("reset-config", async () => {
+ipcMain.handle("reset-config", async (event) => {
+  assertTrustedSender(event, "reset-config");
   store.delete("mongodbUri");
   store.delete("connectionMode");
   store.delete("atlasUri");
@@ -669,7 +771,14 @@ ipcMain.handle("reset-config", async () => {
   return { success: true };
 });
 
-ipcMain.handle("test-connection", async (_event, uri: string) => {
+ipcMain.handle("test-connection", async (event, uri: string) => {
+  assertTrustedSender(event, "test-connection");
+  // GH #300: refuse non-mongodb schemes and local-file TLS options
+  // before handing the string to the driver — otherwise a compromised
+  // renderer could pivot through the main process (SSRF / file read).
+  const reason = validateMongoUri(uri);
+  if (reason) return { success: false, error: reason };
+
   const { MongoClient } = await import("mongodb");
   const client = new MongoClient(uri, {
     serverSelectionTimeoutMS: 5000,
@@ -712,7 +821,13 @@ ipcMain.handle("trigger-sync", async () => {
   if (!syncService) {
     return { error: "Sync not available in current mode" };
   }
-  const results = await withIpcTimeout(() => syncService!.sync(), "trigger-sync");
+  // GH #279: do NOT wrap sync in withIpcTimeout. A 15s race that
+  // abandons an in-flight sync doesn't stop it — the engine keeps
+  // mutating BOTH databases while the renderer is told it "timed out".
+  // Sync is inherently long-running and reports its own progress via
+  // get-sync-status, which the renderer already polls; let it run to
+  // completion.
+  const results = await syncService.sync();
   return { results };
 });
 
@@ -748,8 +863,31 @@ ipcMain.handle("nfc-read-tag", async () => {
   return withIpcTimeout(() => nfcService!.readTag(), "nfc-read-tag");
 });
 
-ipcMain.handle("nfc-write-tag", async (_event, payload: number[], productUrl?: string) => {
+ipcMain.handle("nfc-write-tag", async (event, payload: number[], productUrl?: string) => {
+  assertTrustedSender(event, "nfc-write-tag");
   if (!nfcService) throw new Error("NFC not initialized");
+
+  // GH #278: the payload is a renderer-supplied number[] that gets
+  // encoded onto a physical tag. Validate it BEFORE allocating — cap
+  // the length, and confirm every element is a 0-255 byte.
+  if (!Array.isArray(payload)) {
+    throw new Error("nfc-write-tag: payload must be an array");
+  }
+  if (payload.length > MAX_NFC_PAYLOAD_BYTES) {
+    throw new Error(
+      `nfc-write-tag: payload too large (${payload.length} > ${MAX_NFC_PAYLOAD_BYTES} bytes)`,
+    );
+  }
+  if (!payload.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)) {
+    throw new Error("nfc-write-tag: payload must contain only 0-255 integers");
+  }
+  // GH #278: productUrl is written onto the tag and acted on by
+  // downstream readers (the Prusa app) — only http(s) is safe. A
+  // javascript:/file: URL must never be persisted to physical media.
+  if (productUrl !== undefined && !/^https?:\/\//i.test(productUrl)) {
+    throw new Error("nfc-write-tag: productUrl must be an http(s) URL");
+  }
+
   await withIpcTimeout(() => nfcService!.writeTag(new Uint8Array(payload), productUrl), "nfc-write-tag");
 
   // After a successful write, schedule a delayed read-back so the UI shows
@@ -767,7 +905,8 @@ ipcMain.handle("nfc-write-tag", async (_event, payload: number[], productUrl?: s
   return { success: true };
 });
 
-ipcMain.handle("nfc-format-tag", async () => {
+ipcMain.handle("nfc-format-tag", async (event) => {
+  assertTrustedSender(event, "nfc-format-tag");
   if (!nfcService) throw new Error("NFC not initialized");
   await withIpcTimeout(() => nfcService!.formatTag(), "nfc-format-tag");
   return { success: true };
@@ -897,7 +1036,14 @@ app.whenReady().then(async () => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        "Content-Security-Policy": ["default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:;"],
+        // GH #262: `'unsafe-eval'` dropped — the production Electron build
+        // loads a compiled Next.js bundle that does not need runtime
+        // eval(), so allowing it only weakened CSP for no benefit.
+        // `'unsafe-inline'` on script-src is still required because
+        // Next.js streams the RSC payload via inline <script> tags and
+        // the theme-init bootstrap is inline; migrating those to a
+        // per-request nonce is tracked separately in #225.
+        "Content-Security-Policy": ["default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:;"],
       },
     });
   });
@@ -930,30 +1076,11 @@ app.whenReady().then(async () => {
   }
 
   if (!isDev) {
-    // Always start the server — even without mongoUri, the setup page needs it
+    // Always start the server — even without mongoUri, the setup page needs it.
+    // Crash-restart is handled inside startProductionServer (GH #315), so
+    // every spawned process — including restarts — gets the handler.
     try {
       await startProductionServer(mongoUri || undefined);
-
-      // Watch for unexpected server crashes after successful startup
-      if (serverProcess) {
-        serverProcess.on("exit", (code) => {
-          if (code !== null && code !== 0) {
-            console.error(`Server crashed with exit code ${code}, attempting restart...`);
-            startProductionServer((store.get("mongodbUri") as string) || undefined)
-              .then(() => {
-                console.log("Server restarted successfully after crash");
-                mainWindow?.reload();
-              })
-              .catch((restartErr) => {
-                console.error("Server restart failed:", restartErr);
-                dialog.showErrorBox(
-                  "Server Crashed",
-                  `The embedded web server crashed and could not be restarted.\n\n${restartErr instanceof Error ? restartErr.message : String(restartErr)}`,
-                );
-              });
-          }
-        });
-      }
     } catch (err) {
       console.error("Failed to start server:", err);
       dialog.showErrorBox(
@@ -997,7 +1124,28 @@ app.on("before-quit", (event) => {
   stopServer();
   if (syncService) syncService.destroy();
   if (nfcService) nfcService.destroy();
-  stopLocalMongo().finally(() => app.quit());
+
+  // GH #316: never let a hung mongod.stop() strand the app. Race the
+  // local-Mongo shutdown against a hard timeout — whichever finishes
+  // first re-triggers the quit.
+  //
+  // GH #315 (Codex P1): use `app.quit()`, NOT `app.exit(0)`. The
+  // `isQuitting` guard at the top of this handler already stops a
+  // second before-quit from re-preventDefault-ing, so the original
+  // reason for forcing `app.exit` doesn't hold — and `app.exit(0)`
+  // hard-skips the rest of the quit lifecycle: renderer `beforeunload`
+  // handlers (the unsaved-changes prompt) never fire, and the
+  // auto-updater's install-on-quit never runs. `app.quit()` preserves
+  // both.
+  const QUIT_TIMEOUT_MS = 5000;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    app.quit();
+  };
+  stopLocalMongo().finally(finish);
+  setTimeout(finish, QUIT_TIMEOUT_MS);
 });
 
 } // end single-instance lock else block

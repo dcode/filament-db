@@ -38,6 +38,32 @@ interface CardReaderStatus {
 const BLOCK_SIZE = 4;
 const DEFAULT_BLOCK_COUNT = 80;
 
+/** The MLEN byte a healthy SLIX2 tag reports: total memory / 8 =
+ * 80 blocks × 4 bytes / 8 = 40. */
+const EXPECTED_MLEN = (DEFAULT_BLOCK_COUNT * BLOCK_SIZE) / 8;
+
+/**
+ * Sanitize the raw MLEN byte read from a tag's Capability Container
+ * (GH #301). MLEN is "memory length / 8" and comes straight off the
+ * tag. Only a genuinely UNUSABLE value is rejected — zero, a
+ * non-integer, or out of byte range (block0 too short → `block0[2]`
+ * is `undefined`) — and replaced with the SLIX2 default.
+ *
+ * GH #322 (Codex P1): a value merely OUTSIDE the SLIX2 band is
+ * preserved. It is the real declared capacity of a non-SLIX2 NFC-V
+ * chip; clamping it would make `formatTag()` write a wrong CC and
+ * corrupt an otherwise-valid tag. The bounds that actually matter for
+ * safety are enforced at the USE sites instead — the read loops clamp
+ * the block count to DEFAULT_BLOCK_COUNT, and `writeTag()` caps its
+ * write extent at EXPECTED_MLEN — so a large MLEN can't drive reads or
+ * writes off the end of the chip.
+ */
+function sanitizeMlen(rawByte: number): number {
+  return Number.isInteger(rawByte) && rawByte > 0 && rawByte <= 255
+    ? rawByte
+    : EXPECTED_MLEN;
+}
+
 export class NfcService extends EventEmitter {
   private pcsc: PCSCLite;
   private readers: Map<string, CardReader> = new Map();
@@ -368,7 +394,7 @@ export class NfcService extends EventEmitter {
   /** Read an OpenPrintTag (NFC-V / ISO 15693) tag. */
   private async readOpenPrintTag(protocol: number): Promise<DecodedOpenPrintTag> {
     const block0 = await this.readBlock(protocol, 0);
-    const mlen = block0[2];
+    const mlen = sanitizeMlen(block0[2]);
     const numBlocks = Math.min(Math.ceil((mlen * 8) / BLOCK_SIZE), DEFAULT_BLOCK_COUNT);
 
     const allData = Buffer.alloc(numBlocks * BLOCK_SIZE);
@@ -422,8 +448,13 @@ export class NfcService extends EventEmitter {
   async writeTag(cborPayload: Uint8Array, productUrl?: string): Promise<void> {
     return this.withConnection(async (protocol) => {
       const block0 = await this.readBlock(protocol, 0);
-      const mlen = block0[2];
-      const tagMemorySize = mlen * 8 || DEFAULT_BLOCK_COUNT * BLOCK_SIZE;
+      const mlen = sanitizeMlen(block0[2]);
+      // GH #301/#322: cap the write extent at the SLIX2-class size the
+      // app's own payloads are built for. sanitizeMlen now preserves a
+      // larger real MLEN (so formatTag writes a correct CC), but the
+      // write loop must not run far past a normal chip when the tag
+      // reports an over-large — or corrupt-but-in-byte-range — MLEN.
+      const tagMemorySize = Math.min(mlen, EXPECTED_MLEN) * 8;
 
       const tagMemory = wrapNdefForTag(cborPayload, tagMemorySize, productUrl);
 
@@ -462,14 +493,17 @@ export class NfcService extends EventEmitter {
 
   async formatTag(): Promise<void> {
     return this.withConnection(async (protocol) => {
-      // Read block 0 to get memory size from the CC
+      // Read block 0 to get memory size from the CC. GH #301: the raw
+      // MLEN byte is sanitized before it's trusted for numBlocks OR
+      // written back into the CC — a corrupt byte written here would
+      // brick the tag for the app.
       const block0 = await this.readBlock(protocol, 0);
-      const mlen = block0[2];
-      const numBlocks = mlen ? Math.min(Math.ceil((mlen * 8) / BLOCK_SIZE), DEFAULT_BLOCK_COUNT) : DEFAULT_BLOCK_COUNT;
+      const mlen = sanitizeMlen(block0[2]);
+      const numBlocks = Math.min(Math.ceil((mlen * 8) / BLOCK_SIZE), DEFAULT_BLOCK_COUNT);
 
       // Write CC with valid NFC Forum Type 5 header, then zero everything else
       // CC: E1 40 <size/8> 01 — magic, v1.0 RW, size, read-multiple-blocks supported
-      const cc = Buffer.from([0xe1, 0x40, mlen || (DEFAULT_BLOCK_COUNT * BLOCK_SIZE / 8), 0x01]);
+      const cc = Buffer.from([0xe1, 0x40, mlen, 0x01]);
       await this.writeBlock(protocol, 0, cc);
 
       // Write TLV terminator in block 1, zero the rest
