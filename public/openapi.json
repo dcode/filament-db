@@ -3,7 +3,7 @@
   "info": {
     "title": "Filament DB API",
     "description": "REST API for managing 3D printing filament profiles, spools, nozzles, printers, bed types, locations, print history, sharing, slicer integrations, and OpenPrintTag imports.",
-    "version": "1.18.0",
+    "version": "1.22.0",
     "license": {
       "name": "MIT"
     }
@@ -1695,6 +1695,18 @@
       }
     },
     "/api/filaments/{id}/orcaslicer": {
+      "get": {
+        "tags": ["OrcaSlicer"],
+        "summary": "Export one filament as an OrcaSlicer preset",
+        "description": "Downloads a single filament as an OrcaSlicer filament-preset `.json` (one preset object, not the array the bundle route `/api/filaments/orcaslicer` returns). Sets a `Content-Disposition: attachment` header with a filename derived from the filament name. Variants are resolved against their parent so the preset carries full effective values.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Filament name or MongoDB ObjectId" }
+        ],
+        "responses": {
+          "200": { "description": "OrcaSlicer filament preset (.json download)", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "404": { "description": "Filament not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
       "post": {
         "tags": ["OrcaSlicer"],
         "summary": "Sync OrcaSlicer profile changes",
@@ -1706,6 +1718,34 @@
         "responses": {
           "200": { "description": "Sync result", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "description": "Invalid JSON", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Filament not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/filaments/{id}/prusaslicer": {
+      "get": {
+        "tags": ["PrusaSlicer"],
+        "summary": "Export one filament as a PrusaSlicer config bundle",
+        "description": "Downloads a single filament as a PrusaSlicer config bundle `.ini` (a one-filament bundle). Import via PrusaSlicer → File → Import → Import Config Bundle. Sets a `Content-Disposition: attachment` header with a filename derived from the filament name. Variants are resolved against their parent.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Filament name or MongoDB ObjectId" }
+        ],
+        "responses": {
+          "200": { "description": "PrusaSlicer config bundle (.ini download)", "content": { "text/plain": { "schema": { "type": "string" } } } },
+          "404": { "description": "Filament not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/filaments/{id}/bambustudio": {
+      "get": {
+        "tags": ["OrcaSlicer"],
+        "summary": "Export one filament as a Bambu Studio preset",
+        "description": "Downloads a single filament as a Bambu Studio filament-preset `.json`. Bambu Studio and OrcaSlicer share the filament-preset schema, so this reuses the OrcaSlicer generator with one Bambu-specific tweak: `from` is set to `User` so Bambu Studio files it as a user preset on import. No `inherits` base preset is set (the server can't know the user's installed system presets), so the exported preset is standalone. Variants are resolved against their parent.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "Filament name or MongoDB ObjectId" }
+        ],
+        "responses": {
+          "200": { "description": "Bambu Studio filament preset (.json download)", "content": { "application/json": { "schema": { "type": "object" } } } },
           "404": { "description": "Filament not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
