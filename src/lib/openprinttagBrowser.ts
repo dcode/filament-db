@@ -446,12 +446,44 @@ async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
 
     // tar.x is a Writable transform that auto-detects gzip; pipeline()
     // resolves once the entire tarball has been extracted to disk.
+    //
+    // GH #258: bound the extraction so a hostile/compromised tarball
+    // (tar bomb) can't fill the disk. The `filter` runs per entry with
+    // the header-declared size, so a single entry claiming a huge size
+    // — or a flood of small entries — trips the limit before the data
+    // is written. It also rejects absolute paths and `..` traversal as
+    // defence-in-depth over tar's own path sanitisation.
+    const MAX_TARBALL_EXTRACT_BYTES = 256 * 1024 * 1024;
+    const MAX_TARBALL_FILES = 50_000;
+    let extractedBytes = 0;
+    let fileCount = 0;
     await pipeline(
       // Cast: response.body is a Web ReadableStream, Readable.fromWeb wants
       // the same shape but the type lib for streams/web is a bit loose
       // across Node versions. Functionally identical.
       Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
-      tar.x({ cwd: tmpDir }),
+      tar.x({
+        cwd: tmpDir,
+        filter: (entryPath: string, entry: { size?: number }) => {
+          if (
+            entryPath.startsWith("/") ||
+            entryPath.split(/[\\/]/).includes("..")
+          ) {
+            throw new Error(`Unsafe tarball entry path: ${entryPath}`);
+          }
+          fileCount += 1;
+          extractedBytes += entry.size ?? 0;
+          if (
+            fileCount > MAX_TARBALL_FILES ||
+            extractedBytes > MAX_TARBALL_EXTRACT_BYTES
+          ) {
+            throw new Error(
+              "OpenPrintTag tarball exceeds extraction limits (possible tar bomb).",
+            );
+          }
+          return true;
+        },
+      }),
     );
 
     // The tarball extracts to a subdirectory like OpenPrintTag-openprinttag-database-<sha>/

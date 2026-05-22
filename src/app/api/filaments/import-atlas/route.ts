@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { MongoClient } from "mongodb";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
+import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
 
 // POST with { uri } — list filaments from remote Atlas
 // POST with { uri, filaments: [...ids] } — import selected filaments
@@ -17,6 +18,20 @@ export async function POST(request: NextRequest) {
 
   if (!uri || typeof uri !== "string") {
     return NextResponse.json({ error: "Connection string is required" }, { status: 400 });
+  }
+
+  // GH #254: SSRF guard — without this, a request body with
+  // `uri: "mongodb://10.0.0.5:27017"` turns the server into an
+  // internal-network port scanner. Importing from a remote Atlas
+  // legitimately uses a public `mongodb+srv://` host, so require that
+  // scheme and reject any host resolving to a private/internal address.
+  try {
+    await assertSafeMongoUri(uri, { requireSrv: true, blockPrivateHosts: true });
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : "Invalid connection string" },
+      { status: 400 },
+    );
   }
 
   const client = new MongoClient(uri, {

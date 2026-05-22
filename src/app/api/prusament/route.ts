@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { extractSpoolData } from "@/lib/prusament";
+import { readBodyCapped } from "@/lib/externalUrlGuard";
+
+/** GH #258: cap the Prusament HTML page. A real spool page is well under
+ * 1 MB; the cap stops a hostile/compromised response from buffering an
+ * unbounded body into memory before the regex/JSON.parse step. */
+const MAX_PRUSAMENT_HTML_BYTES = 4 * 1024 * 1024;
 
 /** Shape of the spoolData JSON embedded in the Prusament spool page. */
 interface PrusamentSpoolData {
@@ -102,7 +108,7 @@ export async function GET(request: NextRequest) {
           { status: 502 },
         );
       }
-      html = await res.text();
+      html = (await readBodyCapped(res, MAX_PRUSAMENT_HTML_BYTES)).toString("utf-8");
     } catch (err) {
       const msg = err instanceof Error ? err.message : "Network error";
       return NextResponse.json(
