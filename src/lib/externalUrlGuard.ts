@@ -204,9 +204,17 @@ function ssrfValidatingLookup(
  * that validated IP — so `fetch(url, { dispatcher: ssrfDispatcher })`
  * cannot be rebound onto a private address between guard and connect.
  *
- * The cast bridges a known undici quirk: at runtime the interceptor
- * invokes `lookup` with an origin OBJECT (it reads `origin.hostname`),
- * but the published `.d.ts` types the first parameter as a bare string.
+ * GH #258 (Codex P1): `maxItems` bounds the interceptor's per-hostname
+ * DNS cache. It defaults to `Infinity`, and this is a process-wide
+ * singleton fed user-controlled hosts (embed-check / TDS) — so without
+ * a cap an attacker could trigger endless distinct lookups and grow
+ * the cache until the process is OOM-killed. 256 is far above any
+ * legitimate working set; `maxTTL` (10s default) also ages entries out.
+ *
+ * The `lookup` cast bridges a known undici quirk: at runtime the
+ * interceptor invokes `lookup` with an origin OBJECT (it reads
+ * `origin.hostname`), but the published `.d.ts` types the first
+ * parameter as a bare string.
  */
 type DnsInterceptorLookup = NonNullable<
   NonNullable<Parameters<typeof interceptors.dns>[0]>["lookup"]
@@ -214,6 +222,7 @@ type DnsInterceptorLookup = NonNullable<
 export const ssrfDispatcher = new Agent().compose(
   interceptors.dns({
     lookup: ssrfValidatingLookup as unknown as DnsInterceptorLookup,
+    maxItems: 256,
   }),
 );
 
