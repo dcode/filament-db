@@ -229,6 +229,38 @@ describe("API route correctness", () => {
     expect(body.ok).toBe(true);
   });
 
+  it("#273 — spool-check excludes a retired parent spool from the fallback", async () => {
+    // Codex review: the parent-fallback must not count retired spools —
+    // a retired roll is out of service and shouldn't satisfy the check.
+    const parent = await Filament.create({
+      name: "Retired-Stock Parent",
+      vendor: "Prusa",
+      type: "PLA",
+      spoolWeight: 200,
+      density: 1.24,
+      diameter: 1.75,
+      spools: [{ label: "Old", totalWeight: 1000, retired: true }],
+    });
+    const variant = await Filament.create({
+      name: "Retired-Stock Black",
+      vendor: "Prusa",
+      type: "PLA",
+      color: "#111111",
+      parentId: parent._id,
+    });
+
+    const res = await spoolCheck(
+      getReq(`http://localhost/api/filaments/${variant._id}/spool-check?weight=100`),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The only parent spool is retired → no usable stock → "no data",
+    // not a false ok-based-on-a-retired-spool.
+    expect(body.spools).toHaveLength(0);
+    expect(body.message).toMatch(/no spool weight data/i);
+  });
+
   // ── #305: print history never debits a retired spool ───────────────
 
   it("#305 — print-history records spoolId:null rather than debiting a retired spool", async () => {

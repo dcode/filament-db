@@ -144,9 +144,14 @@ export async function GET(
 
     const requiredLengthM = weightToLengthM(requiredWeight);
 
-    // Check each spool
+    // Check each spool. Retired spools are intentionally out of service
+    // and must not satisfy the check (Codex review) — otherwise a
+    // retired spool with enough weight (the variant's own, or one
+    // borrowed from the parent via the #273 fallback) would suppress
+    // the slicer's insufficient-filament warning while active stock is
+    // empty. Retired spools drop out of spool-check per CLAUDE.md.
     const spoolResults = rawSpools
-      .filter((s) => s.totalWeight != null)
+      .filter((s) => s.totalWeight != null && !s.retired)
       .map((s) => {
         const remainingWeight = Math.max(0, (s.totalWeight as number) - spoolWeight);
         const remainingLengthM = weightToLengthM(remainingWeight);

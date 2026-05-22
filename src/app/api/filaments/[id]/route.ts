@@ -407,10 +407,15 @@ export async function POST(
         { $set: setEntry },
       );
       if (res.matchedCount === 0) {
-        // 2) No entry yet — append one, but CONDITIONALLY: the filter
-        // requires the array to still lack a matching element, so two
-        // concurrent requests can't both $push a duplicate
-        // (nozzle, printer:null) entry (Codex P1).
+        // 2) No entry yet — append one CONDITIONALLY. The filter
+        // requires the array to STILL lack a matching element. This is
+        // not a check-then-act race: MongoDB applies an updateOne to a
+        // single document atomically and serialises concurrent updates
+        // to the same _id, so of two racing requests the first $pushes
+        // and the second re-evaluates this filter against the first's
+        // committed write, no longer matches, returns matchedCount 0,
+        // and falls through to the in-place $set in step 3. At most one
+        // (nozzle, printer:null) entry is ever created (Codex P1).
         const inserted = await Filament.updateOne(
           { _id: calTarget._id, calibrations: { $not: { $elemMatch: { nozzle: nozzleId, printer: null } } } },
           { $push: { calibrations: { nozzle: nozzleId, printer: null, ...fields } } },
