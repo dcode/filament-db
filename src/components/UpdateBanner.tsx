@@ -20,6 +20,10 @@ export default function UpdateBanner() {
   const { t } = useTranslation();
   const [status, setStatus] = useState<UpdateStatus>({ state: "idle" });
   const [dismissedVersion, setDismissedVersion] = useState<string | null>(null);
+  // GH #283: the error banner has no meaningful version, so it needs its
+  // own dismissed flag — keyed on the error text so a *new*, different
+  // error still surfaces instead of staying hidden behind a stale dismiss.
+  const [dismissedError, setDismissedError] = useState<string | null>(null);
   const isElectron = typeof window !== "undefined" && !!window.electronAPI;
   // macOS Gatekeeper blocks unsigned auto-installs. Even the download path
   // currently fails ("ZIP file not provided") because we don't ship mac
@@ -44,7 +48,8 @@ export default function UpdateBanner() {
     status.state === "idle" ||
     status.state === "checking" ||
     status.state === "not-available" ||
-    (status.state === "available" && status.version === dismissedVersion);
+    (status.state === "available" && status.version === dismissedVersion) ||
+    (status.state === "error" && (status.error ?? "") === dismissedError);
   if (hidden) return null;
 
   const handleDownload = () => window.electronAPI!.updateDownload();
@@ -60,7 +65,12 @@ export default function UpdateBanner() {
       laterButton: t("update.dialog.later"),
     });
   const handleOpenPage = () => window.electronAPI!.updateOpenReleasePage();
-  const handleDismiss = () => setDismissedVersion(status.version ?? "");
+  // GH #283: dismiss the state that's actually showing. The error banner
+  // is dismissed by its message; every other banner by its version.
+  const handleDismiss = () => {
+    if (status.state === "error") setDismissedError(status.error ?? "");
+    else setDismissedVersion(status.version ?? "");
+  };
 
   let body: React.ReactNode = null;
   let tone = "bg-blue-600";

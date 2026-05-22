@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { useToast } from "@/components/Toast";
@@ -57,6 +57,17 @@ export default function SharedCatalogPage() {
   const [error, setError] = useState<string | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [importing, setImporting] = useState(false);
+  // GH #290: the import is a long serial chain of POSTs. Track the
+  // mounted state + an AbortController so a thrown network error doesn't
+  // become an unhandled rejection and setState can't fire after unmount.
+  const mountedRef = useRef(true);
+  const importAcRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+      importAcRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     const ac = new AbortController();
@@ -92,7 +103,11 @@ export default function SharedCatalogPage() {
   const handleImport = async () => {
     if (!data) return;
     if (selectedIds.size === 0) return;
+    if (importing) return;
     setImporting(true);
+    importAcRef.current?.abort();
+    const ac = new AbortController();
+    importAcRef.current = ac;
     try {
       const filtered = data.payload.filaments.filter((f) => selectedIds.has(f._id));
 
@@ -132,6 +147,7 @@ export default function SharedCatalogPage() {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ ...r, _id: undefined }),
+            signal: ac.signal,
           });
           if (res.ok) {
             const created = await res.json();
@@ -141,7 +157,7 @@ export default function SharedCatalogPage() {
           if (res.status === 409) {
             // Same-named record already exists on the destination. Look it
             // up so we can reuse its _id rather than leaving a dangling ref.
-            const listRes = await fetch(endpoint);
+            const listRes = await fetch(endpoint, { signal: ac.signal });
             if (listRes.ok) {
               const list: SharedRef[] = await listRes.json();
               const match = list.find((x) => x.name === r.name);
@@ -196,6 +212,7 @@ export default function SharedCatalogPage() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(f),
+          signal: ac.signal,
         });
         if (res.ok) {
           created++;
@@ -204,6 +221,7 @@ export default function SharedCatalogPage() {
           conflicts.push(body?.error || f.name);
         }
       }
+      if (ac.signal.aborted) return;
       toast(t("share.public.imported", { count: created }));
       if (conflicts.length > 0) {
         toast(
@@ -213,8 +231,20 @@ export default function SharedCatalogPage() {
           "error",
         );
       }
+    } catch (err) {
+      // GH #290: a thrown network error used to escape the try/finally
+      // as an unhandled rejection with no user feedback. Swallow the
+      // unmount-abort case; toast everything else.
+      if (
+        ac.signal.aborted ||
+        (err instanceof DOMException && err.name === "AbortError")
+      ) {
+        return;
+      }
+      console.error("Shared-catalog import failed:", err);
+      if (mountedRef.current) toast(t("share.public.importError"), "error");
     } finally {
-      setImporting(false);
+      if (mountedRef.current) setImporting(false);
     }
   };
 

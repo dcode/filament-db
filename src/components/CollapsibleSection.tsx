@@ -183,8 +183,18 @@ export function expandAndScrollToSection(id: string) {
       newValue: "true",
     }),
   );
-  const el = document.getElementById(id);
-  if (el) {
-    el.scrollIntoView({ behavior: "smooth", block: "start" });
-  }
+  // GH #284: the section body is conditionally rendered (`{open &&
+  // children}`), so on the tick the storage event is dispatched it has
+  // not laid out yet — scrolling now lands on the still-collapsed header
+  // and leaves the erroring field below the fold. A double rAF waits for
+  // React to commit the expanded body and the browser to lay it out, so
+  // the offending field is actually brought into view.
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      const el = document.getElementById(id);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+      }
+    });
+  });
 }

@@ -83,8 +83,13 @@ export function useUnsavedChanges(fallbackUrl: string) {
       // Link-click navigation — let the router handle it
       // (caller will do router.push)
     } else {
-      // popstate navigation — go back for real
-      window.history.go(-1);
+      // popstate navigation — go back for real. GH #285: the popstate
+      // handler re-pushed a guard entry to cancel the user's back press,
+      // so history is [...prev, formPage, guard] with `guard` current.
+      // `go(-1)` only reaches `formPage` (same URL as the guard) and
+      // strands the user on the form; `go(-2)` skips past it to the
+      // page they were actually trying to return to.
+      window.history.go(-2);
     }
   }, [pendingNav]);
 

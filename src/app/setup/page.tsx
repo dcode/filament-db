@@ -61,7 +61,14 @@ export default function SetupPage() {
         }
 
         setSuccess(t("setup.webConnectionSuccess"));
-        setTesting(false);
+        // GH #287: the web/Docker path used to stop here, stranding the
+        // user on /setup with no way forward but hand-editing the URL.
+        // Redirect home with a hard reload so the server process picks
+        // up the freshly-saved connection; the brief delay lets the
+        // success message paint first.
+        setTimeout(() => {
+          window.location.href = "/";
+        }, 800);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : t("setup.connectionFailed"));

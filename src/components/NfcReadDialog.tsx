@@ -28,6 +28,10 @@ export default function NfcReadDialog() {
   // Focus trap: focus the dialog when it appears and trap tab within it
   useEffect(() => {
     if (!visible || !dialogRef.current) return;
+    // GH #320: this dialog auto-opens on every NFC scan, so dropping
+    // focus to <body> on close is especially disruptive. Remember what
+    // had focus and restore it when the dialog closes.
+    const prevFocus = document.activeElement as HTMLElement | null;
     dialogRef.current.focus();
 
     const dialog = dialogRef.current;
@@ -52,7 +56,10 @@ export default function NfcReadDialog() {
       }
     };
     document.addEventListener("keydown", handleTab);
-    return () => document.removeEventListener("keydown", handleTab);
+    return () => {
+      document.removeEventListener("keydown", handleTab);
+      prevFocus?.focus?.();
+    };
   }, [visible]);
 
   if (!visible || !tagReadResult) return null;

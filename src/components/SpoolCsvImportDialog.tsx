@@ -37,6 +37,9 @@ export default function SpoolCsvImportDialog({ onClose, onImported }: Props) {
   >(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // GH #319: abort the in-flight import on unmount / on a new submit.
+  const acRef = useRef<AbortController | null>(null);
+  useEffect(() => () => acRef.current?.abort(), []);
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -52,16 +55,21 @@ export default function SpoolCsvImportDialog({ onClose, onImported }: Props) {
   };
 
   const handleSubmit = async () => {
-    if (!csv.trim()) return;
+    if (!csv.trim() || submitting) return;
     setSubmitting(true);
     setResults(null);
+    acRef.current?.abort();
+    const ac = new AbortController();
+    acRef.current = ac;
     try {
       const res = await fetch("/api/spools/import", {
         method: "POST",
         headers: { "Content-Type": "text/csv" },
         body: csv,
+        signal: ac.signal,
       });
       const body = await res.json().catch(() => null);
+      if (ac.signal.aborted) return;
       if (!res.ok) {
         toast(body?.error || t("spoolImport.error"), "error");
         return;
@@ -71,8 +79,12 @@ export default function SpoolCsvImportDialog({ onClose, onImported }: Props) {
         toast(t("spoolImport.success", { imported: body.imported }));
         onImported();
       }
+    } catch (err) {
+      // GH #319: a network error used to escape with no user feedback.
+      if (ac.signal.aborted || (err instanceof DOMException && err.name === "AbortError")) return;
+      toast(t("spoolImport.error"), "error");
     } finally {
-      setSubmitting(false);
+      if (!ac.signal.aborted) setSubmitting(false);
     }
   };
 

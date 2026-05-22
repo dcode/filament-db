@@ -1,6 +1,5 @@
 "use client";
 
-import { useEffect } from "react";
 import dynamic from "next/dynamic";
 import Link from "next/link";
 import "swagger-ui-react/swagger-ui.css";
@@ -11,19 +10,12 @@ const SwaggerUI = dynamic(() => import("swagger-ui-react"), { ssr: false });
 export default function ApiDocsPage() {
   const { t } = useTranslation();
 
-  // Suppress known React deprecation warnings from swagger-ui-react internals
-  useEffect(() => {
-    const origWarn = console.error;
-    console.error = (...args: unknown[]) => {
-      if (
-        typeof args[0] === "string" &&
-        (args[0].includes("UNSAFE_componentWillReceiveProps") ||
-         args[0].includes("UNSAFE_componentWillMount"))
-      ) return;
-      origWarn.apply(console, args);
-    };
-    return () => { console.error = origWarn; };
-  }, []);
+  // GH #321: this page used to monkey-patch the global `console.error`
+  // to filter swagger-ui-react's legacy UNSAFE_* lifecycle warnings.
+  // That intercepted *every* console.error app-wide while /api-docs was
+  // open — other components, error boundaries, React's overlay. The
+  // swagger-ui warnings are harmless dev-only noise from a third-party
+  // dependency; we leave them rather than distort global logging.
   return (
     <div className="min-h-screen">
       <div className="max-w-7xl mx-auto px-4 pt-6 pb-2">
