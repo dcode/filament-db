@@ -1,9 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockLookup } = vi.hoisted(() => ({ mockLookup: vi.fn() }));
+const { mockLookup, mockResolveSrv } = vi.hoisted(() => ({
+  mockLookup: vi.fn(),
+  mockResolveSrv: vi.fn(),
+}));
 
-// Stub DNS so the host-resolution path is deterministic in CI.
-vi.mock("node:dns/promises", () => ({ lookup: mockLookup }));
+// Stub DNS so host resolution + SRV lookups are deterministic in CI.
+vi.mock("node:dns/promises", () => ({
+  lookup: mockLookup,
+  resolveSrv: mockResolveSrv,
+}));
 
 import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
 
@@ -13,7 +19,10 @@ import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
  * this guard a request body can drive the server to probe internal hosts.
  */
 describe("assertSafeMongoUri", () => {
-  beforeEach(() => mockLookup.mockReset());
+  beforeEach(() => {
+    mockLookup.mockReset();
+    mockResolveSrv.mockReset();
+  });
 
   it("rejects a non-mongodb scheme", async () => {
     await expect(assertSafeMongoUri("http://evil.example/")).rejects.toThrow(/mongodb/i);
@@ -32,16 +41,6 @@ describe("assertSafeMongoUri", () => {
       assertSafeMongoUri("mongodb://10.0.0.5:27017/db", { blockPrivateHosts: true }),
     ).rejects.toThrow(/private\/internal/);
     expect(mockLookup).not.toHaveBeenCalled();
-  });
-
-  it("rejects a hostname that resolves to a private address", async () => {
-    mockLookup.mockResolvedValue([{ address: "10.1.2.3", family: 4 }]);
-    await expect(
-      assertSafeMongoUri("mongodb+srv://internal.corp/db", {
-        requireSrv: true,
-        blockPrivateHosts: true,
-      }),
-    ).rejects.toThrow(/private\/internal/);
   });
 
   it("rejects mongodb://localhost when blocking private hosts", async () => {
@@ -65,7 +64,39 @@ describe("assertSafeMongoUri", () => {
     ).rejects.toThrow(/private\/internal/);
   });
 
-  it("accepts a public mongodb+srv host (Atlas)", async () => {
+  // ── mongodb+srv: the SRV *targets* are the real connection hosts ──
+
+  it("rejects a mongodb+srv URI whose SRV target resolves to a private address", async () => {
+    // GH #332: the seed host can be public while its SRV records point
+    // at RFC1918 space — the guard must validate the SRV targets.
+    mockResolveSrv.mockResolvedValue([
+      { name: "shard0.internal.corp", port: 27017, priority: 0, weight: 0 },
+    ]);
+    mockLookup.mockResolvedValue([{ address: "10.1.2.3", family: 4 }]);
+    await expect(
+      assertSafeMongoUri("mongodb+srv://seed.example.com/db", {
+        requireSrv: true,
+        blockPrivateHosts: true,
+      }),
+    ).rejects.toThrow(/private\/internal/);
+    expect(mockResolveSrv).toHaveBeenCalledWith("_mongodb._tcp.seed.example.com");
+  });
+
+  it("rejects a mongodb+srv host with no SRV records", async () => {
+    mockResolveSrv.mockRejectedValue(new Error("ENOTFOUND"));
+    await expect(
+      assertSafeMongoUri("mongodb+srv://not-a-cluster.example.com/db", {
+        requireSrv: true,
+        blockPrivateHosts: true,
+      }),
+    ).rejects.toThrow(/SRV records/i);
+  });
+
+  it("accepts a mongodb+srv host whose SRV targets are all public (Atlas)", async () => {
+    mockResolveSrv.mockResolvedValue([
+      { name: "shard0.abcd.mongodb.net", port: 27017, priority: 0, weight: 0 },
+      { name: "shard1.abcd.mongodb.net", port: 27017, priority: 0, weight: 0 },
+    ]);
     mockLookup.mockResolvedValue([{ address: "13.37.13.37", family: 4 }]);
     await expect(
       assertSafeMongoUri(
@@ -82,5 +113,6 @@ describe("assertSafeMongoUri", () => {
       assertSafeMongoUri("mongodb://localhost:27017/db", { blockPrivateHosts: false }),
     ).resolves.toBeUndefined();
     expect(mockLookup).not.toHaveBeenCalled();
+    expect(mockResolveSrv).not.toHaveBeenCalled();
   });
 });

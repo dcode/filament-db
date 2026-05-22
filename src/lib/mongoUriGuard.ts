@@ -21,8 +21,12 @@
  *     is the job of the destructive-route access guard (GH #252).
  */
 
-import { lookup } from "node:dns/promises";
+import { lookup, resolveSrv } from "node:dns/promises";
 import { isPrivateIp } from "@/lib/externalUrlGuard";
+
+/** Message used whenever a host resolves into private/internal space. */
+const PRIVATE_HOST_ERROR =
+  "Connection string resolves to a private/internal address — only public database hosts are allowed.";
 
 export interface MongoUriGuardOptions {
   /** Require the `mongodb+srv://` scheme (reject plain `mongodb://`). */
@@ -94,16 +98,40 @@ export async function assertSafeMongoUri(
 
   if (!opts.blockPrivateHosts) return;
 
+  if (isSrv) {
+    // GH #332 (Codex P1): a `mongodb+srv://` connection does NOT connect
+    // to the seed host — the driver does a DNS SRV lookup of
+    // `_mongodb._tcp.<seed>` and connects to the hosts in those records.
+    // A seed host with a public A record but SRV targets pointing at
+    // RFC1918 space would otherwise pass the guard and still let
+    // MongoClient open internal connections. Resolve and validate the
+    // SRV TARGETS, not the seed host.
+    const seedHost = extractHost(hostSpecs[0]);
+    if (!seedHost) throw new Error("Connection string has an empty host.");
+    const srvRecords = await resolveSrv(`_mongodb._tcp.${seedHost}`).catch(
+      () => [] as { name: string }[],
+    );
+    if (srvRecords.length === 0) {
+      throw new Error(
+        `No SRV records found for ${seedHost} — not a reachable mongodb+srv host.`,
+      );
+    }
+    for (const record of srvRecords) {
+      const ips = await resolveHostIps(record.name);
+      for (const ip of ips) {
+        if (isPrivateIp(ip)) throw new Error(PRIVATE_HOST_ERROR);
+      }
+    }
+    return;
+  }
+
+  // Plain mongodb:// — the listed hosts ARE the connection targets.
   for (const spec of hostSpecs) {
     const host = extractHost(spec);
     if (!host) throw new Error("Connection string has an empty host.");
     const ips = await resolveHostIps(host);
     for (const ip of ips) {
-      if (isPrivateIp(ip)) {
-        throw new Error(
-          "Connection string points at a private/internal address — only public database hosts are allowed.",
-        );
-      }
+      if (isPrivateIp(ip)) throw new Error(PRIVATE_HOST_ERROR);
     }
   }
 }
