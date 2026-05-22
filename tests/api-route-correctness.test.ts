@@ -316,6 +316,51 @@ describe("API route correctness", () => {
     expect(freshVariant.calibrations ?? []).toHaveLength(0);
   });
 
+  it("#265 — calibration sync on a variant that OVERRIDES calibrations writes to the variant", async () => {
+    // Codex P1: a variant with its own non-empty calibrations array
+    // owns its calibrations (resolveFilament uses them, not the
+    // parent's), so the sync must land on the variant — not the parent.
+    const nozzle = await Nozzle.create({
+      name: "0.4 Brass",
+      diameter: 0.4,
+      type: "brass",
+    });
+    const parent = await Filament.create({
+      name: "PC Parent",
+      vendor: "Prusa",
+      type: "PC",
+      compatibleNozzles: [nozzle._id],
+    });
+    const variant = await Filament.create({
+      name: "PC Black",
+      vendor: "Prusa",
+      type: "PC",
+      color: "#222222",
+      parentId: parent._id,
+      // Variant overrides both arrays — it is the calibration owner.
+      compatibleNozzles: [nozzle._id],
+      calibrations: [{ nozzle: nozzle._id, extrusionMultiplier: 0.9 }],
+    });
+
+    const res = await slicerSync(
+      jsonReq(
+        `http://localhost/api/filaments/${variant._id}?nozzle_diameter=0.4`,
+        { config: { extrusion_multiplier: "1.2" } },
+      ),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+
+    // The override variant's own entry was updated...
+    const freshVariant = await Filament.findById(variant._id);
+    expect(freshVariant.calibrations).toHaveLength(1);
+    expect(freshVariant.calibrations[0].extrusionMultiplier).toBe(1.2);
+
+    // ...and the parent was left untouched.
+    const freshParent = await Filament.findById(parent._id);
+    expect(freshParent.calibrations ?? []).toHaveLength(0);
+  });
+
   // ── #266: the slicer settings-bag merge is bounded ─────────────────
 
   it("#266 — orcaslicer sync rejects an over-large settings bag with 400", async () => {

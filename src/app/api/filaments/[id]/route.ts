@@ -248,26 +248,32 @@ export async function POST(
       update.temperatures = { ...existing, ...temps };
     }
 
-    // GH #265: per-nozzle calibration sync must respect variant
-    // inheritance. A variant typically stores empty `compatibleNozzles`
-    // and `calibrations` and inherits both from its parent (see
-    // resolveFilament). Reading them straight off the variant means the
-    // nozzle match finds nothing — a silent no-op — or appends a lone
-    // calibration entry to the variant, which makes resolveFilament stop
-    // inheriting *every* parent calibration (a non-empty variant array
-    // overrides the parent's wholesale). So calibration sync for a
-    // variant targets the PARENT: per-nozzle calibration is a
-    // material+nozzle property the whole colour family shares, and the
-    // variant keeps inheriting it. Every other field in this sync still
-    // writes to the variant itself.
-    let calTarget = filament;
-    if (filament.parentId) {
-      const parent = await Filament.findOne({
-        _id: filament.parentId,
-        _deletedAt: null,
-      });
-      if (parent) calTarget = parent;
-    }
+    // GH #265 / Codex P1: per-nozzle calibration sync must respect
+    // variant inheritance — but only when the variant actually inherits.
+    // resolveFilament uses the variant's OWN `calibrations` /
+    // `compatibleNozzles` whenever those arrays are non-empty, and falls
+    // back to the parent only when they're empty. So:
+    //   - a variant that OVERRIDES calibrations owns them itself → the
+    //     sync must write to the variant (writing to the parent would
+    //     silently land the change on a document the variant ignores);
+    //   - a variant that INHERITS (empty own array) → the sync writes to
+    //     the parent, so resolveFilament keeps surfacing it and we don't
+    //     sever inheritance by appending a lone entry to the variant.
+    // The compatible-nozzle list used for the nozzle match follows the
+    // same own-if-set-else-parent rule. Every other field in this sync
+    // always writes to the filament itself.
+    const calParent = filament.parentId
+      ? await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
+      : null;
+    const ownCalibrations = (filament.calibrations as unknown[] | undefined) ?? [];
+    const ownCompatNozzles =
+      (filament.compatibleNozzles as unknown[] | undefined) ?? [];
+    // The document whose `calibrations` array is effective for this
+    // filament — and whose `compatibleNozzles` scope the nozzle match.
+    const calTarget =
+      ownCalibrations.length > 0 || !calParent ? filament : calParent;
+    const compatTarget =
+      ownCompatNozzles.length > 0 || !calParent ? filament : calParent;
     let calibrationParentUpdate: unknown[] | null = null;
 
     // Update per-nozzle calibration data when nozzle_diameter is provided.
@@ -302,10 +308,11 @@ export async function POST(
 
       if (Object.keys(calFields).length > 0) {
         // Find the nozzle by diameter (and optionally high_flow) among
-        // the calibration target's compatible nozzles (the parent for a
-        // variant — see #265 note above). The high_flow param
-        // disambiguates e.g. 0.4mm Diamondback vs 0.4mm HF.
-        const compatIds = (calTarget.compatibleNozzles || []).map((n: unknown) => String(n));
+        // the effective compatible nozzles (`compatTarget` — the
+        // variant's own list when set, else the parent's; see the #265
+        // note above). The high_flow param disambiguates e.g. 0.4mm
+        // Diamondback vs 0.4mm HF.
+        const compatIds = (compatTarget.compatibleNozzles || []).map((n: unknown) => String(n));
         if (compatIds.length > 0) {
           const highFlowParam = request.nextUrl.searchParams.get("high_flow");
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -334,9 +341,12 @@ export async function POST(
               // Create new calibration entry for this nozzle
               calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
             }
-            // GH #265: a variant's calibration write lands on the parent
-            // (calTarget), not in this variant's `update` — keeping the
-            // inheritance link intact.
+            // GH #265: write to whichever document owns this filament's
+            // effective calibrations. When `calTarget` is the filament
+            // itself (standalone, or a variant that overrides
+            // calibrations) it goes in this request's `update`; when
+            // `calTarget` is the parent (an inheriting variant) it's
+            // applied to the parent separately so inheritance is kept.
             if (String(calTarget._id) === String(filament._id)) {
               update.calibrations = calibrations;
             } else {
