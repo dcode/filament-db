@@ -41,12 +41,17 @@ const POPULATE_PATHS = [
 export async function resolveFilamentForExport(
   idOrName: string,
 ): Promise<FilamentDoc | null> {
-  const decodedName = decodeURIComponent(idOrName);
+  // `idOrName` comes straight from the Next.js App Router `params`, which
+  // is ALREADY URL-decoded. Do NOT call decodeURIComponent on it again:
+  // a valid filament name containing a literal `%` (e.g. "ABS 100%")
+  // arrives here decoded, and a second decode throws URIError on the
+  // dangling `%` — turning a valid export into a 500 (Codex P2 on
+  // PR #247).
 
   // Name lookup first (the slicer modules address filaments by name),
   // then ObjectId fallback when the param looks like one.
   let filament = (await withPopulate(
-    Filament.findOne({ name: decodedName, _deletedAt: null }),
+    Filament.findOne({ name: idOrName, _deletedAt: null }),
   ).lean()) as FilamentDoc | null;
 
   if (!filament && /^[a-f0-9]{24}$/i.test(idOrName)) {

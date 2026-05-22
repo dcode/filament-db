@@ -150,6 +150,33 @@ describe("single-filament slicer export routes", () => {
     });
   });
 
+  // ── Lookup by name with special characters ────────────────────────
+
+  it("exports a filament whose name contains a literal '%' (no double-decode)", async () => {
+    // Codex P2 on PR #247: Next.js route params are already URL-decoded,
+    // so a name like "ABS 100%" arrives decoded. A second
+    // decodeURIComponent would throw URIError on the dangling '%' and
+    // 500 the request. Look the filament up by its (already-decoded)
+    // name and confirm it exports cleanly.
+    const f = await Filament.create({
+      name: "ABS 100%",
+      vendor: "TestCo",
+      type: "ABS",
+      temperatures: { nozzle: 255, bed: 100 },
+    });
+    const res = await exportPrusa(req("ABS 100%"), {
+      params: Promise.resolve({ id: "ABS 100%" }),
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain("[filament:ABS 100%]");
+    // Sanity: the id-based lookup still works for the same filament.
+    const byId = await exportPrusa(req(String(f._id)), {
+      params: Promise.resolve({ id: String(f._id) }),
+    });
+    expect(byId.status).toBe(200);
+  });
+
   // ── Variant inheritance ───────────────────────────────────────────
 
   it("resolves variant inheritance — an exported variant carries the parent's values", async () => {
