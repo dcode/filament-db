@@ -44,21 +44,22 @@ const EXPECTED_MLEN = (DEFAULT_BLOCK_COUNT * BLOCK_SIZE) / 8;
 
 /**
  * Sanitize the raw MLEN byte read from a tag's Capability Container
- * (GH #301). MLEN is "memory length / 8". The value comes straight off
- * the tag, so a corrupt or non-standard byte must not be trusted:
+ * (GH #301). MLEN is "memory length / 8" and comes straight off the
+ * tag. Only a genuinely UNUSABLE value is rejected — zero, a
+ * non-integer, or out of byte range (block0 too short → `block0[2]`
+ * is `undefined`) — and replaced with the SLIX2 default.
  *
- *  - too small → reads/writes truncate; if `formatTag` then writes that
- *    byte back into the CC the tag is effectively bricked for the app;
- *  - too large → reads/writes run off the end of the chip.
- *
- * Accept the byte only within the plausible SLIX2-class band
- * (EXPECTED_MLEN/2 .. EXPECTED_MLEN); otherwise fall back to the
- * expected SLIX2 value.
+ * GH #322 (Codex P1): a value merely OUTSIDE the SLIX2 band is
+ * preserved. It is the real declared capacity of a non-SLIX2 NFC-V
+ * chip; clamping it would make `formatTag()` write a wrong CC and
+ * corrupt an otherwise-valid tag. The bounds that actually matter for
+ * safety are enforced at the USE sites instead — the read loops clamp
+ * the block count to DEFAULT_BLOCK_COUNT, and `writeTag()` caps its
+ * write extent at EXPECTED_MLEN — so a large MLEN can't drive reads or
+ * writes off the end of the chip.
  */
 function sanitizeMlen(rawByte: number): number {
-  return Number.isInteger(rawByte) &&
-    rawByte >= EXPECTED_MLEN / 2 &&
-    rawByte <= EXPECTED_MLEN
+  return Number.isInteger(rawByte) && rawByte > 0 && rawByte <= 255
     ? rawByte
     : EXPECTED_MLEN;
 }
@@ -448,7 +449,12 @@ export class NfcService extends EventEmitter {
     return this.withConnection(async (protocol) => {
       const block0 = await this.readBlock(protocol, 0);
       const mlen = sanitizeMlen(block0[2]);
-      const tagMemorySize = mlen * 8;
+      // GH #301/#322: cap the write extent at the SLIX2-class size the
+      // app's own payloads are built for. sanitizeMlen now preserves a
+      // larger real MLEN (so formatTag writes a correct CC), but the
+      // write loop must not run far past a normal chip when the tag
+      // reports an over-large — or corrupt-but-in-byte-range — MLEN.
+      const tagMemorySize = Math.min(mlen, EXPECTED_MLEN) * 8;
 
       const tagMemory = wrapNdefForTag(cborPayload, tagMemorySize, productUrl);
 
