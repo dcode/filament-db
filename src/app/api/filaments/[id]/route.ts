@@ -2,11 +2,29 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament, { IFilament } from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
-import "@/models/Printer";
+import Printer from "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 import { mergeSlicerSettings } from "@/lib/slicerSettings";
+import { assignSpoolToSlot } from "@/lib/spoolSlots";
+
+/**
+ * GH #261: clear every spool of a filament out of all printer AMS slots.
+ * Deleting a filament removes its spools, but `Printer.amsSlots[].spoolId`
+ * still references them — leaving printers showing a phantom spool that
+ * can never be cleared from the (now-gone) spool side. The spool DELETE
+ * handler already does this per-spool; the filament DELETE must too.
+ */
+async function clearFilamentSpoolsFromSlots(
+  spools: { _id?: unknown }[] | undefined | null,
+): Promise<void> {
+  for (const spool of spools ?? []) {
+    if (spool?._id) {
+      await assignSpoolToSlot(Printer, String(spool._id), null);
+    }
+  }
+}
 
 /**
  * GET /api/filaments/{id}
@@ -134,6 +152,13 @@ export async function PUT(
     delete body._parent;
     delete body._variants;
     delete body._inherited;
+    // GH #260: `spools` is NOT editable through the filament PUT. Spools
+    // have dedicated CRUD endpoints (POST/PUT/DELETE /spools/...) that
+    // validate via validateSpoolBody — a bulk PUT of the whole `spools`
+    // array would bypass that and let a client rewrite a spool's
+    // usageHistory ledger, inject a non-numeric totalWeight, etc. The
+    // edit form never sends `spools`; strip it as a hard guarantee.
+    delete body.spools;
 
     // Validate parentId if provided
     if (body.parentId) {
@@ -462,7 +487,7 @@ export async function DELETE(
         _deletedAt: { $ne: null },
         _purged: { $ne: true },
       })
-        .select("_id")
+        .select("_id spools")
         .lean();
       if (!trashed) {
         return errorResponse(
@@ -497,6 +522,10 @@ export async function DELETE(
         { _id: id },
         { $set: { _purged: true, _deletedAt: new Date() } },
       );
+      // GH #261: drop this filament's spools from every printer AMS slot.
+      await clearFilamentSpoolsFromSlots(
+        (trashed as { spools?: { _id?: unknown }[] }).spools,
+      );
       return NextResponse.json({ message: "Permanently deleted" });
     }
 
@@ -516,6 +545,11 @@ export async function DELETE(
     if (!filament) {
       return errorResponse("Not found", 404);
     }
+    // GH #261: drop this filament's spools from every printer AMS slot
+    // so the soft-deleted filament doesn't leave dangling slot refs.
+    await clearFilamentSpoolsFromSlots(
+      (filament as { spools?: { _id?: unknown }[] }).spools,
+    );
     return NextResponse.json({ message: "Deleted" });
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to delete filament");
