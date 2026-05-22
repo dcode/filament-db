@@ -112,9 +112,26 @@ export default function FilamentDetail() {
   const [locations, setLocations] = useState<{ _id: string; name: string; kind: string }[]>([]);
   const [printers, setPrinters] = useState<PrinterLite[]>([]);
 
+  // Slicer-export dropdown (<details>). The ref lets us close the menu
+  // after a download click and on an outside click — a bare <details>
+  // doesn't collapse on outside click on its own.
+  const slicerExportRef = useRef<HTMLDetailsElement>(null);
+
   // Clear NFC write timeout on unmount
   useEffect(() => {
     return () => { if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current); };
+  }, []);
+
+  // Collapse the slicer-export dropdown when the user clicks elsewhere.
+  useEffect(() => {
+    const onDocClick = (e: MouseEvent) => {
+      const el = slicerExportRef.current;
+      if (el && el.open && !el.contains(e.target as Node)) {
+        el.removeAttribute("open");
+      }
+    };
+    document.addEventListener("click", onDocClick);
+    return () => document.removeEventListener("click", onDocClick);
   }, []);
 
   useEffect(() => {
@@ -628,6 +645,47 @@ export default function FilamentDetail() {
             </svg>
             {t("detail.exportOpt")}
           </button>
+          {/* Export this filament as a slicer config — PrusaSlicer .ini or
+              OrcaSlicer / Bambu Studio .json. <details> is a self-contained
+              disclosure widget; the outside-click effect above handles the
+              one thing it doesn't do natively (collapse on outside click). */}
+          <details ref={slicerExportRef} className="relative inline-block">
+            <summary
+              className="px-4 py-2 bg-sky-600 text-white rounded hover:bg-sky-700 text-sm inline-flex items-center gap-1.5 cursor-pointer list-none [&::-webkit-details-marker]:hidden"
+              title={t("detail.slicerExport.title")}
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+              </svg>
+              {t("detail.slicerExport")}
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </summary>
+            <div className="absolute right-0 z-20 mt-1 w-64 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded shadow-lg py-1">
+              {([
+                ["prusaslicer", t("detail.slicerExport.prusa"), ".ini"],
+                ["orcaslicer", t("detail.slicerExport.orca"), ".json"],
+                ["bambustudio", t("detail.slicerExport.bambu"), ".json"],
+              ] as const).map(([target, label, ext]) => (
+                <button
+                  key={target}
+                  type="button"
+                  onClick={() => {
+                    const a = document.createElement("a");
+                    a.href = `/api/filaments/${filament._id}/${target}`;
+                    a.download = "";
+                    a.click();
+                    slicerExportRef.current?.removeAttribute("open");
+                  }}
+                  className="w-full text-left px-3 py-1.5 text-sm text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center justify-between gap-3"
+                >
+                  <span>{label}</span>
+                  <span className="text-xs text-gray-400 font-mono">{ext}</span>
+                </button>
+              ))}
+            </div>
+          </details>
           {!isVariant && (
             <Link
               href={`/filaments/new?cloneId=${filament._id}`}

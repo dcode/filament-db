@@ -1,6 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
+import { generateOrcaSlicerProfiles } from "@/lib/orcaSlicerBundle";
+import {
+  resolveFilamentForExport,
+  exportFilenameStem,
+} from "@/lib/singleFilamentExport";
+import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 
 /**
  * Top-level body keys that map to structured Filament DB fields.
@@ -17,6 +23,47 @@ const STRUCTURED_KEYS = new Set([
   "maxVolumetricSpeed",
   "temperatures",
 ]);
+
+/**
+ * GET /api/filaments/{id}/orcaslicer
+ *
+ * Download a single filament as an OrcaSlicer filament-preset (`.json`).
+ *
+ * Distinct from the bundle route `GET /api/filaments/orcaslicer`, which
+ * returns a JSON *array* consumed by the OrcaSlicer FilamentDB module.
+ * This route returns one preset object with a download header so the
+ * detail-page "Export" button produces a file ready for OrcaSlicer's
+ * filament-preset import. Variants are resolved against their parent.
+ */
+export async function GET(
+  _request: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    await dbConnect();
+    const { id } = await params;
+
+    const filament = await resolveFilamentForExport(id);
+    if (!filament) {
+      return errorResponse("Filament not found", 404);
+    }
+
+    // generateOrcaSlicerProfiles works on an array — take the single
+    // profile object, not the [obj] wrapper, so the file imports as one
+    // preset rather than a list.
+    const profile = generateOrcaSlicerProfiles([filament])[0];
+    const stem = exportFilenameStem(filament.name);
+
+    return new NextResponse(JSON.stringify(profile, null, 2), {
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Content-Disposition": `attachment; filename="${stem}.json"`,
+      },
+    });
+  } catch (err) {
+    return errorResponseFromCaught(err, "Failed to export filament for OrcaSlicer");
+  }
+}
 
 /**
  * POST /api/filaments/{id}/orcaslicer
