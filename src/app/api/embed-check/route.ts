@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { assertExternalUrl } from "@/lib/externalUrlGuard";
+import { assertExternalUrl, ssrfDispatcher } from "@/lib/externalUrlGuard";
 import { errorResponse, getErrorMessage } from "@/lib/apiErrorHandler";
 
 /**
@@ -58,7 +58,12 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
           Accept: "text/html,application/xhtml+xml,application/pdf,*/*",
         },
         redirect: "manual",
-      });
+        // GH #256: pin the connection to the SSRF-validated IP. The
+        // per-hop assertExternalUrl above resolves the host once; the
+        // dispatcher re-validates at connect time so a DNS rebind
+        // between the two can't land the socket on a private address.
+        dispatcher: ssrfDispatcher,
+      } as RequestInit & { dispatcher?: typeof ssrfDispatcher });
 
       // Treat 3xx (except 304) as a redirect we follow ourselves.
       const isRedirect = hopRes.status >= 300 && hopRes.status < 400 && hopRes.status !== 304;
