@@ -36,15 +36,22 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
   const acRef = useRef<AbortController | null>(null);
   useEffect(() => () => acRef.current?.abort(), []);
 
-  // Focus trap
+  // GH #320/#329: focus capture, initial focus, and restore run once —
+  // on mount and unmount only. This MUST NOT be keyed to `onClose`: that
+  // callback is created inline by parent pages, so a parent re-render
+  // changes its identity, fires this cleanup, and bounces focus out of
+  // the still-open modal. Empty deps tie restore to a real unmount.
   useEffect(() => {
-    if (!dialogRef.current) return;
-    // GH #320: remember what had focus so it can be restored on close,
-    // instead of dropping focus to the document body.
     const prevFocus = document.activeElement as HTMLElement | null;
-    dialogRef.current.focus();
+    dialogRef.current?.focus();
+    return () => prevFocus?.focus?.();
+  }, []);
 
+  // Tab trap + Escape. Re-bound when `onClose` changes — cheap, and with
+  // no focus side-effects so a parent re-render is harmless here.
+  useEffect(() => {
     const dialog = dialogRef.current;
+    if (!dialog) return;
     const handleTab = (e: KeyboardEvent) => {
       if (e.key === "Escape") { onClose(); return; }
       if (e.key !== "Tab") return;
@@ -67,10 +74,7 @@ export default function ImportAtlasDialog({ onClose, onImported }: Props) {
       }
     };
     document.addEventListener("keydown", handleTab);
-    return () => {
-      document.removeEventListener("keydown", handleTab);
-      prevFocus?.focus?.();
-    };
+    return () => document.removeEventListener("keydown", handleTab);
   }, [onClose]);
 
   // GH #320: move focus into the newly-rendered step on a wizard

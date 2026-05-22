@@ -70,13 +70,22 @@ export default function PrusamentImportDialog({
   const acRef = useRef<AbortController | null>(null);
   useEffect(() => () => acRef.current?.abort(), []);
 
-  // Focus trap & escape
+  // GH #320/#329: focus capture, initial focus, and restore run once —
+  // on mount and unmount only. Keying this to `onClose` (an inline
+  // parent callback) made the cleanup fire on every parent re-render,
+  // bouncing focus out of the still-open modal. Empty deps tie restore
+  // to a real unmount.
   useEffect(() => {
-    if (!dialogRef.current) return;
-    // GH #320: remember + restore focus so it isn't dropped to <body>.
     const prevFocus = document.activeElement as HTMLElement | null;
-    dialogRef.current.focus();
+    dialogRef.current?.focus();
+    return () => prevFocus?.focus?.();
+  }, []);
+
+  // Tab trap + Escape. Re-bound when `onClose` changes — no focus
+  // side-effects, so a parent re-render is harmless here.
+  useEffect(() => {
     const dialog = dialogRef.current;
+    if (!dialog) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
       if (e.key !== "Tab") return;
@@ -100,10 +109,7 @@ export default function PrusamentImportDialog({
       }
     };
     document.addEventListener("keydown", handleKey);
-    return () => {
-      document.removeEventListener("keydown", handleKey);
-      prevFocus?.focus?.();
-    };
+    return () => document.removeEventListener("keydown", handleKey);
   }, [onClose]);
 
   // GH #320: move focus into the newly-rendered step on a wizard
