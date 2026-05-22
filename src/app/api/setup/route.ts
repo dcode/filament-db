@@ -1,8 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { MongoClient } from "mongodb";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
 
 export async function POST(request: NextRequest) {
+  // GH #252: this route makes the server open an outbound MongoDB
+  // connection to a caller-supplied host — reject cross-origin (CSRF)
+  // callers so a hostile page can't drive it.
+  const guard = assertSameOriginRequest(request);
+  if (guard) return guard;
+
   let body;
   try {
     body = await request.json();
