@@ -80,9 +80,9 @@ describe("parseCsv", () => {
   });
 
   // GH #294: pin the exact row-limit boundary so an off-by-one or a
-  // 2x-too-large cap on the CSV DoS guard would fail a test. The guard
-  // caps the *total* parsed-row count (header inclusive) and throws on
-  // the first row past the cap.
+  // 2x-too-large cap on the CSV DoS guard would fail a test. Per the
+  // CsvParseOptions contract, `maxRows` caps emitted DATA rows — the
+  // header row is NOT counted toward it.
   describe("maxRows row-limit guard", () => {
     const rows = (n: number) =>
       Array.from({ length: n }, (_, i) => `r${i}`).join("\n");
@@ -96,12 +96,14 @@ describe("parseCsv", () => {
       );
     });
 
-    it("counts the header row toward maxRows (header: true)", () => {
-      // header + 3 data = 4 total rows == maxRows → accepted.
-      expect(parseCsv("h\nd1\nd2\nd3", { header: true, maxRows: 4 })).toHaveLength(3);
-      // header + 4 data = 5 total rows > maxRows → rejected.
-      expect(() =>
+    it("excludes the header row from the maxRows data-row cap (header: true)", () => {
+      // header + 4 data == 4 data rows == maxRows → accepted.
+      expect(
         parseCsv("h\nd1\nd2\nd3\nd4", { header: true, maxRows: 4 }),
+      ).toHaveLength(4);
+      // header + 5 data == 5 data rows > maxRows → rejected.
+      expect(() =>
+        parseCsv("h\nd1\nd2\nd3\nd4\nd5", { header: true, maxRows: 4 }),
       ).toThrow(CsvRowLimitExceededError);
     });
 

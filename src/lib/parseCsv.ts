@@ -41,6 +41,12 @@ export function parseCsv(
   opts: CsvParseOptions = { header: true },
 ): Array<Record<string, string>> | string[][] {
   const maxRows = opts.maxRows ?? 10_000;
+  // `maxRows` caps emitted DATA rows (per CsvParseOptions). The guard
+  // below runs mid-parse against the raw row count, which in header mode
+  // includes the not-yet-stripped header row — so allow one extra raw
+  // row there. Without this the header silently counted toward the cap,
+  // turning `maxRows: N` into an `N-1` data-row ceiling in header mode.
+  const rawRowCap = opts.header ? maxRows + 1 : maxRows;
   const rows: string[][] = [];
   let row: string[] = [];
   let field = "";
@@ -87,7 +93,7 @@ export function parseCsv(
       row = [];
       i++;
       if (input[i] === "\n") i++;
-      if (rows.length > maxRows) throw new CsvRowLimitExceededError(maxRows);
+      if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
       continue;
     }
     if (ch === "\n") {
@@ -96,7 +102,7 @@ export function parseCsv(
       field = "";
       row = [];
       i++;
-      if (rows.length > maxRows) throw new CsvRowLimitExceededError(maxRows);
+      if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
       continue;
     }
     field += ch;
@@ -107,7 +113,7 @@ export function parseCsv(
   if (field.length > 0 || row.length > 0) {
     row.push(field);
     rows.push(row);
-    if (rows.length > maxRows) throw new CsvRowLimitExceededError(maxRows);
+    if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
   }
 
   // Strip outer whitespace from unquoted strings — we keep quoted values
