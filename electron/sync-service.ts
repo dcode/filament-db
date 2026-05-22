@@ -895,7 +895,11 @@ export class SyncService extends EventEmitter {
    * as "epoch", not NaN.
    */
   private static readTimestamp(value: unknown): number | undefined {
-    if (!value) return undefined;
+    // GH #317 (Codex review): only `null`/`undefined` counts as
+    // "missing". A `!value` check also swallowed a numeric `0` — a
+    // legitimate epoch timestamp — making an `updatedAt: 0` row look
+    // untimed and altering conflict resolution.
+    if (value == null) return undefined;
     if (value instanceof Date) {
       const t = value.getTime();
       return Number.isNaN(t) ? undefined : t;
