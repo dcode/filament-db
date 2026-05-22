@@ -1,0 +1,90 @@
+import type { IpcMainInvokeEvent } from "electron";
+
+/**
+ * Shared IPC hardening helpers (GH #299, #300).
+ *
+ * Privileged ipcMain.handle handlers — save-config, reset-config,
+ * test-connection, nfc-write-tag, nfc-format-tag, update-install — can
+ * rewrite the Mongo connection string, erase NFC tags, or restart the
+ * app. Without a sender check, any frame loaded in the renderer
+ * (including a sub-frame such as an embedded TDS document, or an XSS
+ * payload in a user-supplied filament field) could invoke them.
+ */
+
+/** The renderer is always served from the embedded Next.js server on
+ * this port (see getAppURL in main.ts), in both dev and production. */
+const PORT = parseInt(process.env.PORT || "3456", 10);
+const APP_ORIGIN = `http://localhost:${PORT}`;
+
+/**
+ * Reject an IPC invocation that doesn't originate from the app's own
+ * top-level frame at the expected origin. Throws — the thrown error
+ * propagates back to the renderer as a rejected `invoke` promise.
+ */
+export function assertTrustedSender(
+  event: IpcMainInvokeEvent,
+  channel: string,
+): void {
+  const frame = event.senderFrame;
+  if (!frame) {
+    throw new Error(`IPC "${channel}" rejected: no sender frame`);
+  }
+  // A sub-frame (embedded document, iframe) has a non-null parent.
+  // Privileged handlers may only be reached from the top-level frame.
+  if (frame.parent !== null) {
+    throw new Error(`IPC "${channel}" rejected: sender is a sub-frame`);
+  }
+  let origin: string;
+  try {
+    origin = new URL(frame.url).origin;
+  } catch {
+    throw new Error(`IPC "${channel}" rejected: unparseable sender URL`);
+  }
+  if (origin !== APP_ORIGIN) {
+    throw new Error(`IPC "${channel}" rejected: untrusted origin "${origin}"`);
+  }
+}
+
+/**
+ * MongoDB connection-string options that can reference a local
+ * filesystem path. A renderer-supplied URI must not set these — they
+ * would let a compromised page read arbitrary local files through the
+ * TLS handshake (GH #300). Compared case-insensitively.
+ */
+const FILESYSTEM_URI_OPTIONS = [
+  "tlscafile",
+  "tlscertificatekeyfile",
+  "tlscrlfile",
+  "sslca",
+  "sslcert",
+  "sslkey",
+];
+
+/**
+ * Validate a renderer-supplied MongoDB connection string. Returns null
+ * when the URI is safe to use, or a human-readable rejection reason.
+ *
+ * Guards against:
+ *  - non-mongodb schemes (an SSRF pivot, or file:/http: probes)
+ *  - TLS options that point at local files (arbitrary file read)
+ *
+ * The scheme check is a regex rather than `new URL()` because a valid
+ * multi-host mongodb URI (`mongodb://h1,h2,h3/db`) doesn't always
+ * round-trip through the WHATWG URL parser.
+ */
+export function validateMongoUri(uri: unknown): string | null {
+  if (typeof uri !== "string" || uri.trim() === "") {
+    return "MongoDB URI must be a non-empty string";
+  }
+  const trimmed = uri.trim();
+  if (!/^mongodb(\+srv)?:\/\//i.test(trimmed)) {
+    return "MongoDB URI must start with mongodb:// or mongodb+srv://";
+  }
+  const lower = trimmed.toLowerCase();
+  for (const opt of FILESYSTEM_URI_OPTIONS) {
+    if (lower.includes(`${opt}=`)) {
+      return `MongoDB URI option "${opt}" is not allowed — it can reference a local file`;
+    }
+  }
+  return null;
+}

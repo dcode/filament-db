@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { autoUpdater } from "electron-updater";
+import { assertTrustedSender } from "./ipc-security";
 
 /**
  * Thin wrapper around electron-updater that ships silently while the app is
@@ -101,13 +102,16 @@ export function initAutoUpdater(win: BrowserWindow) {
     }
   });
 
-  ipcMain.handle("update-install", async (_evt, strings?: {
+  ipcMain.handle("update-install", async (evt, strings?: {
     title?: string;
     message?: string;
     detail?: string;
     installButton?: string;
     laterButton?: string;
   }) => {
+    // GH #299: update-install restarts the app — only the app's own
+    // top-level frame may invoke it.
+    assertTrustedSender(evt, "update-install");
     if (!app.isPackaged) return { ok: false, error: "dev-mode" };
     if (currentState.state !== "ready") {
       return { ok: false, error: "No update ready to install" };
