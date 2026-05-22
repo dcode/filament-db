@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
+import { errorResponseFromCaught } from "@/lib/apiErrorHandler";
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -36,7 +37,9 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(parents);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return NextResponse.json({ error: "Failed to fetch parents", detail: message }, { status: 500 });
+    // GH #267: a non-ObjectId `exclude` makes Mongoose throw a CastError
+    // when casting `{ _id: { $ne: exclude } }`. errorResponseFromCaught
+    // maps CastError → 400 (bad client input) instead of a generic 500.
+    return errorResponseFromCaught(err, "Failed to fetch parents");
   }
 }

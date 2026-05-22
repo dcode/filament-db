@@ -32,10 +32,21 @@ function pickFilament(value: unknown): ScanEventFilament | null {
   };
 }
 
+/**
+ * GH #271: cap the candidates array. The published event is retained in
+ * `scanBus` as the "last scan" and replayed to every new SSE subscriber,
+ * so an unauthenticated POST with a multi-megabyte `candidates` array
+ * would otherwise be held in memory indefinitely and fanned out to every
+ * connection. A real tag match produces a handful of candidates; 25 is a
+ * generous bound.
+ */
+const MAX_CANDIDATES = 25;
+
 function pickCandidates(value: unknown): ScanEventFilament[] {
   if (!Array.isArray(value)) return [];
   const out: ScanEventFilament[] = [];
   for (const entry of value) {
+    if (out.length >= MAX_CANDIDATES) break;
     const f = pickFilament(entry);
     if (f) out.push(f);
   }

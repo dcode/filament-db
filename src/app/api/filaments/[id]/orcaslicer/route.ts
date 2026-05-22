@@ -7,6 +7,7 @@ import {
   exportFilenameStem,
 } from "@/lib/singleFilamentExport";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { mergeSlicerSettings } from "@/lib/slicerSettings";
 
 /**
  * Top-level body keys that map to structured Filament DB fields.
@@ -134,17 +135,20 @@ export async function POST(
       }
     }
 
-    // Merge any unknown top-level keys into the settings passthrough bag
-    const settings = (filament.settings as Record<string, unknown>) || {};
-    const settingsAdded: string[] = [];
-    for (const [key, value] of Object.entries(body)) {
-      if (!STRUCTURED_KEYS.has(key)) {
-        settings[key] = value as string | string[] | null;
-        settingsAdded.push(key);
-      }
+    // Merge any unknown top-level keys into the settings passthrough bag.
+    // GH #266: bounded merge — caps key count and per-value size so a
+    // sync write can't bloat the embedded `settings` field unboundedly.
+    const merge = mergeSlicerSettings(
+      (filament.settings as Record<string, unknown>) || {},
+      body,
+      STRUCTURED_KEYS,
+    );
+    if (merge.error) {
+      return errorResponse(merge.error, 400);
     }
+    const settingsAdded = merge.added;
     if (settingsAdded.length > 0) {
-      update.settings = settings;
+      update.settings = merge.settings;
     }
 
     await Filament.updateOne({ _id: filament._id }, { $set: update });

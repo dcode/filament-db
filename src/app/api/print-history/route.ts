@@ -111,6 +111,14 @@ export async function POST(request: NextRequest) {
     ? body.source
     : "manual";
   const startedAt = body.startedAt ? new Date(body.startedAt) : new Date();
+  // GH #306: `new Date("garbage")` is an Invalid Date, not an error. Left
+  // unvalidated it gets persisted into the PrintHistory doc and every
+  // spool `usageHistory[].date`, then later 500s the analytics endpoint
+  // (`.toISOString()` → RangeError) and breaks the DELETE refund's
+  // date-match logic (`.getTime()` → NaN).
+  if (Number.isNaN(startedAt.getTime())) {
+    return errorResponse("startedAt is not a valid date", 400);
+  }
   const notes = typeof body.notes === "string" ? body.notes.slice(0, 2000) : "";
   const printerId =
     typeof body.printerId === "string" && mongoose.Types.ObjectId.isValid(body.printerId)
@@ -202,16 +210,22 @@ export async function POST(request: NextRequest) {
     for (const u of usage) {
       const filament = byId.get(u.filamentId)!;
 
-      // Pick the target spool: explicit spoolId, else first non-retired spool
-      // with non-null totalWeight, else the first non-retired spool.
-      let spool = u.spoolId
+      // Pick the target spool: explicit spoolId, else first non-retired
+      // spool with non-null totalWeight, else any non-retired spool.
+      //
+      // GH #305: there is deliberately no fall-through to `spools[0]`.
+      // When every spool is retired, `spool` stays undefined and the
+      // `else` branch below records the usage with `spoolId: null` — a
+      // print job must not silently debit a retired spool, which would
+      // corrupt the retired spool's preserved history and under-count
+      // active inventory. An explicit `u.spoolId` is honoured even when
+      // retired (the caller named it on purpose; pass 1 already
+      // confirmed it exists).
+      const spool = u.spoolId
         ? filament.spools.find((s) => String(s._id) === u.spoolId)
         : filament.spools.find(
             (s) => !s.retired && s.totalWeight !== null && s.totalWeight > 0,
           ) ?? filament.spools.find((s) => !s.retired);
-      if (!spool && filament.spools.length > 0) {
-        spool = filament.spools[0];
-      }
 
       if (spool) {
         if (typeof spool.totalWeight === "number") {

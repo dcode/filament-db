@@ -17,26 +17,27 @@ export async function GET(
     await dbConnect();
     const { slug } = await params;
 
-    // Atomic find-and-increment. Using read-modify-write here (findOne +
-    // save) races under concurrent viewers: each reader sees the same count
-    // and increments it by one, so simultaneous hits silently drop updates.
-    // findOneAndUpdate with $inc is one round-trip and collision-safe.
+    // GH #272: look the catalog up first, then increment viewCount only
+    // for a valid, non-expired hit. The pre-fix handler `$inc`'d on every
+    // GET *before* the expiry check, so expired catalogs kept accruing
+    // views and any caller could inflate the count by hammering the slug.
     // Filter on _deletedAt: null so an unpublished (soft-deleted) slug
     // returns 404 rather than 200.
-    const catalog = await SharedCatalog.findOneAndUpdate(
-      { slug, _deletedAt: null },
-      { $inc: { viewCount: 1 } },
-      { returnDocument: "after" },
-    );
+    const catalog = await SharedCatalog.findOne({ slug, _deletedAt: null });
     if (!catalog) {
       return errorResponse("Shared catalog not found", 404);
     }
     if (catalog.expiresAt && catalog.expiresAt < new Date()) {
-      // We've already incremented the view count on an expired catalog;
-      // that's acceptable — analytics on unpublished shares is harmless
-      // and the alternative is a second round-trip to re-check expiry.
       return errorResponse("Shared catalog has expired", 410);
     }
+
+    // Targeted `$inc` — atomic and collision-safe under concurrent
+    // viewers, so simultaneous hits don't drop updates the way a
+    // read-modify-write (findOne + save) would.
+    await SharedCatalog.updateOne(
+      { _id: catalog._id },
+      { $inc: { viewCount: 1 } },
+    );
 
     return NextResponse.json({
       slug: catalog.slug,
@@ -44,7 +45,7 @@ export async function GET(
       description: catalog.description,
       createdAt: catalog.createdAt,
       expiresAt: catalog.expiresAt,
-      viewCount: catalog.viewCount,
+      viewCount: (catalog.viewCount ?? 0) + 1,
       payload: catalog.payload,
     });
   } catch (err) {

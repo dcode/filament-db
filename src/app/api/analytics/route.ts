@@ -105,7 +105,13 @@ export async function GET(request: NextRequest) {
     }
 
     for (const entry of history) {
-      const dayKey = new Date(entry.startedAt).toISOString().slice(0, 10);
+      // GH #269: a malformed `startedAt` already in the DB (bad import,
+      // snapshot restore, or the historical print-history bug) is an
+      // Invalid Date — `.toISOString()` on it throws RangeError and 500s
+      // the whole endpoint. Skip the offending row instead.
+      const entryDate = new Date(entry.startedAt);
+      if (Number.isNaN(entryDate.getTime())) continue;
+      const dayKey = entryDate.toISOString().slice(0, 10);
       byDay.set(dayKey, (byDay.get(dayKey) ?? 0) + sumGrams(entry.usage));
       const printerId =
         entry.printerId && typeof entry.printerId === "object"
@@ -154,6 +160,10 @@ export async function GET(request: NextRequest) {
       for (const s of f.spools || []) {
         for (const u of s.usageHistory || []) {
           const uDate = new Date(u.date as unknown as string | Date);
+          // GH #269: skip a malformed usageHistory date — `NaN < since`
+          // is false, so without this check the entry slips through to
+          // `uDate.toISOString()` below and throws RangeError.
+          if (Number.isNaN(uDate.getTime())) continue;
           if (uDate < since) continue;
           // Only "manual" means "logged directly on the spool UI without a
           // PrintHistory record". "job" and "slicer" entries are owned by a

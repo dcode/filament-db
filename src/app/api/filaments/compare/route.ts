@@ -5,7 +5,7 @@ import "@/models/Nozzle";
 import "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament } from "@/lib/resolveFilament";
-import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
 
 /**
  * GET /api/filaments/compare?ids=a,b,c — fetch multiple filaments for the
@@ -82,6 +82,9 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json(ordered);
   } catch (err) {
-    return errorResponse("Failed to fetch filaments for comparison", 500, getErrorMessage(err));
+    // GH #267: a malformed id in `ids` makes Mongoose throw a CastError
+    // when casting `{ _id: { $in: ids } }`. errorResponseFromCaught maps
+    // CastError → 400 instead of a generic 500.
+    return errorResponseFromCaught(err, "Failed to fetch filaments for comparison");
   }
 }

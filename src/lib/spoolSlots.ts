@@ -65,7 +65,12 @@ export async function findSpoolSlot(
 
   const target = String(spoolId);
   for (const printer of printers) {
-    for (const slot of printer.amsSlots) {
+    // GH #277: guard the legacy missing-amsSlots array. The query filter
+    // (`amsSlots.spoolId`) keeps this safe today, but every other
+    // iteration site in this module guards with `|| []` — match the
+    // convention so a refactor of the filter or a `amsSlots: null` doc
+    // can't surface a TypeError here.
+    for (const slot of printer.amsSlots || []) {
       if (slot.spoolId && String(slot.spoolId) === target) {
         return {
           printerId: String(printer._id),

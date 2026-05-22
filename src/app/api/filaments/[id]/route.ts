@@ -6,6 +6,7 @@ import "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { mergeSlicerSettings } from "@/lib/slicerSettings";
 
 /**
  * GET /api/filaments/{id}
@@ -247,6 +248,28 @@ export async function POST(
       update.temperatures = { ...existing, ...temps };
     }
 
+    // GH #265: per-nozzle calibration sync must respect variant
+    // inheritance. A variant typically stores empty `compatibleNozzles`
+    // and `calibrations` and inherits both from its parent (see
+    // resolveFilament). Reading them straight off the variant means the
+    // nozzle match finds nothing — a silent no-op — or appends a lone
+    // calibration entry to the variant, which makes resolveFilament stop
+    // inheriting *every* parent calibration (a non-empty variant array
+    // overrides the parent's wholesale). So calibration sync for a
+    // variant targets the PARENT: per-nozzle calibration is a
+    // material+nozzle property the whole colour family shares, and the
+    // variant keeps inheriting it. Every other field in this sync still
+    // writes to the variant itself.
+    let calTarget = filament;
+    if (filament.parentId) {
+      const parent = await Filament.findOne({
+        _id: filament.parentId,
+        _deletedAt: null,
+      });
+      if (parent) calTarget = parent;
+    }
+    let calibrationParentUpdate: unknown[] | null = null;
+
     // Update per-nozzle calibration data when nozzle_diameter is provided.
     // PrusaSlicer passes ?nozzle_diameter=0.4&high_flow=0|1 so the API
     // knows which calibration entry to update with EM, PA, retraction, etc.
@@ -279,9 +302,10 @@ export async function POST(
 
       if (Object.keys(calFields).length > 0) {
         // Find the nozzle by diameter (and optionally high_flow) among
-        // this filament's compatible nozzles. The high_flow param
+        // the calibration target's compatible nozzles (the parent for a
+        // variant — see #265 note above). The high_flow param
         // disambiguates e.g. 0.4mm Diamondback vs 0.4mm HF.
-        const compatIds = (filament.compatibleNozzles || []).map((n: unknown) => String(n));
+        const compatIds = (calTarget.compatibleNozzles || []).map((n: unknown) => String(n));
         if (compatIds.length > 0) {
           const highFlowParam = request.nextUrl.searchParams.get("high_flow");
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -299,7 +323,7 @@ export async function POST(
           if (matchingNozzle) {
             const nozzleId = String(matchingNozzle._id);
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const calibrations = [...((filament.calibrations as any[]) || [])];
+            const calibrations = [...((calTarget.calibrations as any[]) || [])];
             const idx = calibrations.findIndex(
               (cal) => String(cal.nozzle) === nozzleId && !cal.printer,
             );
@@ -310,13 +334,22 @@ export async function POST(
               // Create new calibration entry for this nozzle
               calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
             }
-            update.calibrations = calibrations;
+            // GH #265: a variant's calibration write lands on the parent
+            // (calTarget), not in this variant's `update` — keeping the
+            // inheritance link intact.
+            if (String(calTarget._id) === String(filament._id)) {
+              update.calibrations = calibrations;
+            } else {
+              calibrationParentUpdate = calibrations;
+            }
           }
         }
       }
     }
 
-    // Everything else goes into the settings bag
+    // Everything else goes into the settings bag. GH #266: bounded
+    // merge — caps the key count and per-value size so a sync write
+    // can't bloat the embedded `settings` field unboundedly.
     const STRUCTURED_KEYS = new Set([
       "filament_type", "filament_vendor", "filament_colour", "filament_diameter",
       "filament_density", "filament_cost", "filament_spool_weight",
@@ -325,15 +358,25 @@ export async function POST(
       "filament_shrinkage_compensation_xy", "filament_shrinkage_compensation_z",
       "filament_soluble", "filament_abrasive", "filament_settings_id",
     ]);
-    const settings = (filament.settings as Record<string, unknown>) || {};
-    for (const [key, value] of Object.entries(config)) {
-      if (!STRUCTURED_KEYS.has(key)) {
-        settings[key] = value;
-      }
+    const merge = mergeSlicerSettings(
+      (filament.settings as Record<string, unknown>) || {},
+      config,
+      STRUCTURED_KEYS,
+    );
+    if (merge.error) {
+      return errorResponse(merge.error, 400);
     }
-    update.settings = settings;
+    update.settings = merge.settings;
 
     await Filament.findByIdAndUpdate(filament._id, { $set: update });
+
+    // GH #265: persist a variant's calibration change on its parent so
+    // the variant keeps inheriting it (see the note above).
+    if (calibrationParentUpdate) {
+      await Filament.findByIdAndUpdate(calTarget._id, {
+        $set: { calibrations: calibrationParentUpdate },
+      });
+    }
 
     return NextResponse.json({
       message: `Synced ${Object.keys(config).length} settings for "${decodedName}"`,
