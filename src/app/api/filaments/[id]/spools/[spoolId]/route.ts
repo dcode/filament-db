@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
+import Printer from "@/models/Printer";
 import { validateSpoolBody } from "@/lib/validateSpoolBody";
+import { assignSpoolToSlot } from "@/lib/spoolSlots";
 
 export async function PUT(
   request: NextRequest,
@@ -82,6 +84,10 @@ export async function DELETE(
         { status: 404 },
       );
     }
+
+    // GH #242 — a deleted spool must not linger in a printer AMS slot.
+    await assignSpoolToSlot(Printer, spoolId, null);
+
     return NextResponse.json(filament);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

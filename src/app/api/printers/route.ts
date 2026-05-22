@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Printer from "@/models/Printer";
 import { findNozzleConflicts } from "@/lib/nozzleConflicts";
+import { clearSpoolsFromOtherPrinters } from "@/lib/spoolSlots";
 import Nozzle from "@/models/Nozzle";
 import { getErrorMessage, errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
@@ -83,6 +84,16 @@ export async function POST(request: NextRequest) {
     }
 
     const printer = await Printer.create(body);
+
+    // GH #242 — see printers/[id] PUT. Clear any spools this new printer
+    // claims out of every other printer's slots.
+    const claimedSpoolIds = printer.amsSlots
+      .map((s) => s.spoolId)
+      .filter((x): x is NonNullable<typeof x> => x != null);
+    if (claimedSpoolIds.length > 0) {
+      await clearSpoolsFromOtherPrinters(Printer, claimedSpoolIds, String(printer._id));
+    }
+
     return NextResponse.json(printer, { status: 201 });
   } catch (err: unknown) {
     const dupResponse = handleDuplicateKeyError(err, "printer");
