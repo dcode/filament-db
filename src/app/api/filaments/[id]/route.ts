@@ -511,6 +511,16 @@ export async function DELETE(
           400,
         );
       }
+      // GH #261/#333: drop this filament's spools from every printer AMS
+      // slot BEFORE the purge write. `_purged` is a one-way tombstone — if
+      // slot cleanup ran afterwards and failed, the precondition above
+      // (`_purged: { $ne: true }`) would reject every retry, leaving the
+      // dangling slot refs uncleanable forever. Clearing first keeps the
+      // operation retryable: a failure here leaves the filament in the
+      // trash, exactly the state the retry expects.
+      await clearFilamentSpoolsFromSlots(
+        (trashed as { spools?: { _id?: unknown }[] }).spools,
+      );
       // Don't physically `deleteOne` here. The hybrid sync engine pairs
       // docs across peers by syncId and treats "missing on one side" as a
       // fresh insert from the other side — so a hard delete on one peer
@@ -521,10 +531,6 @@ export async function DELETE(
       await Filament.updateOne(
         { _id: id },
         { $set: { _purged: true, _deletedAt: new Date() } },
-      );
-      // GH #261: drop this filament's spools from every printer AMS slot.
-      await clearFilamentSpoolsFromSlots(
-        (trashed as { spools?: { _id?: unknown }[] }).spools,
       );
       return NextResponse.json({ message: "Permanently deleted" });
     }
@@ -537,18 +543,23 @@ export async function DELETE(
       );
     }
 
-    const filament = await Filament.findOneAndUpdate(
-      { _id: id, _deletedAt: null },
-      { _deletedAt: new Date() },
-      { returnDocument: "after" }
-    ).lean();
+    const filament = await Filament.findOne({ _id: id, _deletedAt: null })
+      .select("_id spools")
+      .lean();
     if (!filament) {
       return errorResponse("Not found", 404);
     }
-    // GH #261: drop this filament's spools from every printer AMS slot
-    // so the soft-deleted filament doesn't leave dangling slot refs.
+    // GH #261/#333: drop this filament's spools from every printer AMS slot
+    // BEFORE the soft-delete write. If slot cleanup fails the filament is
+    // still active and the whole DELETE is retryable; clearing afterwards
+    // would 404 the retry (`_deletedAt: null` no longer matches) and leave
+    // dangling slot refs behind.
     await clearFilamentSpoolsFromSlots(
       (filament as { spools?: { _id?: unknown }[] }).spools,
+    );
+    await Filament.updateOne(
+      { _id: id, _deletedAt: null },
+      { _deletedAt: new Date() },
     );
     return NextResponse.json({ message: "Deleted" });
   } catch (err) {
