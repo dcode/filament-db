@@ -3,6 +3,7 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef, useSyncExternalStore } from "react";
 import Link from "next/link";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import ImportAtlasDialog from "@/components/ImportAtlasDialog";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import SpoolCsvImportDialog from "@/components/SpoolCsvImportDialog";
@@ -178,6 +179,7 @@ export default function Home() {
   const stickyHeaderRef = useRef<HTMLDivElement>(null);
   const [stickyHeaderHeight, setStickyHeaderHeight] = useState(0);
   const { toast } = useToast();
+  const confirm = useConfirm();
 
   const fetchFilamentsRef = useRef<AbortController | null>(null);
   // GH #292: dedicated controller for the post-import filter-options
@@ -416,7 +418,7 @@ export default function Home() {
 
   const handleBulkDelete = async () => {
     const count = selected.size;
-    if (!confirm(t("filaments.deleteConfirm", { count }))) return;
+    if (!(await confirm({ message: t("filaments.deleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") }))) return;
     setBulkDeleting(true);
     let deleted = 0;
     const errors: string[] = [];

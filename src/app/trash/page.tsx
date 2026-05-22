@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
 interface TrashedFilament {
@@ -19,6 +20,7 @@ interface TrashedFilament {
 export default function TrashPage() {
   const { t } = useTranslation();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const [items, setItems] = useState<TrashedFilament[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState<Set<string>>(new Set());
@@ -79,7 +81,7 @@ export default function TrashPage() {
   };
 
   const handlePermanentDelete = async (item: TrashedFilament) => {
-    if (!confirm(t("trash.permanentConfirm", { name: item.name }))) return;
+    if (!(await confirm({ message: t("trash.permanentConfirm", { name: item.name }), destructive: true, confirmLabel: t("common.delete") }))) return;
     markBusy(item._id, true);
     try {
       const res = await fetch(`/api/filaments/${item._id}?permanent=true`, {
@@ -99,7 +101,7 @@ export default function TrashPage() {
 
   const handleEmptyTrash = async () => {
     if (items.length === 0) return;
-    if (!confirm(t("trash.emptyConfirm", { count: items.length }))) return;
+    if (!(await confirm({ message: t("trash.emptyConfirm", { count: items.length }), destructive: true, confirmLabel: t("common.delete") }))) return;
     let ok = 0;
     const errors: string[] = [];
     // Permanent delete each one sequentially. Variants must be purged before

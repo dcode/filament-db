@@ -208,6 +208,8 @@
   "share.existingShares": "Deine geteilten Kataloge",
   "share.noShares": "Du hast noch keine Kataloge veröffentlicht.",
   "share.viewCount": "{count} Aufrufe",
+  "share.openLink": "Öffnen",
+  "detail.spool.labelSave": "Label speichern",
   "share.unpublish": "Zurücknehmen",
   "share.unpublished": "Zurückgenommen",
   "share.unpublishConfirm": "Diesen geteilten Katalog zurücknehmen? Der Link funktioniert danach nicht mehr.",
@@ -663,6 +665,8 @@
   "error.failedToLoadSettings": "Einstellungen konnten nicht geladen werden",
 
   "common.save": "Speichern",
+  "common.delete": "Löschen",
+  "common.restore": "Wiederherstellen",
 
   "detail.back": "Zurück zur Liste",
   "detail.backToFilaments": "Zurück zu Filamenten",

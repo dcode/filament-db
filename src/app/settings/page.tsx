@@ -5,6 +5,7 @@ import { useRef, useState, useEffect } from "react";
 import { CURRENCIES, useCurrency } from "@/hooks/useCurrency";
 import type { ValidationError } from "@/lib/customCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { LOCALES } from "@/i18n";
 import { useTheme, type ThemePreference } from "@/components/ThemeProvider";
 import { useIsElectron } from "@/hooks/useIsElectron";
@@ -12,6 +13,7 @@ import { useNfcContext } from "@/components/NfcProvider";
 
 export default function SettingsPage() {
   const { t, locale, setLocale } = useTranslation();
+  const confirm = useConfirm();
   const { notifyTagErased } = useNfcContext();
   const [restoring, setRestoring] = useState(false);
   const [restoreResult, setRestoreResult] = useState<{ ok: boolean; message: string } | null>(null);
@@ -186,9 +188,7 @@ export default function SettingsPage() {
     // Reset file input so the same file can be re-selected
     e.target.value = "";
 
-    if (!confirm(
-      t("settings.restoreConfirm")
-    )) return;
+    if (!(await confirm({ message: t("settings.restoreConfirm"), destructive: true, confirmLabel: t("common.restore") }))) return;
 
     setRestoring(true);
     setRestoreResult(null);

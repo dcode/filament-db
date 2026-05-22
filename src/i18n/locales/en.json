@@ -208,6 +208,8 @@
   "share.existingShares": "Your shared catalogs",
   "share.noShares": "You haven't published any catalogs yet.",
   "share.viewCount": "{count} views",
+  "share.openLink": "Open",
+  "detail.spool.labelSave": "Save label",
   "share.unpublish": "Unpublish",
   "share.unpublished": "Unpublished",
   "share.unpublishConfirm": "Unpublish this shared catalog? The link will stop working.",
@@ -663,6 +665,8 @@
   "error.failedToLoadSettings": "Failed to load settings",
 
   "common.save": "Save",
+  "common.delete": "Delete",
+  "common.restore": "Restore",
 
   "detail.back": "Back to list",
   "detail.backToFilaments": "Back to Filaments",
