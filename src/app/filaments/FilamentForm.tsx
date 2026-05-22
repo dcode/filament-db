@@ -1119,7 +1119,12 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         </div>
       </div>
 
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+      {/* Two columns, not four: at the form's width four cells were too
+          narrow to fit the colour swatch + hex input together, and the
+          "Density (g/cm³)" label wrapped to two lines, pushing its input
+          out of alignment with the rest of the row. Two columns matches
+          the vendor/type row above and gives every field room. */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div>
           <label className={labelClass}>{t("form.color")}</label>
           <div className="flex gap-2">
@@ -1133,7 +1138,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             <input
               type="text"
               inputMode="text"
-              className={`${inputClass} font-mono uppercase`}
+              className={`${inputClass} font-mono uppercase min-w-0`}
               value={form.color}
               placeholder="#RRGGBB"
               maxLength={7}
