@@ -215,6 +215,14 @@ const FilamentSchema = new Schema<IFilament>(
       bedFirstLayer: { type: Number, default: null },
       standby: { type: Number, default: null },
     },
+    // GH #281: `bedTypeTemps[].bedType` is deliberately free text, NOT a
+    // BedType ObjectId ref. It holds a slicer bed-surface *key* (e.g.
+    // PrusaSlicer's "Textured PEI" / "Smooth PEI" strings) for the
+    // per-surface temperature table that round-trips through INI export
+    // — a slicer-export concern with no DB identity. `calibrations[]
+    // .bedType` below is the separate, ref-counted concept: a pointer
+    // into the shared BedType catalog for calibration data. The two are
+    // intentionally distinct representations; do not conflate them.
     bedTypeTemps: [
       {
         bedType: { type: String, required: true },

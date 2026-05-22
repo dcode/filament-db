@@ -34,14 +34,16 @@ export function getSpoolCount(f: InventoryFilament): number {
 }
 
 /** Grams of filament remaining across all non-retired spools. Returns
- * null when the filament isn't weight-tracked. */
+ * null when the filament isn't weight-tracked.
+ *
+ * GH #310: the gram math is purely `sum(max(0, totalWeight - spoolWeight))`
+ * — `netFilamentWeight` is never referenced here (it's the denominator for
+ * the *percentage*, not the grams). Requiring it would suppress a
+ * perfectly computable grams figure for filaments that have `spoolWeight`
+ * set but `netFilamentWeight` blank, so the guard checks only the inputs
+ * the calculation actually uses. */
 export function getRemainingGrams(f: InventoryFilament): number | null {
-  if (
-    !f.spools ||
-    f.spools.length === 0 ||
-    f.spoolWeight == null ||
-    f.netFilamentWeight == null
-  ) {
+  if (!f.spools || f.spools.length === 0 || f.spoolWeight == null) {
     return null;
   }
   let grams = 0;

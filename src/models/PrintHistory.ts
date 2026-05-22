@@ -40,6 +40,13 @@ const PrintHistorySchema = new Schema<IPrintHistory>(
     usage: [
       {
         filamentId: { type: Schema.Types.ObjectId, ref: "Filament", required: true },
+        // GH #280: `spoolId` is intentionally ref-less — a spool is a
+        // subdocument of a Filament, not a top-level collection, so it
+        // cannot be a Mongoose `ref`. Existence is validated at write
+        // time by the POST /api/print-history handler (pass 1 confirms
+        // an explicit spoolId belongs to the filament before any
+        // mutation); the hybrid-sync engine nulls it on cross-side
+        // remap. All writes funnel through that route.
         spoolId: { type: Schema.Types.ObjectId, default: null },
         grams: { type: Number, required: true, min: 0 },
       },

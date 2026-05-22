@@ -54,6 +54,15 @@ export async function PUT(
     if (!filament) {
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
+
+    // GH #268: retiring a spool excludes it from inventory, so it must
+    // not stay loaded in a printer AMS slot — the assignment route
+    // already refuses to *assign* a retired spool. Clear it from every
+    // slot, the same way the spool DELETE handler does.
+    if (validation.retired === true) {
+      await assignSpoolToSlot(Printer, spoolId, null);
+    }
+
     return NextResponse.json(filament);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

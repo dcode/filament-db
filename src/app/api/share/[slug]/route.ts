@@ -17,25 +17,42 @@ export async function GET(
     await dbConnect();
     const { slug } = await params;
 
-    // Atomic find-and-increment. Using read-modify-write here (findOne +
-    // save) races under concurrent viewers: each reader sees the same count
-    // and increments it by one, so simultaneous hits silently drop updates.
-    // findOneAndUpdate with $inc is one round-trip and collision-safe.
-    // Filter on _deletedAt: null so an unpublished (soft-deleted) slug
-    // returns 404 rather than 200.
+    // GH #272: increment viewCount only for a valid, non-expired hit.
+    // The pre-fix handler `$inc`'d on every GET *before* the expiry
+    // check, so expired catalogs kept accruing views.
+    //
+    // A single atomic findOneAndUpdate carries the validity predicates
+    // (_deletedAt + non-expired) into the WRITE itself — so a catalog
+    // that expires or is unpublished between read and write is not
+    // incremented (Codex review) — and `returnDocument: "after"` gives
+    // back the freshly-incremented count, accurate under concurrent
+    // viewers (no read-modify-write skew).
+    const now = new Date();
     const catalog = await SharedCatalog.findOneAndUpdate(
-      { slug, _deletedAt: null },
+      {
+        slug,
+        _deletedAt: null,
+        $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
+      },
       { $inc: { viewCount: 1 } },
       { returnDocument: "after" },
     );
+
     if (!catalog) {
+      // No valid hit. Distinguish an expired catalog (410) from a
+      // genuinely missing/unpublished one (404) with a read-only
+      // lookup — this path does NOT increment anything. The expiry
+      // test is `<= now` to match the increment query's `$gt: now`
+      // exactly: a catalog whose expiresAt is precisely `now` is
+      // excluded from the valid-hit query, so it must report 410 here
+      // (Codex review — consistent boundary semantics).
+      const existing = await SharedCatalog.findOne({ slug, _deletedAt: null })
+        .select("expiresAt")
+        .lean();
+      if (existing && existing.expiresAt && existing.expiresAt <= now) {
+        return errorResponse("Shared catalog has expired", 410);
+      }
       return errorResponse("Shared catalog not found", 404);
-    }
-    if (catalog.expiresAt && catalog.expiresAt < new Date()) {
-      // We've already incremented the view count on an expired catalog;
-      // that's acceptable — analytics on unpublished shares is harmless
-      // and the alternative is a second round-trip to re-check expiry.
-      return errorResponse("Shared catalog has expired", 410);
     }
 
     return NextResponse.json({

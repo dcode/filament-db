@@ -6,6 +6,7 @@ import "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { mergeSlicerSettings } from "@/lib/slicerSettings";
 
 /**
  * GET /api/filaments/{id}
@@ -247,6 +248,42 @@ export async function POST(
       update.temperatures = { ...existing, ...temps };
     }
 
+    // GH #265 / Codex P1: per-nozzle calibration sync must respect
+    // variant inheritance — but only when the variant actually inherits.
+    // resolveFilament uses the variant's OWN `calibrations` /
+    // `compatibleNozzles` whenever those arrays are non-empty, and falls
+    // back to the parent only when they're empty. So:
+    //   - a variant that OVERRIDES calibrations owns them itself → the
+    //     sync must write to the variant (writing to the parent would
+    //     silently land the change on a document the variant ignores);
+    //   - a variant that INHERITS (empty own array) → the sync writes to
+    //     the parent, so resolveFilament keeps surfacing it and we don't
+    //     sever inheritance by appending a lone entry to the variant.
+    // The compatible-nozzle list used for the nozzle match follows the
+    // same own-if-set-else-parent rule. Every other field in this sync
+    // always writes to the filament itself.
+    const calParent = filament.parentId
+      ? await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
+      : null;
+    const ownCalibrations = (filament.calibrations as unknown[] | undefined) ?? [];
+    const ownCompatNozzles =
+      (filament.compatibleNozzles as unknown[] | undefined) ?? [];
+    // The document whose `calibrations` array is effective for this
+    // filament — and whose `compatibleNozzles` scope the nozzle match.
+    const calTarget =
+      ownCalibrations.length > 0 || !calParent ? filament : calParent;
+    const compatTarget =
+      ownCompatNozzles.length > 0 || !calParent ? filament : calParent;
+    // GH #265 (Codex P1): when the calibration belongs on the PARENT
+    // (an inheriting variant), we record just the nozzle + fields here
+    // and apply them with an atomic per-entry write after the main
+    // update — never a read-modify-write of the parent's whole
+    // `calibrations` array, which would lose a concurrent sibling's
+    // write.
+    let parentCalibrationWrite:
+      | { nozzleId: string; fields: Record<string, number | null> }
+      | null = null;
+
     // Update per-nozzle calibration data when nozzle_diameter is provided.
     // PrusaSlicer passes ?nozzle_diameter=0.4&high_flow=0|1 so the API
     // knows which calibration entry to update with EM, PA, retraction, etc.
@@ -279,9 +316,11 @@ export async function POST(
 
       if (Object.keys(calFields).length > 0) {
         // Find the nozzle by diameter (and optionally high_flow) among
-        // this filament's compatible nozzles. The high_flow param
-        // disambiguates e.g. 0.4mm Diamondback vs 0.4mm HF.
-        const compatIds = (filament.compatibleNozzles || []).map((n: unknown) => String(n));
+        // the effective compatible nozzles (`compatTarget` — the
+        // variant's own list when set, else the parent's; see the #265
+        // note above). The high_flow param disambiguates e.g. 0.4mm
+        // Diamondback vs 0.4mm HF.
+        const compatIds = (compatTarget.compatibleNozzles || []).map((n: unknown) => String(n));
         if (compatIds.length > 0) {
           const highFlowParam = request.nextUrl.searchParams.get("high_flow");
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -298,25 +337,38 @@ export async function POST(
 
           if (matchingNozzle) {
             const nozzleId = String(matchingNozzle._id);
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            const calibrations = [...((filament.calibrations as any[]) || [])];
-            const idx = calibrations.findIndex(
-              (cal) => String(cal.nozzle) === nozzleId && !cal.printer,
-            );
-            if (idx >= 0) {
-              // Update existing calibration entry
-              Object.assign(calibrations[idx], calFields);
+            // GH #265: write to whichever document owns this filament's
+            // effective calibrations.
+            if (String(calTarget._id) === String(filament._id)) {
+              // The filament itself owns calibrations (standalone, or a
+              // variant that overrides them) — fold the change into this
+              // request's own single $set on this document.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const calibrations = [...((calTarget.calibrations as any[]) || [])];
+              const idx = calibrations.findIndex(
+                (cal) => String(cal.nozzle) === nozzleId && !cal.printer,
+              );
+              if (idx >= 0) {
+                Object.assign(calibrations[idx], calFields);
+              } else {
+                calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
+              }
+              update.calibrations = calibrations;
             } else {
-              // Create new calibration entry for this nozzle
-              calibrations.push({ nozzle: nozzleId, printer: null, ...calFields });
+              // An inheriting variant — the calibration belongs on the
+              // parent. Defer to an atomic per-entry write (below) so a
+              // concurrent sibling sync of the same parent can't be
+              // clobbered by a whole-array overwrite.
+              parentCalibrationWrite = { nozzleId, fields: calFields };
             }
-            update.calibrations = calibrations;
           }
         }
       }
     }
 
-    // Everything else goes into the settings bag
+    // Everything else goes into the settings bag. GH #266: bounded
+    // merge — caps the key count and per-value size so a sync write
+    // can't bloat the embedded `settings` field unboundedly.
     const STRUCTURED_KEYS = new Set([
       "filament_type", "filament_vendor", "filament_colour", "filament_diameter",
       "filament_density", "filament_cost", "filament_spool_weight",
@@ -325,15 +377,59 @@ export async function POST(
       "filament_shrinkage_compensation_xy", "filament_shrinkage_compensation_z",
       "filament_soluble", "filament_abrasive", "filament_settings_id",
     ]);
-    const settings = (filament.settings as Record<string, unknown>) || {};
-    for (const [key, value] of Object.entries(config)) {
-      if (!STRUCTURED_KEYS.has(key)) {
-        settings[key] = value;
-      }
+    const merge = mergeSlicerSettings(
+      (filament.settings as Record<string, unknown>) || {},
+      config,
+      STRUCTURED_KEYS,
+    );
+    if (merge.error) {
+      return errorResponse(merge.error, 400);
     }
-    update.settings = settings;
+    update.settings = merge.settings;
 
     await Filament.findByIdAndUpdate(filament._id, { $set: update });
+
+    // GH #265 (Codex P1): persist an inheriting variant's calibration
+    // change on its parent with an ATOMIC per-entry write — never a
+    // read-modify-write of the parent's whole `calibrations` array, so
+    // two variants syncing the same parent concurrently can't drop each
+    // other's entries.
+    if (parentCalibrationWrite) {
+      const { nozzleId, fields } = parentCalibrationWrite;
+      const setEntry: Record<string, number | null> = {};
+      for (const [k, v] of Object.entries(fields)) {
+        setEntry[`calibrations.$.${k}`] = v;
+      }
+      const elemMatch = { calibrations: { $elemMatch: { nozzle: nozzleId, printer: null } } };
+      // 1) Update the matching calibration sub-document in place.
+      const res = await Filament.updateOne(
+        { _id: calTarget._id, ...elemMatch },
+        { $set: setEntry },
+      );
+      if (res.matchedCount === 0) {
+        // 2) No entry yet — append one CONDITIONALLY. The filter
+        // requires the array to STILL lack a matching element. This is
+        // not a check-then-act race: MongoDB applies an updateOne to a
+        // single document atomically and serialises concurrent updates
+        // to the same _id, so of two racing requests the first $pushes
+        // and the second re-evaluates this filter against the first's
+        // committed write, no longer matches, returns matchedCount 0,
+        // and falls through to the in-place $set in step 3. At most one
+        // (nozzle, printer:null) entry is ever created (Codex P1).
+        const inserted = await Filament.updateOne(
+          { _id: calTarget._id, calibrations: { $not: { $elemMatch: { nozzle: nozzleId, printer: null } } } },
+          { $push: { calibrations: { nozzle: nozzleId, printer: null, ...fields } } },
+        );
+        if (inserted.matchedCount === 0) {
+          // 3) A concurrent request inserted the entry first — apply our
+          // fields to it in place so this sync isn't silently lost.
+          await Filament.updateOne(
+            { _id: calTarget._id, ...elemMatch },
+            { $set: setEntry },
+          );
+        }
+      }
+    }
 
     return NextResponse.json({
       message: `Synced ${Object.keys(config).length} settings for "${decodedName}"`,

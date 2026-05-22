@@ -68,31 +68,58 @@ export async function GET(
     let density = filament.density as number | null;
     let diameter = filament.diameter as number | null;
 
-    if (filament.parentId && (spoolWeight == null || density == null || diameter == null)) {
+    // Spool source for the check. A variant usually carries its own
+    // spools array, but a legacy single-weight variant (#273) stores its
+    // capacity in `totalWeight` — which is excluded from variant
+    // inheritance — so its own value is typically null. Without a parent
+    // fallback the check below hits the "no data" branch and silently
+    // disables PrusaSlicer's insufficient-filament warning for every
+    // legacy-mode variant.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ownSpools: any[] = Array.isArray(filament.spools) ? filament.spools : [];
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let spoolsSource: any[] = ownSpools;
+    let legacyTotalWeight = filament.totalWeight as number | null;
+
+    const needsParent =
+      spoolWeight == null ||
+      density == null ||
+      diameter == null ||
+      (ownSpools.length === 0 && legacyTotalWeight == null);
+    if (filament.parentId && needsParent) {
       const parent = await Filament.findOne({
         _id: filament.parentId,
         _deletedAt: null,
       })
-        .select("spoolWeight density diameter")
+        .select("spoolWeight density diameter spools totalWeight")
         .lean();
       if (parent) {
         if (spoolWeight == null) spoolWeight = (parent.spoolWeight as number | null) ?? null;
         if (density == null) density = (parent.density as number | null) ?? null;
         if (diameter == null) diameter = (parent.diameter as number | null) ?? null;
+        // Only borrow the parent's spool data when the variant has none
+        // of its own — an explicit variant spool always wins.
+        if (ownSpools.length === 0 && legacyTotalWeight == null) {
+          if (Array.isArray(parent.spools) && parent.spools.length > 0) {
+            spoolsSource = parent.spools;
+          } else if (parent.totalWeight != null) {
+            legacyTotalWeight = parent.totalWeight as number | null;
+          }
+        }
       }
     }
 
     // Collect all spools — multi-spool array takes priority, fall back to legacy single spool
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const rawSpools: any[] = [];
-    if (Array.isArray(filament.spools) && filament.spools.length > 0) {
-      rawSpools.push(...filament.spools);
-    } else if (filament.totalWeight != null) {
+    if (spoolsSource.length > 0) {
+      rawSpools.push(...spoolsSource);
+    } else if (legacyTotalWeight != null) {
       // Legacy single-spool mode
       rawSpools.push({
         _id: "default",
         label: "Default",
-        totalWeight: filament.totalWeight,
+        totalWeight: legacyTotalWeight,
       });
     }
 
@@ -117,9 +144,14 @@ export async function GET(
 
     const requiredLengthM = weightToLengthM(requiredWeight);
 
-    // Check each spool
+    // Check each spool. Retired spools are intentionally out of service
+    // and must not satisfy the check (Codex review) — otherwise a
+    // retired spool with enough weight (the variant's own, or one
+    // borrowed from the parent via the #273 fallback) would suppress
+    // the slicer's insufficient-filament warning while active stock is
+    // empty. Retired spools drop out of spool-check per CLAUDE.md.
     const spoolResults = rawSpools
-      .filter((s) => s.totalWeight != null)
+      .filter((s) => s.totalWeight != null && !s.retired)
       .map((s) => {
         const remainingWeight = Math.max(0, (s.totalWeight as number) - spoolWeight);
         const remainingLengthM = weightToLengthM(remainingWeight);

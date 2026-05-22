@@ -68,6 +68,15 @@ const PrinterSchema = new Schema<IPrinter>(
       {
         slotName: { type: String, required: true },
         filamentId: { type: Schema.Types.ObjectId, ref: "Filament", default: null },
+        // GH #280: `spoolId` is intentionally ref-less. A spool is a
+        // *subdocument* of a Filament, not a top-level collection, so
+        // Mongoose `ref`/`populate` cannot resolve it. Slot assignment is
+        // funnelled through `assignSpoolToSlot` (src/lib/spoolSlots.ts),
+        // which is the enforcement point for the "one spool, one slot"
+        // invariant; the spool DELETE / retire routes clear stale ids.
+        // The hybrid-sync engine additionally nulls this on every
+        // cross-side remap (no stable cross-side spool id — see the
+        // v1.13 notes in CLAUDE.md), so a dangling id is self-healing.
         spoolId: { type: Schema.Types.ObjectId, default: null },
       },
     ],

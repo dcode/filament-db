@@ -1,0 +1,414 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { GET as getParents } from "@/app/api/filaments/parents/route";
+import { GET as getCompare } from "@/app/api/filaments/compare/route";
+import { GET as getAnalytics } from "@/app/api/analytics/route";
+import { GET as getShare } from "@/app/api/share/[slug]/route";
+import { GET as spoolCheck } from "@/app/api/filaments/[id]/spool-check/route";
+import { PUT as putSpool } from "@/app/api/filaments/[id]/spools/[spoolId]/route";
+import { POST as postPrintHistory } from "@/app/api/print-history/route";
+import { POST as scanPublish } from "@/app/api/scan/publish/route";
+import { POST as slicerSync } from "@/app/api/filaments/[id]/route";
+import { POST as orcaSync } from "@/app/api/filaments/[id]/orcaslicer/route";
+
+/**
+ * Code-review issues #265, #266, #267, #268, #269, #271, #272, #273,
+ * #305, #306 — API route correctness. (#270, #277, #280, #281, #310 are
+ * covered by their own unit tests or are pure documentation.)
+ */
+describe("API route correctness", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  let Filament: any;
+  let Printer: any;
+  let Nozzle: any;
+  let SharedCatalog: any;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  beforeEach(async () => {
+    const filMod = await import("@/models/Filament");
+    const prtMod = await import("@/models/Printer");
+    const nozMod = await import("@/models/Nozzle");
+    const bedMod = await import("@/models/BedType");
+    const phMod = await import("@/models/PrintHistory");
+    const scMod = await import("@/models/SharedCatalog");
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
+    if (!mongoose.models.PrintHistory) mongoose.model("PrintHistory", phMod.default.schema);
+    if (!mongoose.models.SharedCatalog) mongoose.model("SharedCatalog", scMod.default.schema);
+    Filament = mongoose.models.Filament;
+    Printer = mongoose.models.Printer;
+    Nozzle = mongoose.models.Nozzle;
+    SharedCatalog = mongoose.models.SharedCatalog;
+  });
+
+  function getReq(url: string) {
+    return new NextRequest(url, { method: "GET" });
+  }
+  function jsonReq(url: string, body: unknown, method = "POST") {
+    return new NextRequest(url, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  }
+
+  // ── #267: malformed ObjectId → 400, not 500 ────────────────────────
+
+  describe("#267 — malformed ObjectId yields 400", () => {
+    it("parents route rejects a non-ObjectId `exclude` with 400", async () => {
+      const res = await getParents(
+        getReq("http://localhost/api/filaments/parents?exclude=not-an-id"),
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("compare route rejects a non-ObjectId in `ids` with 400", async () => {
+      const res = await getCompare(
+        getReq("http://localhost/api/filaments/compare?ids=not-an-id"),
+      );
+      expect(res.status).toBe(400);
+    });
+  });
+
+  // ── #268: retiring a slotted spool clears the AMS slot ─────────────
+
+  it("#268 — retiring a spool clears it from any printer AMS slot", async () => {
+    const f = await Filament.create({
+      name: "Slot Host",
+      vendor: "T",
+      type: "PLA",
+      spools: [{ label: "Loaded", totalWeight: 1000 }],
+    });
+    const spoolId = String(f.spools[0]._id);
+    const printer = await Printer.create({
+      name: "MK4",
+      manufacturer: "Prusa",
+      printerModel: "MK4",
+      amsSlots: [{ slotName: "Slot A", spoolId }],
+    });
+
+    const res = await putSpool(
+      jsonReq(
+        `http://localhost/api/filaments/${f._id}/spools/${spoolId}`,
+        { retired: true },
+        "PUT",
+      ),
+      { params: Promise.resolve({ id: String(f._id), spoolId }) },
+    );
+    expect(res.status).toBe(200);
+
+    const fresh = await Printer.findById(printer._id);
+    expect(fresh.amsSlots[0].spoolId).toBeNull();
+  });
+
+  // ── #269: analytics survives a malformed usageHistory date ─────────
+
+  it("#269 — analytics skips a malformed usageHistory date instead of 500", async () => {
+    // Raw insert bypasses the schema cast so the date lands as a bad
+    // string — the shape a bad import / snapshot restore can produce.
+    await mongoose.connection.collection("filaments").insertOne({
+      name: "Bad Date Filament",
+      vendor: "T",
+      type: "PLA",
+      spools: [
+        {
+          label: "S1",
+          usageHistory: [
+            { grams: 25, date: "not-a-real-date", source: "manual" },
+          ],
+        },
+      ],
+    });
+
+    const res = await getAnalytics(getReq("http://localhost/api/analytics"));
+    expect(res.status).toBe(200);
+  });
+
+  // ── #271: scan/publish caps the candidates array ───────────────────
+
+  it("#271 — scan/publish caps the candidates array at 25", async () => {
+    const candidates = Array.from({ length: 60 }, (_, i) => ({
+      _id: `cand-${i}`,
+      name: `Candidate ${i}`,
+    }));
+    const res = await scanPublish(
+      jsonReq("http://localhost/api/scan/publish", {
+        filament: { _id: "match-1", name: "Matched" },
+        candidates,
+      }),
+    );
+    expect(res.status).toBe(202);
+    const body = await res.json();
+    expect(body.event.candidates).toHaveLength(25);
+  });
+
+  // ── #272: expired catalogs don't accrue views ──────────────────────
+
+  it("#272 — an expired shared catalog returns 410 without incrementing viewCount", async () => {
+    const catalog = await SharedCatalog.create({
+      title: "Old Share",
+      payload: {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        filaments: [],
+        nozzles: [],
+        printers: [],
+        bedTypes: [],
+      },
+      expiresAt: new Date(Date.now() - 60_000),
+      viewCount: 5,
+    });
+
+    const res = await getShare(
+      getReq(`http://localhost/api/share/${catalog.slug}`),
+      { params: Promise.resolve({ slug: catalog.slug }) },
+    );
+    expect(res.status).toBe(410);
+
+    const fresh = await SharedCatalog.findById(catalog._id);
+    expect(fresh.viewCount).toBe(5); // not incremented
+  });
+
+  it("#272 — a live shared catalog increments viewCount exactly once", async () => {
+    const catalog = await SharedCatalog.create({
+      title: "Live Share",
+      payload: {
+        version: 1,
+        createdAt: new Date().toISOString(),
+        filaments: [],
+        nozzles: [],
+        printers: [],
+        bedTypes: [],
+      },
+      viewCount: 0,
+    });
+
+    const res = await getShare(
+      getReq(`http://localhost/api/share/${catalog.slug}`),
+      { params: Promise.resolve({ slug: catalog.slug }) },
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).viewCount).toBe(1);
+
+    const fresh = await SharedCatalog.findById(catalog._id);
+    expect(fresh.viewCount).toBe(1);
+  });
+
+  // ── #273: spool-check resolves a legacy-mode variant's parent ──────
+
+  it("#273 — spool-check falls back to the parent's totalWeight for a legacy-mode variant", async () => {
+    const parent = await Filament.create({
+      name: "Galaxy Parent",
+      vendor: "Prusa",
+      type: "PLA",
+      totalWeight: 1000,
+      spoolWeight: 200,
+      density: 1.24,
+      diameter: 1.75,
+    });
+    const variant = await Filament.create({
+      name: "Galaxy Black",
+      vendor: "Prusa",
+      type: "PLA",
+      color: "#111111",
+      parentId: parent._id,
+    });
+
+    const res = await spoolCheck(
+      getReq(`http://localhost/api/filaments/${variant._id}/spool-check?weight=100`),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // Pre-fix: empty spools + "no data" message. Now the parent's
+    // legacy totalWeight is used, so the check actually runs.
+    expect(body.spools.length).toBe(1);
+    expect(body.ok).toBe(true);
+  });
+
+  it("#273 — spool-check excludes a retired parent spool from the fallback", async () => {
+    // Codex review: the parent-fallback must not count retired spools —
+    // a retired roll is out of service and shouldn't satisfy the check.
+    const parent = await Filament.create({
+      name: "Retired-Stock Parent",
+      vendor: "Prusa",
+      type: "PLA",
+      spoolWeight: 200,
+      density: 1.24,
+      diameter: 1.75,
+      spools: [{ label: "Old", totalWeight: 1000, retired: true }],
+    });
+    const variant = await Filament.create({
+      name: "Retired-Stock Black",
+      vendor: "Prusa",
+      type: "PLA",
+      color: "#111111",
+      parentId: parent._id,
+    });
+
+    const res = await spoolCheck(
+      getReq(`http://localhost/api/filaments/${variant._id}/spool-check?weight=100`),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    // The only parent spool is retired → no usable stock → "no data",
+    // not a false ok-based-on-a-retired-spool.
+    expect(body.spools).toHaveLength(0);
+    expect(body.message).toMatch(/no spool weight data/i);
+  });
+
+  // ── #305: print history never debits a retired spool ───────────────
+
+  it("#305 — print-history records spoolId:null rather than debiting a retired spool", async () => {
+    const f = await Filament.create({
+      name: "All Retired",
+      vendor: "T",
+      type: "PLA",
+      spools: [{ label: "Old", totalWeight: 500, retired: true }],
+    });
+
+    const res = await postPrintHistory(
+      jsonReq("http://localhost/api/print-history", {
+        jobLabel: "benchy",
+        usage: [{ filamentId: String(f._id), grams: 40 }],
+      }),
+    );
+    expect(res.status).toBe(201);
+    const body = await res.json();
+    expect(body.usage[0].spoolId).toBeNull();
+
+    // The retired spool's preserved weight + history are untouched.
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.spools[0].totalWeight).toBe(500);
+    expect(fresh.spools[0].usageHistory ?? []).toHaveLength(0);
+  });
+
+  // ── #306: print history rejects an invalid startedAt ───────────────
+
+  it("#306 — print-history rejects a malformed startedAt with 400", async () => {
+    const f = await Filament.create({
+      name: "Date Host",
+      vendor: "T",
+      type: "PLA",
+      spools: [{ label: "S1", totalWeight: 1000 }],
+    });
+    const res = await postPrintHistory(
+      jsonReq("http://localhost/api/print-history", {
+        jobLabel: "benchy",
+        startedAt: "garbage",
+        usage: [{ filamentId: String(f._id), grams: 10 }],
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/startedAt/);
+  });
+
+  // ── #265: variant calibration sync writes to the parent ────────────
+
+  it("#265 — slicer calibration sync on a variant writes calibration to the parent", async () => {
+    const nozzle = await Nozzle.create({
+      name: "0.4 Brass",
+      diameter: 0.4,
+      type: "brass",
+    });
+    const parent = await Filament.create({
+      name: "PC Parent",
+      vendor: "Prusa",
+      type: "PC",
+      compatibleNozzles: [nozzle._id],
+    });
+    const variant = await Filament.create({
+      name: "PC Black",
+      vendor: "Prusa",
+      type: "PC",
+      color: "#222222",
+      parentId: parent._id,
+    });
+
+    const res = await slicerSync(
+      jsonReq(
+        `http://localhost/api/filaments/${variant._id}?nozzle_diameter=0.4`,
+        { config: { extrusion_multiplier: "1.05" } },
+      ),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+
+    // Calibration landed on the parent — the variant keeps inheriting it.
+    const freshParent = await Filament.findById(parent._id);
+    expect(freshParent.calibrations).toHaveLength(1);
+    expect(freshParent.calibrations[0].extrusionMultiplier).toBe(1.05);
+    expect(String(freshParent.calibrations[0].nozzle)).toBe(String(nozzle._id));
+
+    const freshVariant = await Filament.findById(variant._id);
+    expect(freshVariant.calibrations ?? []).toHaveLength(0);
+  });
+
+  it("#265 — calibration sync on a variant that OVERRIDES calibrations writes to the variant", async () => {
+    // Codex P1: a variant with its own non-empty calibrations array
+    // owns its calibrations (resolveFilament uses them, not the
+    // parent's), so the sync must land on the variant — not the parent.
+    const nozzle = await Nozzle.create({
+      name: "0.4 Brass",
+      diameter: 0.4,
+      type: "brass",
+    });
+    const parent = await Filament.create({
+      name: "PC Parent",
+      vendor: "Prusa",
+      type: "PC",
+      compatibleNozzles: [nozzle._id],
+    });
+    const variant = await Filament.create({
+      name: "PC Black",
+      vendor: "Prusa",
+      type: "PC",
+      color: "#222222",
+      parentId: parent._id,
+      // Variant overrides both arrays — it is the calibration owner.
+      compatibleNozzles: [nozzle._id],
+      calibrations: [{ nozzle: nozzle._id, extrusionMultiplier: 0.9 }],
+    });
+
+    const res = await slicerSync(
+      jsonReq(
+        `http://localhost/api/filaments/${variant._id}?nozzle_diameter=0.4`,
+        { config: { extrusion_multiplier: "1.2" } },
+      ),
+      { params: Promise.resolve({ id: String(variant._id) }) },
+    );
+    expect(res.status).toBe(200);
+
+    // The override variant's own entry was updated...
+    const freshVariant = await Filament.findById(variant._id);
+    expect(freshVariant.calibrations).toHaveLength(1);
+    expect(freshVariant.calibrations[0].extrusionMultiplier).toBe(1.2);
+
+    // ...and the parent was left untouched.
+    const freshParent = await Filament.findById(parent._id);
+    expect(freshParent.calibrations ?? []).toHaveLength(0);
+  });
+
+  // ── #266: the slicer settings-bag merge is bounded ─────────────────
+
+  it("#266 — orcaslicer sync rejects an over-large settings bag with 400", async () => {
+    const f = await Filament.create({
+      name: "Settings Host",
+      vendor: "T",
+      type: "PLA",
+    });
+    const body: Record<string, string> = {};
+    for (let i = 0; i < 450; i++) body[`orca_key_${i}`] = "v";
+
+    const res = await orcaSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}/orcaslicer`, body),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toMatch(/settings/i);
+  });
+});

@@ -71,6 +71,19 @@ describe("inventoryStats", () => {
       };
       expect(getRemainingGrams(f)).toBeNull();
     });
+
+    it("computes grams even when netFilamentWeight is blank (#310)", () => {
+      // netFilamentWeight is the denominator for the *percentage*, not
+      // the gram math — grams is purely sum(max(0, total - spoolWeight)).
+      // Pre-fix the guard required it and suppressed a computable figure.
+      const f: InventoryFilament = {
+        spoolWeight: 200,
+        netFilamentWeight: null,
+        totalWeight: null,
+        spools: [{ totalWeight: 800 }],
+      };
+      expect(getRemainingGrams(f)).toBe(600);
+    });
   });
 
   describe("getRemainingPct", () => {
