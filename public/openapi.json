@@ -1103,6 +1103,20 @@
         }
       }
     },
+    "/api/nozzles/{id}/clone": {
+      "post": {
+        "tags": ["Nozzles"],
+        "summary": "Clone a nozzle",
+        "description": "Creates a new nozzle that copies the source's spec fields (diameter, type, highFlow, hardened, notes) under a 'Name #N' suffix, with a fresh _id. Used by the printer form's move-or-clone conflict resolution. The clone is not auto-attached to any printer.",
+        "parameters": [
+          { "$ref": "#/components/parameters/NozzleId" }
+        ],
+        "responses": {
+          "201": { "description": "The cloned nozzle", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Nozzle" } } } },
+          "404": { "description": "Source nozzle not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
     "/api/printers": {
       "get": {
         "tags": ["Printers"],
@@ -1976,6 +1990,57 @@
         "responses": {
           "200": { "description": "Per-row import result", "content": { "application/json": { "schema": { "type": "object" } } } },
           "400": { "description": "Invalid or empty CSV", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/spools/{spoolId}/assignment": {
+      "get": {
+        "tags": ["Spools"],
+        "summary": "Get a spool's printer-slot assignment",
+        "description": "Returns the printer AMS/MMU slot the spool currently occupies, or null when unassigned. Reverse lookup over Printer.amsSlots[].spoolId.",
+        "parameters": [
+          { "name": "spoolId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Current assignment ({ assignment } — null when the spool is in no slot)", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "description": "Invalid spool id", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "put": {
+        "tags": ["Spools"],
+        "summary": "Assign a spool to a printer slot",
+        "description": "Assigns the spool to a printer AMS/MMU slot, first clearing it from any other slot — a spool occupies at most one slot at a time. Writes only Printer.amsSlots[].spoolId, never the spool's locationId. Retired spools are rejected.",
+        "parameters": [
+          { "name": "spoolId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["printerId", "slotId"],
+                "properties": { "printerId": { "type": "string" }, "slotId": { "type": "string" } }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "Updated assignment", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "description": "Malformed body, or the spool is retired", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Spool, printer, or slot not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["Spools"],
+        "summary": "Clear a spool's printer-slot assignment",
+        "description": "Removes the spool from whatever slot it occupies. Idempotent — succeeds even if the spool was already unassigned.",
+        "parameters": [
+          { "name": "spoolId", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": { "description": "Assignment cleared ({ assignment: null })", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "400": { "description": "Invalid spool id", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },

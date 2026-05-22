@@ -155,6 +155,7 @@ Each nozzle has:
 - **Type** (Brass, Hardened Steel, Stainless Steel, ObXidian, Diamondback, etc.)
 - **High Flow** flag
 - **Hardened** flag
+- **Installed in** -- the single printer this physical nozzle is currently installed in, chosen from a radio list (or **Not installed in a printer**). A nozzle can only be in one printer at a time; picking a printer here moves it off any printer it was previously on.
 - **Notes**
 
 ---
@@ -180,7 +181,8 @@ Each printer has:
 - **Manufacturer** (e.g. Prusa, Bambu Lab)
 - **Model** (e.g. Core One, X1C)
 - **Name** -- auto-generated from manufacturer + model, but editable
-- **Installed Nozzles** -- select which nozzles are available on this printer
+- **Installed Nozzles** -- the nozzles physically installed in this printer. A printer can hold several (e.g. a toolchanger or multi-head machine), but each physical nozzle can only be installed in one printer at a time.
+- **Multi-material slots (AMS / MMU)** -- optional; define one slot per AMS/MMU position so you can track which spool is loaded where (see [Printer Slot Assignment](#printer-slot-assignment-v121))
 - **Notes**
 
 Printers cannot be deleted if they are referenced by any filament calibrations. The error message tells you how many filaments reference the printer.
@@ -484,6 +486,16 @@ The **Locations** page at `/locations` lets you describe where your physical spo
 Once you've created at least one location, the spool detail panel gains a **Location** dropdown. Assign spools there and the list view stats show spool counts and total grams per location.
 
 **Delete protection:** the UI refuses to delete a location that's still referenced by any spool. Reassign those spools first, or retire them, and the delete will succeed.
+
+## Printer Slot Assignment *(v1.21)*
+
+Separate from its **Location** (its storage "home"), a spool can be assigned to a **printer slot** — the AMS / MMU position it is currently loaded in for printing. When a printer has multi-material slots defined, the spool detail panel shows a **Printer slot** picker directly below the Location dropdown.
+
+- Pick a `Printer · Slot` entry to assign the spool; a badge then shows where it's loaded, with a **Clear** button to remove it.
+- A spool occupies at most one slot at a time — assigning it to a new slot automatically clears it from the previous one.
+- Retired spools can be cleared from a slot but not newly assigned (they're out of inventory).
+
+**Hybrid mode caveat:** printer-slot assignments are stored on the printer and are **not** synced between databases in hybrid mode — they may be cleared on the next sync cycle. The feature is fully reliable in cloud-only or offline-only setups.
 
 ## Spool Photos, Retirement & Dry Cycles *(v1.11)*
 

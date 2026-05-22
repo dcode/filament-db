@@ -13,7 +13,7 @@ A desktop and web application for managing 3D printing filament profiles. Import
 - **Slicer parity** -- OrcaSlicer/BambuStudio/PrusaSlicer settings: overhang fan, aux fan, layer time thresholds, MMU/AMS params, start/end G-code, z-offset, air filtration
 - **Color variants** -- clone a filament as a color variant; inherited settings resolve automatically from the parent
 - **Presets** -- named parameter variants per filament (e.g., shore hardness profiles with different temps and extrusion multiplier)
-- **Spool tracking** -- track multiple spools per filament with individual weights, lot numbers, purchase/opened dates, photos, location assignment, retirement flag, dry-cycle log, and per-spool usage history
+- **Spool tracking** -- track multiple spools per filament with individual weights, lot numbers, purchase/opened dates, photos, location assignment, printer-slot assignment, retirement flag, dry-cycle log, and per-spool usage history
 - **Locations** -- dedicated collection for dryboxes / shelves / cabinets / AMS slots with optional humidity readings; every spool can be assigned to one
 - **Low-stock thresholds** -- per-filament grams threshold surfaces inventory warnings on the dashboard and filament list chips
 - **Dashboard** -- at-a-glance counts, low-stock warnings, "needs drying" reminders, and shortcut links to every section
@@ -24,7 +24,7 @@ A desktop and web application for managing 3D printing filament profiles. Import
 
 ### Hardware Integration
 - **Printers** -- define printers with manufacturer, model, and installed nozzles
-- **Nozzles** -- define nozzles by diameter, type, high-flow, and hardened attributes
+- **Nozzles** -- define nozzles by diameter, type, high-flow, and hardened attributes; each physical nozzle is installed in at most one printer at a time
 - **Bed types** -- define bed surfaces (Smooth PEI, Textured PEI, G10/FR4, Glass, etc.) for per-bed-type calibration
 - **Per-printer per-nozzle per-bed-type calibration** -- store EM, max volumetric speed, pressure advance, retraction, temperature overrides, and fan settings per printer/nozzle/bed-type combination
 - **NFC tag read/write/erase** -- read, write, and erase [OpenPrintTag](https://openprinttag.io/) NFC-V (ISO 15693) tags and read Bambu Lab MIFARE Classic spool tags using an ACR1552U reader (desktop app)
@@ -130,7 +130,7 @@ filament-db/
 │   │   ├── api/print-history/  # Print job ledger (v1.11)
 │   │   ├── api/analytics/      # Usage analytics aggregation (v1.11)
 │   │   ├── api/share/          # Public shared catalogs (v1.11)
-│   │   ├── api/spools/         # Bulk spool CSV import + export (v1.11)
+│   │   ├── api/spools/         # Bulk spool CSV import + export (v1.11); printer-slot assignment (v1.21)
 │   │   ├── api/prusament/      # Prusament spool scraping and import
 │   │   ├── api/openprinttag/   # OpenPrintTag database browser and import
 │   │   ├── api/tds/            # AI-powered TDS extraction (Gemini/Claude/OpenAI)
@@ -152,7 +152,7 @@ filament-db/
 │   ├── components/             # React components (NFC, dialogs, providers, update banner, theme)
 │   ├── hooks/                  # Custom hooks (useNfc, useCurrency)
 │   ├── i18n/                   # Locale files + TranslationProvider (en, de)
-│   ├── lib/                    # DB connection, INI parser, CSV parser, image compression, OpenPrintTag encoder/decoder, TDS extractor (with manual SSRF redirect guard), PrusaSlicer bundle, spool validator, safeRenderUrl (http(s)-only render guard), inventoryStats (retired-spool-aware totals), externalUrlGuard (SSRF block-list)
+│   ├── lib/                    # DB connection, INI parser, CSV parser, image compression, OpenPrintTag encoder/decoder, TDS extractor (with manual SSRF redirect guard), PrusaSlicer bundle, spool validator, safeRenderUrl (http(s)-only render guard), inventoryStats (retired-spool-aware totals), externalUrlGuard (SSRF block-list), spoolSlots (spool ↔ printer-slot assignment)
 │   └── models/                 # Mongoose schemas (Filament, Nozzle, Printer, BedType, Location, PrintHistory, SharedCatalog)
 ├── tests/                      # Vitest unit + route + Mongoose model + electron sync tests
 ├── .github/workflows/
