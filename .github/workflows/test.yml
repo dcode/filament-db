@@ -39,8 +39,13 @@ jobs:
       - name: Run tests with coverage
         run: npm run test:coverage
 
+      # GH #253: this step previously ended in `|| true`, which swallowed
+      # the audit exit code so moderate+ advisories never failed CI. The
+      # known findings are now resolved (brace-expansion bumped; uuid
+      # pinned >=11.1.1 via an exceljs override), so the audit is a real
+      # gate again — a new moderate+ advisory will fail the workflow.
       - name: Security audit
-        run: npm audit --audit-level=moderate || true
+        run: npm audit --audit-level=moderate
 
       - name: Build
         run: npm run build

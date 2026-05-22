@@ -41,7 +41,10 @@
     "yaml": "^2.8.3"
   },
   "overrides": {
-    "postcss": "^8.5.10"
+    "postcss": "^8.5.10",
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
   },
   "devDependencies": {
     "@electron/rebuild": "^4.0.3",
