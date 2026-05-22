@@ -162,52 +162,47 @@ export async function POST(request: NextRequest) {
         settings: f.settings,
       };
 
-      const active = await Filament.findOne({ name: f.name, _deletedAt: null });
-      if (active) {
-        await Filament.updateOne(
-          { _id: active._id },
-          { $set: doc },
-          { runValidators: true, context: "query" },
-        );
+      // GH #327 (Codex): each branch is a single atomic operation so
+      // there is no findOne→write window for a concurrent soft-delete
+      // or insert to slip through.
+
+      // 1) Update an existing ACTIVE filament with this name.
+      const activeUpdated = await Filament.findOneAndUpdate(
+        { name: f.name, _deletedAt: null },
+        { $set: doc },
+        { runValidators: true, context: "query", returnDocument: "after" },
+      );
+      if (activeUpdated) {
         updated++;
       } else {
-        // GH #297: a trashed (non-purged) filament owning this name is
-        // resurrected-and-updated rather than shadowed by a duplicate
+        // 2) GH #297: a trashed (non-purged) filament owning this name
+        // is resurrected-and-updated rather than shadowed by a duplicate
         // active row — a duplicate would strand the trashed one (its
         // restore would 409 forever on the name conflict).
-        const trashed = await Filament.findOne({
-          name: f.name,
-          _deletedAt: { $ne: null },
-          _purged: { $ne: true },
-        });
-        if (trashed) {
-          await Filament.updateOne(
-            { _id: trashed._id },
-            { $set: { ...doc, _deletedAt: null } },
-            { runValidators: true, context: "query" },
-          );
+        const trashedResurrected = await Filament.findOneAndUpdate(
+          { name: f.name, _deletedAt: { $ne: null }, _purged: { $ne: true } },
+          { $set: { ...doc, _deletedAt: null } },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (trashedResurrected) {
           updated++;
         } else {
-          // GH #327 (Codex): retry-on-duplicate. Two concurrent imports
-          // of the same new name can both pass the lookups above and
-          // race into create(); the partial-unique index then throws
-          // E11000 for the loser. Resolve that as an update so parallel
-          // identical imports stay idempotent instead of 500-ing.
+          // 3) Create; retry-on-duplicate. Two concurrent imports of the
+          // same new name can both pass the lookups above and race into
+          // create(); the partial-unique index throws E11000 for the
+          // loser. Resolve that as an update so parallel identical
+          // imports stay idempotent instead of 500-ing.
           try {
             await Filament.create(doc);
             created++;
           } catch (createErr) {
             if (!isDuplicateKeyError(createErr)) throw createErr;
-            const raced = await Filament.findOne({
-              name: f.name,
-              _deletedAt: null,
-            });
-            if (!raced) throw createErr;
-            await Filament.updateOne(
-              { _id: raced._id },
+            const raced = await Filament.findOneAndUpdate(
+              { name: f.name, _deletedAt: null },
               { $set: doc },
-              { runValidators: true, context: "query" },
+              { runValidators: true, context: "query", returnDocument: "after" },
             );
+            if (!raced) throw createErr;
             updated++;
           }
         }

@@ -48,59 +48,52 @@ export async function POST(request: NextRequest) {
       try {
         const { name, ...rest } = filament;
 
-        // Update an existing active filament with this name.
-        const active = await Filament.findOne({ name, _deletedAt: null });
-        if (active) {
-          // GH #308: runValidators so the update branch enforces the
-          // same schema constraints (cost.min, etc.) as a create.
-          await Filament.updateOne(
-            { _id: active._id },
-            { $set: rest },
-            { runValidators: true, context: "query" },
-          );
+        // GH #327 (Codex): each branch is a single atomic operation so
+        // there is no findOne→write window for a concurrent soft-delete
+        // or insert to slip through. `runValidators` keeps the update
+        // path enforcing the same schema constraints as a create (#308).
+
+        // 1) Update an existing ACTIVE filament with this name.
+        const activeUpdated = await Filament.findOneAndUpdate(
+          { name, _deletedAt: null },
+          { $set: rest },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (activeUpdated) {
           updated++;
           continue;
         }
 
-        // GH #297: if a TRASHED (non-purged) filament owns this name,
+        // 2) GH #297: if a TRASHED (non-purged) filament owns this name,
         // resurrect-and-update it rather than creating a second active
-        // row. Creating a duplicate would strand the trashed one — its
-        // restore would then 409 on the name conflict, forever. Mirrors
-        // the resurrect behaviour of the CSV importer.
-        const trashed = await Filament.findOne({
-          name,
-          _deletedAt: { $ne: null },
-          _purged: { $ne: true },
-        });
-        if (trashed) {
-          await Filament.updateOne(
-            { _id: trashed._id },
-            { $set: { ...rest, _deletedAt: null } },
-            { runValidators: true, context: "query" },
-          );
+        // row — a duplicate would strand the trashed one (its restore
+        // would 409 on the name conflict forever).
+        const trashedResurrected = await Filament.findOneAndUpdate(
+          { name, _deletedAt: { $ne: null }, _purged: { $ne: true } },
+          { $set: { ...rest, _deletedAt: null } },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (trashedResurrected) {
           updated++;
           continue;
         }
 
-        // No active or trashed row — create. GH #327 (Codex): a
-        // concurrent import of the same new name can race two requests
-        // past the lookups above and both into create(); the
-        // partial-unique index then throws E11000 for the loser. Treat
-        // that as "another request just created it" and fall through to
-        // an update, so identical parallel imports stay idempotent
-        // instead of intermittently erroring.
+        // 3) No active or trashed row — create. A concurrent import of
+        // the same new name can still race two requests into create();
+        // the partial-unique index throws E11000 for the loser. Treat
+        // that as "another request just created it" and resolve it as
+        // an update, so identical parallel imports stay idempotent.
         try {
           await Filament.create({ name, ...rest });
           created++;
         } catch (createErr) {
           if (!isDuplicateKeyError(createErr)) throw createErr;
-          const raced = await Filament.findOne({ name, _deletedAt: null });
-          if (!raced) throw createErr;
-          await Filament.updateOne(
-            { _id: raced._id },
+          const raced = await Filament.findOneAndUpdate(
+            { name, _deletedAt: null },
             { $set: rest },
-            { runValidators: true, context: "query" },
+            { runValidators: true, context: "query", returnDocument: "after" },
           );
+          if (!raced) throw createErr;
           updated++;
         }
       } catch (err) {
