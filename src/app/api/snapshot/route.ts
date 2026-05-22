@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
 import Filament from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
 import Printer from "@/models/Printer";
@@ -87,7 +88,12 @@ function restoreTypes(doc: Record<string, unknown>): Record<string, unknown> {
  * collection-name mismatch. The keys are kept stable so older
  * snapshots round-trip on the same shape.
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
+  // GH #252: a snapshot is a full data export — reject cross-origin
+  // (CSRF) callers so a hostile page can't trigger an exfiltration.
+  const guard = assertSameOriginRequest(request);
+  if (guard) return guard;
+
   await dbConnect();
 
   const [
@@ -155,6 +161,11 @@ export async function GET() {
  * the snapshot JSON.
  */
 export async function POST(request: NextRequest) {
+  // GH #252: restore wipes and replaces every collection — reject
+  // cross-origin (CSRF) callers before the destructive work begins.
+  const guard = assertSameOriginRequest(request);
+  if (guard) return guard;
+
   if (restoreInProgress) {
     return NextResponse.json(
       { error: "A snapshot restore is already in progress. Please wait." },

@@ -1,5 +1,6 @@
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
 import Filament from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
 import Printer from "@/models/Printer";
@@ -15,7 +16,12 @@ import SharedCatalog from "@/models/SharedCatalog";
  * a "reset" still surfaces stale data in the dashboard / analytics and can
  * leave published share links active after what the user asked to be a wipe.
  */
-export async function DELETE() {
+export async function DELETE(request: NextRequest) {
+  // GH #252: this route wipes every collection — reject cross-origin
+  // (CSRF) callers before touching the database.
+  const guard = assertSameOriginRequest(request);
+  if (guard) return guard;
+
   try {
     await dbConnect();
 

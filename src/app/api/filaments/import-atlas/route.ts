@@ -2,10 +2,16 @@ import { NextRequest, NextResponse } from "next/server";
 import { MongoClient } from "mongodb";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
+import { assertSameOriginRequest } from "@/lib/requestGuard";
 
 // POST with { uri } — list filaments from remote Atlas
 // POST with { uri, filaments: [...ids] } — import selected filaments
 export async function POST(request: NextRequest) {
+  // GH #252: this route connects to a caller-supplied MongoDB host and
+  // can overwrite local filaments — reject cross-origin (CSRF) callers.
+  const guard = assertSameOriginRequest(request);
+  if (guard) return guard;
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let body: any;
   try {

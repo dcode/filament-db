@@ -48,7 +48,7 @@ describe("snapshot route — bedTypes round-trip", () => {
     await BedType.create({ name: "Smooth PEI", material: "PEI" });
     await BedType.create({ name: "Textured PEI", material: "PEI" });
 
-    const res = await GET();
+    const res = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshot = await res.json();
 
     // Snapshot version bumps whenever a new collection joins the payload —
@@ -149,7 +149,7 @@ describe("snapshot route — bedTypes round-trip", () => {
     });
 
     // Export
-    const exportRes = await GET();
+    const exportRes = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshot = JSON.parse(await exportRes.text());
     expect(snapshot.version).toBeGreaterThanOrEqual(4);
     expect(Array.isArray(snapshot.collections.sharedCatalogs)).toBe(true);
@@ -237,7 +237,7 @@ describe("snapshot route — bedTypes round-trip", () => {
     });
 
     // Export
-    const exportRes = await GET();
+    const exportRes = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshotPayload = JSON.parse(await exportRes.text());
 
     // Wipe and re-import
@@ -304,7 +304,7 @@ describe("snapshot route — Location + PrintHistory round-trip", () => {
     await Location.create({ name: "Drybox 1", kind: "drybox", humidity: 18 });
     await Location.create({ name: "Garage shelf", kind: "shelf" });
 
-    const res = await GET();
+    const res = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshot = await res.json();
 
     expect(snapshot.version).toBeGreaterThanOrEqual(3);
@@ -376,7 +376,7 @@ describe("snapshot route — Location + PrintHistory round-trip", () => {
     });
 
     // Export full snapshot, wipe, restore.
-    const exportRes = await GET();
+    const exportRes = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshotPayload = JSON.parse(await exportRes.text());
 
     await PrintHistory.deleteMany({});
@@ -418,7 +418,7 @@ describe("snapshot route — Location + PrintHistory round-trip", () => {
       spools: [{ label: "Spool 1", totalWeight: 1000, locationId: loc._id }],
     });
 
-    const exportRes = await GET();
+    const exportRes = await GET(new NextRequest("http://localhost/api/snapshot"));
     const snapshotPayload = JSON.parse(await exportRes.text());
 
     await Filament.deleteMany({});
