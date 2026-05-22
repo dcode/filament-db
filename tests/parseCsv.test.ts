@@ -79,12 +79,39 @@ describe("parseCsv", () => {
     expect(rows[0]).toEqual({ a: "1", b: "2" });
   });
 
-  it("throws CsvRowLimitExceededError beyond maxRows", () => {
-    // 6 physical rows (header + 5), limit 4 → we process 4 and then hit
-    // the cap. The exact count depends on header handling; what matters
-    // is that a malicious multi-million-row file doesn't silently load.
-    const csv = "a\n1\n2\n3\n4\n5\n";
-    expect(() => parseCsv(csv, { header: true, maxRows: 4 })).toThrow(CsvRowLimitExceededError);
+  // GH #294: pin the exact row-limit boundary so an off-by-one or a
+  // 2x-too-large cap on the CSV DoS guard would fail a test. The guard
+  // caps the *total* parsed-row count (header inclusive) and throws on
+  // the first row past the cap.
+  describe("maxRows row-limit guard", () => {
+    const rows = (n: number) =>
+      Array.from({ length: n }, (_, i) => `r${i}`).join("\n");
+
+    it("accepts exactly maxRows rows and rejects maxRows + 1 (header: false)", () => {
+      // header:false → every parsed row is a data row, 1:1 with the cap.
+      const atLimit = parseCsv(rows(4), { header: false, maxRows: 4 }) as string[][];
+      expect(atLimit).toHaveLength(4);
+      expect(() => parseCsv(rows(5), { header: false, maxRows: 4 })).toThrow(
+        CsvRowLimitExceededError,
+      );
+    });
+
+    it("counts the header row toward maxRows (header: true)", () => {
+      // header + 3 data = 4 total rows == maxRows → accepted.
+      expect(parseCsv("h\nd1\nd2\nd3", { header: true, maxRows: 4 })).toHaveLength(3);
+      // header + 4 data = 5 total rows > maxRows → rejected.
+      expect(() =>
+        parseCsv("h\nd1\nd2\nd3\nd4", { header: true, maxRows: 4 }),
+      ).toThrow(CsvRowLimitExceededError);
+    });
+
+    it("pins the default 10,000-row cap", () => {
+      const atLimit = parseCsv(rows(10_000), { header: false }) as string[][];
+      expect(atLimit).toHaveLength(10_000);
+      expect(() => parseCsv(rows(10_001), { header: false })).toThrow(
+        CsvRowLimitExceededError,
+      );
+    });
   });
 
   it("allows a large but under-limit file when maxRows is raised", () => {
