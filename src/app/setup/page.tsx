@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import { useIsElectron } from "@/hooks/useIsElectron";
 
@@ -15,6 +15,16 @@ export default function SetupPage() {
   const [success, setSuccess] = useState("");
   const isElectron = useIsElectron();
   const [showUri, setShowUri] = useState(false);
+  // GH #287 (Codex review): the post-success "/" redirect is deferred
+  // 800ms so the success banner paints. Track the timer so it can be
+  // cancelled on unmount — otherwise navigating away within that window
+  // lets the stale timer hijack the user to "/" from the new page.
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (redirectTimerRef.current) clearTimeout(redirectTimerRef.current);
+    };
+  }, []);
 
   const handleAtlasConnect = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,8 +75,9 @@ export default function SetupPage() {
         // user on /setup with no way forward but hand-editing the URL.
         // Redirect home with a hard reload so the server process picks
         // up the freshly-saved connection; the brief delay lets the
-        // success message paint first.
-        setTimeout(() => {
+        // success message paint first. The timer is cleared on unmount
+        // so it can't fire from a stale page context.
+        redirectTimerRef.current = setTimeout(() => {
           window.location.href = "/";
         }, 800);
       }
