@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import mongoose from "mongoose";
+import { getRemainingGrams } from "@/lib/inventoryStats";
 
 describe("Filament Model", () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -463,7 +464,17 @@ describe("Filament Model", () => {
   });
 });
 
-describe("Spool remaining weight calculation", () => {
+/**
+ * GH #293: this block used to re-implement the remaining-weight maths
+ * inline and assert on its own arithmetic (e.g. `expect(spool.totalWeight
+ * - filament.spoolWeight).toBe(-90)` — a tautology over test-authored
+ * literals), so a broken helper stayed green. The real remaining-weight
+ * logic lives in `src/lib/inventoryStats.ts` and is unit-tested by
+ * `inventoryStats.test.ts`. What's worth covering *here* is that the
+ * `spools` subdocument array round-trips through Mongoose and that the
+ * shared helper accepts a real persisted Filament document.
+ */
+describe("Spool subdocument persistence", () => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   let Filament: any;
 
@@ -476,79 +487,18 @@ describe("Spool remaining weight calculation", () => {
     await Filament.syncIndexes();
   });
 
-  it("computes remaining weight as totalWeight minus spoolWeight", async () => {
-    const filament = await Filament.create({
-      name: "Remaining Weight PLA",
-      vendor: "Test",
-      type: "PLA",
-      spoolWeight: 190,
-      spools: [{ label: "Spool A", totalWeight: 850 }],
-    });
-
-    const spool = filament.spools[0];
-    const remainingWeight = spool.totalWeight - filament.spoolWeight;
-    expect(remainingWeight).toBe(660);
-  });
-
-  it("clamps remaining weight to zero when totalWeight is less than spoolWeight", async () => {
-    const filament = await Filament.create({
-      name: "Low Weight PLA",
-      vendor: "Test",
-      type: "PLA",
-      spoolWeight: 190,
-      spools: [{ label: "Nearly empty", totalWeight: 100 }],
-    });
-
-    const spool = filament.spools[0];
-    const remainingWeight = Math.max(0, spool.totalWeight - filament.spoolWeight);
-    expect(remainingWeight).toBe(0);
-    // Without clamping, the value would be negative
-    expect(spool.totalWeight - filament.spoolWeight).toBe(-90);
-  });
-
-  it("cannot compute remaining weight when spoolWeight is null", async () => {
-    const filament = await Filament.create({
-      name: "Null SpoolWeight PLA",
-      vendor: "Test",
-      type: "PLA",
-      spoolWeight: null,
-      spools: [{ label: "Spool B", totalWeight: 850 }],
-    });
-
-    expect(filament.spoolWeight).toBeNull();
-    const spool = filament.spools[0];
-    const canCompute = filament.spoolWeight != null && spool.totalWeight != null;
-    expect(canCompute).toBe(false);
-  });
-
-  it("cannot compute remaining weight when spool totalWeight is null", async () => {
-    const filament = await Filament.create({
-      name: "Null TotalWeight PLA",
-      vendor: "Test",
-      type: "PLA",
-      spoolWeight: 190,
-      spools: [{ label: "Spool C", totalWeight: null }],
-    });
-
-    const spool = filament.spools[0];
-    expect(spool.totalWeight).toBeNull();
-    const canCompute = filament.spoolWeight != null && spool.totalWeight != null;
-    expect(canCompute).toBe(false);
-  });
-
-  it("stores and retrieves multiple spools for a single filament", async () => {
+  it("round-trips a multi-spool array and feeds the real getRemainingGrams helper", async () => {
     const filament = await Filament.create({
       name: "Multi-Spool PLA",
       vendor: "Test",
       type: "PLA",
       spoolWeight: 190,
+      netFilamentWeight: 1000,
       spools: [
         { label: "Printer A", totalWeight: 850 },
         { label: "Printer B", totalWeight: 600 },
       ],
     });
-
-    expect(filament.spools).toHaveLength(2);
 
     const found = await Filament.findById(filament._id);
     expect(found!.spools).toHaveLength(2);
@@ -557,45 +507,33 @@ describe("Spool remaining weight calculation", () => {
     expect(found!.spools[1].label).toBe("Printer B");
     expect(found!.spools[1].totalWeight).toBe(600);
 
-    // Verify remaining weight for each spool
-    const remaining0 = found!.spools[0].totalWeight - found!.spoolWeight;
-    const remaining1 = found!.spools[1].totalWeight - found!.spoolWeight;
-    expect(remaining0).toBe(660);
-    expect(remaining1).toBe(410);
+    // Exercise the actual helper against the persisted document:
+    // (850-190) + (600-190) = 1070.
+    expect(getRemainingGrams(found!)).toBe(1070);
   });
 
-  it("computes remaining filament length from weight, density, and diameter", async () => {
+  it("getRemainingGrams returns null for a persisted filament with no spoolWeight", async () => {
     const filament = await Filament.create({
-      name: "Length Calc PLA",
+      name: "Null SpoolWeight PLA",
+      vendor: "Test",
+      type: "PLA",
+      spoolWeight: null,
+      spools: [{ label: "Spool B", totalWeight: 850 }],
+    });
+    expect(getRemainingGrams(filament)).toBeNull();
+  });
+
+  it("getRemainingGrams clamps a near-empty persisted spool at zero", async () => {
+    const filament = await Filament.create({
+      name: "Low Weight PLA",
       vendor: "Test",
       type: "PLA",
       spoolWeight: 190,
-      density: 1.24, // g/cm^3 — typical PLA
-      diameter: 1.75, // mm
-      spools: [{ label: "Main", totalWeight: 850 }],
+      netFilamentWeight: 1000,
+      // totalWeight (100) below spoolWeight (190) — would be -90 unclamped.
+      spools: [{ label: "Nearly empty", totalWeight: 100 }],
     });
-
-    const spool = filament.spools[0];
-    const remainingWeightG = spool.totalWeight - filament.spoolWeight; // 660g
-    expect(remainingWeightG).toBe(660);
-
-    // Volume in cm^3 = weight / density
-    const volumeCm3 = remainingWeightG / filament.density;
-
-    // Cross-section area in cm^2: pi * (diameter/2)^2, diameter in cm
-    const radiusCm = (filament.diameter / 10) / 2; // 1.75mm -> 0.175cm -> r=0.0875cm
-    const crossSectionCm2 = Math.PI * radiusCm * radiusCm;
-
-    // Length in cm = volume / cross-section area
-    const lengthCm = volumeCm3 / crossSectionCm2;
-
-    // Convert to meters
-    const lengthM = lengthCm / 100;
-
-    // ~221m for 660g of PLA at 1.24 g/cm^3 and 1.75mm diameter
-    expect(lengthM).toBeGreaterThan(200);
-    expect(lengthM).toBeLessThan(250);
-    expect(Math.round(lengthM)).toBe(221);
+    expect(getRemainingGrams(filament)).toBe(0);
   });
 });
 

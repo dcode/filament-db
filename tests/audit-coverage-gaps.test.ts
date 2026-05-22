@@ -113,18 +113,23 @@ describe("GH #227 — audit coverage gaps", () => {
       expect(callbackRan).toBe(true);
     });
 
-    it("abort inside withTransaction surfaces as a 500 with rollback semantics", async () => {
-      // Forces an abort by throwing inside the callback after at least
-      // one save. Real Atlas withTransaction rolls everything back; here
-      // we just verify the route propagates the failure shape correctly
-      // (no 201, no PrintHistory row).
+    it("an abort inside withTransaction surfaces as a 500 and creates no PrintHistory row", async () => {
+      // GH #264: honest scope. This test does NOT verify transactional
+      // rollback — that is a MongoDB guarantee exercised only on a
+      // replica set (Atlas), and tests/setup.ts runs a single-node
+      // mongodb-memory-server. The injected fake `withTransaction` runs
+      // the callback then throws *without* rolling back, so the spool
+      // debit it applied is not reverted here. What this test locks in
+      // is the route's failure *shape* on an unexpected abort: a 500
+      // response (not a 201) and no independently-committed PrintHistory
+      // row. Rollback of the spool weight itself is covered in
+      // production by the real driver.
       const f = await Filament.create({
         name: "Txn Abort PLA",
         vendor: "T",
         type: "PLA",
         spools: [{ label: "main", totalWeight: 1000 }],
       });
-      const before = await Filament.findById(f._id).lean();
 
       const sessionSpy = vi
         .spyOn(mongoose, "startSession")
@@ -156,17 +161,10 @@ describe("GH #227 — audit coverage gaps", () => {
       // 500 expected — the unexpected abort isn't a VersionError so the
       // 409 path doesn't apply.
       expect(res?.status).toBe(500);
-      // We can't make the memory-server roll back the save without
-      // real transactional support; the test is here to lock the
-      // path against future refactors. Assert the call shape:
       // PrintHistory.create was NOT committed independently of the
-      // session (no rows from this job).
+      // aborted session — no rows from this job.
       const ph = await PrintHistory.find({ jobLabel: "abort job" }).lean();
       expect(ph).toHaveLength(0);
-      // The save happened inside the (fake) transaction without rollback
-      // support, so we can't assert pre-call state here. Documented:
-      // production Atlas DOES roll back; the memory-server can't.
-      void before;
     });
   });
 

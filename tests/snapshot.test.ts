@@ -22,14 +22,26 @@ describe("snapshot route — bedTypes round-trip", () => {
   let Printer: any;
 
   beforeEach(async () => {
-    delete mongoose.models.BedType;
-    delete mongoose.models.Filament;
-    delete mongoose.models.Nozzle;
-    delete mongoose.models.Printer;
-    BedType = (await import("@/models/BedType")).default;
-    Filament = (await import("@/models/Filament")).default;
-    Nozzle = (await import("@/models/Nozzle")).default;
-    Printer = (await import("@/models/Printer")).default;
+    // GH #295: re-register every model via mongoose.model(name, schema).
+    // setup.ts wipes mongoose.models between tests, and a plain
+    // `import` returns the module-cached model object — which is no
+    // longer in the registry after the wipe, so any `.populate()` the
+    // snapshot/restore route might gain in future would throw "Schema
+    // hasn't been registered". Registering through the registry (the
+    // pattern locations-route.test.ts / print-history.test.ts use)
+    // keeps the test robust against that.
+    const bedMod = await import("@/models/BedType");
+    const filMod = await import("@/models/Filament");
+    const nozMod = await import("@/models/Nozzle");
+    const prtMod = await import("@/models/Printer");
+    if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
+    BedType = mongoose.models.BedType;
+    Filament = mongoose.models.Filament;
+    Nozzle = mongoose.models.Nozzle;
+    Printer = mongoose.models.Printer;
   });
 
   it("GET includes bedTypes in the snapshot payload", async () => {

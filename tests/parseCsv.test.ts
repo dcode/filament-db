@@ -79,12 +79,41 @@ describe("parseCsv", () => {
     expect(rows[0]).toEqual({ a: "1", b: "2" });
   });
 
-  it("throws CsvRowLimitExceededError beyond maxRows", () => {
-    // 6 physical rows (header + 5), limit 4 → we process 4 and then hit
-    // the cap. The exact count depends on header handling; what matters
-    // is that a malicious multi-million-row file doesn't silently load.
-    const csv = "a\n1\n2\n3\n4\n5\n";
-    expect(() => parseCsv(csv, { header: true, maxRows: 4 })).toThrow(CsvRowLimitExceededError);
+  // GH #294: pin the exact row-limit boundary so an off-by-one or a
+  // 2x-too-large cap on the CSV DoS guard would fail a test. Per the
+  // CsvParseOptions contract, `maxRows` caps emitted DATA rows — the
+  // header row is NOT counted toward it.
+  describe("maxRows row-limit guard", () => {
+    const rows = (n: number) =>
+      Array.from({ length: n }, (_, i) => `r${i}`).join("\n");
+
+    it("accepts exactly maxRows rows and rejects maxRows + 1 (header: false)", () => {
+      // header:false → every parsed row is a data row, 1:1 with the cap.
+      const atLimit = parseCsv(rows(4), { header: false, maxRows: 4 }) as string[][];
+      expect(atLimit).toHaveLength(4);
+      expect(() => parseCsv(rows(5), { header: false, maxRows: 4 })).toThrow(
+        CsvRowLimitExceededError,
+      );
+    });
+
+    it("excludes the header row from the maxRows data-row cap (header: true)", () => {
+      // header + 4 data == 4 data rows == maxRows → accepted.
+      expect(
+        parseCsv("h\nd1\nd2\nd3\nd4", { header: true, maxRows: 4 }),
+      ).toHaveLength(4);
+      // header + 5 data == 5 data rows > maxRows → rejected.
+      expect(() =>
+        parseCsv("h\nd1\nd2\nd3\nd4\nd5", { header: true, maxRows: 4 }),
+      ).toThrow(CsvRowLimitExceededError);
+    });
+
+    it("pins the default 10,000-row cap", () => {
+      const atLimit = parseCsv(rows(10_000), { header: false }) as string[][];
+      expect(atLimit).toHaveLength(10_000);
+      expect(() => parseCsv(rows(10_001), { header: false })).toThrow(
+        CsvRowLimitExceededError,
+      );
+    });
   });
 
   it("allows a large but under-limit file when maxRows is raised", () => {
