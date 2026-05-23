@@ -80,11 +80,20 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 
 ## Release Process
 
-1. Update version in `package.json`
-2. Commit and push to main
-3. Tag with `git tag v<version>` and push tag
-4. CI builds desktop installers and uploads to GitHub release
-5. Apply release notes with `gh release edit`
+1. Update version in **three** places (the release CI uses package-lock for `npm ci`, OpenAPI reports the API version in `/api-docs`):
+   - `package.json` (top-level `version`)
+   - `package-lock.json` (two occurrences: top-level `version` and `packages[""].version`)
+   - `public/openapi.json` (`info.version`)
+2. Commit and push to main with a `Bump version to <x.y.z>` message
+3. Tag with `git tag v<version>` and push the tag
+4. CI builds desktop installers and uploads to a draft GitHub release. The release is auto-published when uploads finish; **assets ≠ source of truth for "release done"** — wait for the workflow run, not just the release-created event
+5. Apply release notes with `gh release edit v<version> --notes-file …`. CI doesn't overwrite the body when it publishes, so a single edit (any time after the draft is created) suffices
+
+### Release-process gotchas
+- **CSP fixes affect TWO files.** The web CSP lives in `next.config.ts`; the Electron renderer applies its OWN CSP from `electron/main.ts:~1050` and the renderer doesn't merge them — the value set in Electron's `onHeadersReceived` REPLACES whatever Next sent. Any `script-src` / `frame-src` / new-directive change has to land in both. (v1.25.0 shipped with the web CSP gated for dev `'unsafe-eval'` but the Electron CSP unchanged; required a v1.25.1 patch.)
+- **Dev vs packaged in Electron is `app.isPackaged`, not `NODE_ENV`.** `NODE_ENV` isn't reliably set when Electron launches the main process; gate Electron-specific dev-only behaviour on `app.isPackaged ? prod : dev`.
+- **The Windows ARM64 release job runs the full Vitest suite under x64 emulation, which makes `mongodb-memory-server`'s 10s startup timeout flaky** (`tests/compressImage.test.ts` was a victim on v1.25.0). When the job fails on that timeout specifically, a re-run usually passes; if it becomes a pattern, bump the `mongodb-memory-server` start timeout in `tests/setup.ts` or skip the affected test on the cross runner.
+- **macOS installs from an older app cache the bundle ID, not the binary.** A `.dmg` in Downloads doesn't replace `/Applications/Filament DB.app` until you drag it over. Verify with `defaults read /Applications/Filament\ DB.app/Contents/Info.plist CFBundleShortVersionString`.
 
 ## PrusaSlicer Integration
 
