@@ -1,8 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseIniFilaments } from "@/lib/parseIni";
-import { checkFileSize } from "@/lib/apiErrorHandler";
+import { assertMultipartFormData, checkFileSize } from "@/lib/apiErrorHandler";
 
 export async function POST(request: NextRequest) {
+  // GH #338: bad content-type is client input, not a server fault — 400 + clear message.
+  const ctError = assertMultipartFormData(request);
+  if (ctError) return ctError;
   try {
     const formData = await request.formData();
     const file = formData.get("file") as File | null;

@@ -47,9 +47,22 @@ const nextConfig: NextConfig = {
     //     buildEsbuild).
     //   - Hash-pin the theme-init script.
     //   - Consider report-uri once we have an endpoint.
+    // GH #344: React's RSC client uses `eval()` in development for
+    // debugging features (callstack reconstruction from cross-environment
+    // payloads). Without `'unsafe-eval'` in dev, the browser console logs
+    // an error on every page and the Next.js devtools badge surfaces a
+    // permanent "1 Issue", drowning real app errors during QA.
+    //
+    // Production builds never use eval(); keep the production CSP tight
+    // by only adding `'unsafe-eval'` when NODE_ENV !== "production".
+    const isDev = process.env.NODE_ENV !== "production";
+    const scriptSrc = isDev
+      ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+      : "script-src 'self' 'unsafe-inline'";
+
     const csp = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline'",
+      scriptSrc,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",

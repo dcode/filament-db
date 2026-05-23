@@ -93,3 +93,24 @@ export async function GET(request: NextRequest) {
     );
   }
 }
+
+/**
+ * GH #341: bulk OrcaSlicer bundle IMPORT is not yet implemented (the
+ * corresponding PrusaSlicer route supports POST). OrcaSlicer profiles
+ * are JSON, not INI, and the orcaSlicerBundle lib only exposes
+ * serialisers; a parser + per-key mapper would be a follow-up.
+ *
+ * Returning an explicit 501 with a clear message — instead of letting
+ * Next.js auto-respond with 405 — documents the gap and points callers
+ * at the per-preset POST that DOES exist
+ * (`POST /api/filaments/{id}/orcaslicer`).
+ */
+export async function POST() {
+  return NextResponse.json(
+    {
+      error:
+        "Bulk OrcaSlicer bundle import is not yet supported. Use POST /api/filaments/{id}/orcaslicer to sync an individual preset back, or import a PrusaSlicer INI bundle (POST /api/filaments/prusaslicer) which IS supported.",
+    },
+    { status: 501 },
+  );
+}
