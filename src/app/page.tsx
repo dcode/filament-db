@@ -8,6 +8,7 @@ import ImportAtlasDialog from "@/components/ImportAtlasDialog";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import SpoolCsvImportDialog from "@/components/SpoolCsvImportDialog";
 import QuickFilterChips, { type QuickFilter } from "@/components/QuickFilterChips";
+import FilamentSwatch from "@/components/FilamentSwatch";
 import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import type { FilamentSummary } from "@/types/filament";
@@ -492,11 +493,11 @@ export default function Home() {
       <td className="py-2 px-2">
         <div className="flex items-center gap-1">
           {isVariant && <span className="text-gray-400 text-xs ml-2">&#8627;</span>}
-          <div
-            className={`${isVariant ? "w-5 h-5" : "w-6 h-6"} rounded-full border border-gray-300`}
-            style={{ backgroundColor: f.color }}
+          <FilamentSwatch
+            color={f.color}
+            isParent={!isVariant && f.hasVariants === true}
+            size={isVariant ? 20 : 24}
             title={f.color}
-            aria-label={`Color swatch: ${f.color}`}
           />
         </div>
       </td>
@@ -594,11 +595,11 @@ export default function Home() {
               >
                 {isExpanded ? "▾" : "▸"}
               </button>
-              <div
-                className="w-6 h-6 rounded-full border border-gray-300"
-                style={{ backgroundColor: f.color }}
+              <FilamentSwatch
+                color={f.color}
+                isParent
+                size={24}
                 title={f.color}
-                aria-label={`Color swatch: ${f.color}`}
               />
             </div>
           </td>
@@ -663,10 +664,11 @@ export default function Home() {
                     href={`/filaments/${v._id}`}
                     title={v.name}
                   >
-                    <div
-                      className="w-4 h-4 rounded-full border border-gray-400 hover:ring-2 hover:ring-blue-400 transition-all"
-                      style={{ backgroundColor: v.color }}
-                      aria-label={`Color swatch: ${v.color}`}
+                    <FilamentSwatch
+                      color={v.color}
+                      size={16}
+                      className="hover:ring-2 hover:ring-blue-400 transition-all"
+                      title={v.name}
                     />
                   </Link>
                 ))}

@@ -137,10 +137,24 @@ function NewFilamentContent() {
   }, [searchParams]);
 
   // Initialize from ?parentId= query param
+  //
+  // Two things happen here:
+  //   1. We pre-fill `vendor` + `type` because those are almost always
+  //      shared between a parent and its variants — typing them again is
+  //      a papercut, not an inheritance violation (they're trivially
+  //      re-derivable, and the form already does this when the user picks
+  //      a parent manually via the dropdown).
+  //   2. We attach the full parent doc as `_parent` so FilamentForm can
+  //      render the parent's values as faded placeholders on every
+  //      inheritable input. The form must NOT copy these into form state
+  //      on save — placeholders are display-only. That preserves the
+  //      GH #106 dynamic-inheritance design: a blank input on the variant
+  //      stays blank in the database and resolves to the parent's current
+  //      value at read time via resolveFilament().
   useEffect(() => {
     if (parentId) {
       const ac = new AbortController();
-      fetch(`/api/filaments/${parentId}`, { signal: ac.signal })
+      fetch(`/api/filaments/${parentId}?raw=true`, { signal: ac.signal })
         .then((r) => (r.ok ? r.json() : null))
         .then((parent) => {
           if (parent) {
@@ -148,6 +162,7 @@ function NewFilamentContent() {
               parentId,
               vendor: parent.vendor || "",
               type: parent.type || "",
+              _parent: parent,
             });
             setTitleKey("new.addColorVariant");
             setFormKey((k) => k + 1);

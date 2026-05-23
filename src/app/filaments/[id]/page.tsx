@@ -11,6 +11,7 @@ import { useConfirm } from "@/components/ConfirmDialog";
 import { useCurrency } from "@/hooks/useCurrency";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import CopyButton from "@/components/CopyButton";
+import FilamentSwatch from "@/components/FilamentSwatch";
 import type { FilamentDetail, FilamentCalibration } from "@/types/filament";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
@@ -576,10 +577,12 @@ export default function FilamentDetail() {
       </div>
 
       <div className="flex flex-wrap items-center gap-4 mb-6">
-        <div
-          className="w-10 h-10 rounded-full border-2 border-gray-300 flex-shrink-0"
-          style={{ backgroundColor: filament.color }}
-          aria-label={`Color swatch: ${filament.color}`}
+        <FilamentSwatch
+          color={filament.color}
+          isParent={isParent}
+          size={40}
+          className="border-2"
+          ariaLabel={isParent ? "Multi-color parent" : `Color swatch: ${filament.color}`}
         />
         <div className="min-w-0">
           <h1 className="text-2xl font-bold">{filament.name}</h1>
@@ -700,6 +703,18 @@ export default function FilamentDetail() {
               {t("detail.clone")}
             </Link>
           )}
+          {!isVariant && (
+            <Link
+              href={`/filaments/new?parentId=${filament._id}`}
+              className="px-4 py-2 bg-fuchsia-600 text-white rounded hover:bg-fuchsia-700 text-sm inline-flex items-center gap-1.5"
+              title={t("detail.createVariant.title")}
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+              </svg>
+              {t("detail.createVariant")}
+            </Link>
+          )}
           <Link
             href={`/filaments/${filament._id}/edit`}
             className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 text-sm"
@@ -742,10 +757,10 @@ export default function FilamentDetail() {
                 href={`/filaments/${v._id}`}
                 className="flex items-center gap-2 px-3 py-2 bg-gray-100 dark:bg-gray-800 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
               >
-                <div
-                  className="w-5 h-5 rounded-full border border-gray-300"
-                  style={{ backgroundColor: v.color }}
-                  aria-label={`Color swatch: ${v.color}`}
+                <FilamentSwatch
+                  color={v.color}
+                  size={20}
+                  ariaLabel={`Color swatch: ${v.color}`}
                 />
                 <span className="text-sm">{v.name}</span>
                 {v.cost != null && (

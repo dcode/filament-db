@@ -157,4 +157,8 @@ export interface FilamentSummary {
    * aggregation projection so the full calibrations array doesn't need
    * to ship with every list row. */
   hasCalibrations?: boolean;
+  /** True when ≥1 non-deleted filament currently references this row as
+   * parent. Drives the cross-hatch swatch render: parents have no
+   * canonical color of their own. Auto-detected — no schema flag. */
+  hasVariants?: boolean;
 }

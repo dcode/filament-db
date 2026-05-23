@@ -159,6 +159,58 @@ describe("GET /api/filaments — projection to FilamentSummary", () => {
     expect(cal.hasCalibrations).toBe(true);
   });
 
+  it("surfaces hasVariants true on parents with ≥1 non-deleted variant and false otherwise", async () => {
+    // Parent-of-color-variants visual indicator: the list payload needs a
+    // boolean so FilamentSwatch can render the cross-hatch on the right
+    // row without each consumer re-querying. A filament is never a parent
+    // unless it actually has variants — auto-detected from the lookup,
+    // no schema field.
+    const Filament = (await import("@/models/Filament")).default;
+    const parent = await Filament.create({
+      name: "Variant Parent",
+      vendor: "Test",
+      type: "PLA",
+    });
+    await Filament.create({
+      name: "Black Variant",
+      vendor: "Test",
+      type: "PLA",
+      parentId: parent._id,
+      color: "#000000",
+    });
+    // A deleted variant must NOT count — a parent whose only child has
+    // been trashed should fall back to a solid swatch.
+    const trashedParent = await Filament.create({
+      name: "Trashed-variant Parent",
+      vendor: "Test",
+      type: "PLA",
+    });
+    await Filament.create({
+      name: "Trashed Variant",
+      vendor: "Test",
+      type: "PLA",
+      parentId: trashedParent._id,
+      _deletedAt: new Date(),
+    });
+    // Standalone with no children — should be a plain solid swatch.
+    await Filament.create({
+      name: "Lone Standalone",
+      vendor: "Test",
+      type: "PLA",
+    });
+
+    const res = await listFilaments(
+      new NextRequest("http://localhost/api/filaments"),
+    );
+    const body = await res.json();
+    const find = (name: string) => body.find((f: { name: string }) => f.name === name);
+
+    expect(find("Variant Parent").hasVariants).toBe(true);
+    expect(find("Black Variant").hasVariants).toBe(false);
+    expect(find("Trashed-variant Parent").hasVariants).toBe(false);
+    expect(find("Lone Standalone").hasVariants).toBe(false);
+  });
+
   it("does not include the full calibrations array (only the boolean)", async () => {
     await seed();
     const res = await listFilaments(
