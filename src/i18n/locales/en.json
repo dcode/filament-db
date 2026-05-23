@@ -667,6 +667,7 @@
   "common.save": "Save",
   "common.delete": "Delete",
   "common.restore": "Restore",
+  "common.ok": "OK",
 
   "detail.back": "Back to list",
   "detail.backToFilaments": "Back to Filaments",

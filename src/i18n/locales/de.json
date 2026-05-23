@@ -667,6 +667,7 @@
   "common.save": "Speichern",
   "common.delete": "Löschen",
   "common.restore": "Wiederherstellen",
+  "common.ok": "OK",
 
   "detail.back": "Zurück zur Liste",
   "detail.backToFilaments": "Zurück zu Filamenten",
