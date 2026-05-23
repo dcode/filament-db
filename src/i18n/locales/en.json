@@ -675,6 +675,8 @@
   "detail.edit": "Edit",
   "detail.clone": "Clone",
   "detail.clone.title": "Clone this filament as a new color variant",
+  "detail.createVariant": "Create variant",
+  "detail.createVariant.title": "Create a new color variant that inherits this filament's settings",
   "detail.variant": "variant",
   "detail.colorCount": "{count} colors",
   "detail.inherited": "inherited",

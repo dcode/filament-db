@@ -5,6 +5,7 @@ import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import CollapsibleSection, { expandAndScrollToSection } from "@/components/CollapsibleSection";
 import FormToc, { FormTocMobileButton, type TocEntry } from "@/components/FormToc";
+import FilamentSwatch from "@/components/FilamentSwatch";
 
 interface BedTypeTempEntry {
   /** Client-only stable row id for React keys. Stripped before API submission. */
@@ -91,6 +92,9 @@ interface ParentOption {
   vendor: string;
   type: string;
   color: string;
+  /** Annotated by /api/filaments/parents — true when this candidate
+   * currently has ≥1 variant. Drives the cross-hatch swatch in the picker. */
+  hasVariants?: boolean;
 }
 
 interface PrinterOption {
@@ -771,6 +775,34 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
   // Identity fields (name / parent / vendor / type / color / cost) sit above
   // the first TOC entry as always-visible primary content.
   const hasCompatibleNozzles = form.compatibleNozzles.length > 0;
+
+  // Placeholder helpers — when the form is opened from `?parentId=`, the
+  // parent doc rides along on `initialData._parent`. We render the parent's
+  // values as faded placeholders on every inheritable input so the user
+  // can see what they're inheriting without leaving the page. Inputs stay
+  // empty in form state and on submit, so the variant doc records no
+  // explicit override and continues to track the parent at read time via
+  // resolveFilament (GH #106 — placeholders must NEVER bleed into form
+  // state). Returns `undefined` when there is no parent, no value, or an
+  // empty-string value, so callers can fall back to a static placeholder.
+  type ParentDocLike = Record<string, unknown>;
+  const parentDoc =
+    (initialData?._parent && typeof initialData._parent === "object"
+      ? (initialData._parent as ParentDocLike)
+      : undefined);
+  const parentPh = (path: string): string | undefined => {
+    if (!parentDoc) return undefined;
+    let value: unknown = parentDoc;
+    for (const seg of path.split(".")) {
+      if (value && typeof value === "object" && seg in (value as object)) {
+        value = (value as Record<string, unknown>)[seg];
+      } else {
+        return undefined;
+      }
+    }
+    if (value === null || value === undefined || value === "") return undefined;
+    return String(value);
+  };
   const tocEntries: TocEntry[] = useMemo(() => {
     const all: { id: string; label: string; show: boolean }[] = [
       { id: "spool-weight", label: t("form.section.spoolWeight"), show: true },
@@ -864,9 +896,10 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               const p = parentOptions.find((o) => o._id === form.parentId);
               return p ? (
                 <>
-                  <div
-                    className="w-4 h-4 rounded-full border border-gray-300 flex-shrink-0"
-                    style={{ backgroundColor: p.color }}
+                  <FilamentSwatch
+                    color={p.color}
+                    isParent={p.hasVariants === true}
+                    size={16}
                   />
                   <span className="flex-1">{p.name}</span>
                   <span className="text-gray-500 text-xs">{p.vendor} &middot; {p.type}</span>
@@ -948,9 +981,10 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                         setParentDropdownOpen(false);
                       }}
                     >
-                      <div
-                        className="w-4 h-4 rounded-full border border-gray-500 flex-shrink-0"
-                        style={{ backgroundColor: p.color }}
+                      <FilamentSwatch
+                        color={p.color}
+                        isParent={p.hasVariants === true}
+                        size={16}
                       />
                       <span className="flex-1 truncate">{p.name}</span>
                       <span className="text-gray-400 text-xs flex-shrink-0">{p.vendor} &middot; {p.type}</span>
@@ -1191,6 +1225,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             className={inputClass}
             value={form.cost}
             onChange={(e) => setForm({ ...form, cost: e.target.value })}
+            placeholder={parentPh("cost")}
           />
         </div>
         <div>
@@ -1202,6 +1237,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             className={inputClass}
             value={form.density}
             onChange={(e) => setForm({ ...form, density: e.target.value })}
+            placeholder={parentPh("density")}
           />
         </div>
       </div>
@@ -1221,7 +1257,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               className={inputClass}
               value={form.netFilamentWeight}
               onChange={(e) => setForm({ ...form, netFilamentWeight: e.target.value })}
-              placeholder={t("form.placeholder.netFilament")}
+              placeholder={parentPh("netFilamentWeight") ?? t("form.placeholder.netFilament")}
             />
             <p className="text-xs text-gray-400 mt-1">{t("form.netFilamentHint")}</p>
           </div>
@@ -1234,7 +1270,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               className={inputClass}
               value={form.spoolWeight}
               onChange={(e) => setForm({ ...form, spoolWeight: e.target.value })}
-              placeholder={t("form.placeholder.emptySpool")}
+              placeholder={parentPh("spoolWeight") ?? t("form.placeholder.emptySpool")}
             />
             <p className="text-xs text-gray-400 mt-1">{t("form.emptySpoolHint")}</p>
           </div>
@@ -1279,6 +1315,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           <input type="number" step="1" min="0" className={inputClass}
             value={form.minPrintSpeed}
             onChange={(e) => setForm({ ...form, minPrintSpeed: e.target.value })}
+            placeholder={parentPh("minPrintSpeed")}
           />
         </div>
         <div>
@@ -1286,6 +1323,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           <input type="number" step="1" min="0" className={inputClass}
             value={form.maxPrintSpeed}
             onChange={(e) => setForm({ ...form, maxPrintSpeed: e.target.value })}
+            placeholder={parentPh("maxPrintSpeed")}
           />
         </div>
         <div>
@@ -1317,6 +1355,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, nozzle: e.target.value },
                 })
               }
+              placeholder={parentPh("temperatures.nozzle")}
             />
           </div>
           <div>
@@ -1332,6 +1371,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, nozzleFirstLayer: e.target.value },
                 })
               }
+              placeholder={parentPh("temperatures.nozzleFirstLayer")}
             />
           </div>
           <div>
@@ -1347,6 +1387,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, bed: e.target.value },
                 })
               }
+              placeholder={parentPh("temperatures.bed")}
             />
           </div>
           <div>
@@ -1362,6 +1403,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, bedFirstLayer: e.target.value },
                 })
               }
+              placeholder={parentPh("temperatures.bedFirstLayer")}
             />
           </div>
           <div>
@@ -1392,6 +1434,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, standby: e.target.value },
                 })
               }
+              placeholder={parentPh("temperatures.standby")}
             />
           </div>
           <div>
@@ -1407,7 +1450,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, nozzleRangeMin: e.target.value },
                 })
               }
-              placeholder={t("form.placeholder.safeMinimum")}
+              placeholder={parentPh("temperatures.nozzleRangeMin") ?? t("form.placeholder.safeMinimum")}
             />
           </div>
           <div>
@@ -1423,7 +1466,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                   temperatures: { ...form.temperatures, nozzleRangeMax: e.target.value },
                 })
               }
-              placeholder={t("form.placeholder.safeMaximum")}
+              placeholder={parentPh("temperatures.nozzleRangeMax") ?? t("form.placeholder.safeMaximum")}
             />
           </div>
         </div>
@@ -1489,7 +1532,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               className={inputClass}
               value={form.shrinkageXY}
               onChange={(e) => setForm({ ...form, shrinkageXY: e.target.value })}
-              placeholder={t("form.placeholder.shrinkage")}
+              placeholder={parentPh("shrinkageXY") ?? t("form.placeholder.shrinkage")}
             />
           </div>
           <div>
@@ -1499,7 +1542,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               className={inputClass}
               value={form.shrinkageZ}
               onChange={(e) => setForm({ ...form, shrinkageZ: e.target.value })}
-              placeholder={t("form.placeholder.shrinkage")}
+              placeholder={parentPh("shrinkageZ") ?? t("form.placeholder.shrinkage")}
             />
           </div>
         </div>
@@ -1679,7 +1722,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           <input type="number" step="1" min="0" className={inputClass}
             value={form.glassTempTransition}
             onChange={(e) => setForm({ ...form, glassTempTransition: e.target.value })}
-            placeholder={t("form.placeholder.glassTempTransition")}
+            placeholder={parentPh("glassTempTransition") ?? t("form.placeholder.glassTempTransition")}
           />
         </div>
         <div>
@@ -1687,7 +1730,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           <input type="number" step="1" min="0" className={inputClass}
             value={form.heatDeflectionTemp}
             onChange={(e) => setForm({ ...form, heatDeflectionTemp: e.target.value })}
-            placeholder={t("form.placeholder.heatDeflectionTemp")}
+            placeholder={parentPh("heatDeflectionTemp") ?? t("form.placeholder.heatDeflectionTemp")}
           />
         </div>
         <div>
@@ -1695,7 +1738,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           <input type="number" step="any" min="0" className={inputClass}
             value={form.transmissionDistance}
             onChange={(e) => setForm({ ...form, transmissionDistance: e.target.value })}
-            placeholder={t("form.placeholder.transmissionDistance")}
+            placeholder={parentPh("transmissionDistance") ?? t("form.placeholder.transmissionDistance")}
           />
         </div>
         </div>
@@ -1711,7 +1754,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             min="0"
             value={form.dryingTemperature}
             onChange={(e) => setForm({ ...form, dryingTemperature: e.target.value })}
-            placeholder={t("form.placeholder.dryingTemp")}
+            placeholder={parentPh("dryingTemperature") ?? t("form.placeholder.dryingTemp")}
           />
         </div>
         <div>
@@ -1723,7 +1766,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             min="0"
             value={form.dryingTime}
             onChange={(e) => setForm({ ...form, dryingTime: e.target.value })}
-            placeholder={t("form.placeholder.dryingTime")}
+            placeholder={parentPh("dryingTime") ?? t("form.placeholder.dryingTime")}
           />
         </div>
         <div>
@@ -1750,7 +1793,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             max="100"
             value={form.shoreHardnessA}
             onChange={(e) => setForm({ ...form, shoreHardnessA: e.target.value })}
-            placeholder={t("form.placeholder.shoreHardnessA")}
+            placeholder={parentPh("shoreHardnessA") ?? t("form.placeholder.shoreHardnessA")}
           />
         </div>
         <div>
@@ -1763,7 +1806,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             max="100"
             value={form.shoreHardnessD}
             onChange={(e) => setForm({ ...form, shoreHardnessD: e.target.value })}
-            placeholder={t("form.placeholder.shoreHardnessD")}
+            placeholder={parentPh("shoreHardnessD") ?? t("form.placeholder.shoreHardnessD")}
           />
         </div>
       </div>
@@ -2290,6 +2333,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             className={inputClass}
             value={form.diameter}
             onChange={(e) => setForm({ ...form, diameter: e.target.value })}
+            placeholder={parentPh("diameter")}
           />
         </div>
         <div>
@@ -2310,7 +2354,7 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           className={inputClass}
           value={form.tdsUrl}
           onChange={(e) => setForm({ ...form, tdsUrl: e.target.value })}
-          placeholder={t("form.placeholder.tdsUrl")}
+          placeholder={parentPh("tdsUrl") ?? t("form.placeholder.tdsUrl")}
         />
         {!form.tdsUrl && tdsSuggestions.length > 0 && (
           <div className="mt-1">

@@ -675,6 +675,8 @@
   "detail.edit": "Bearbeiten",
   "detail.clone": "Klonen",
   "detail.clone.title": "Dieses Filament als neue Farbvariante klonen",
+  "detail.createVariant": "Variante erstellen",
+  "detail.createVariant.title": "Eine neue Farbvariante anlegen, die die Einstellungen dieses Filaments erbt",
   "detail.variant": "Variante",
   "detail.colorCount": "{count} Farben",
   "detail.inherited": "vererbt",

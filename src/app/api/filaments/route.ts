@@ -54,6 +54,34 @@ export async function GET(request: NextRequest) {
           pipeline: [{ $project: { calibrations: 1 } }],
         },
       },
+      // Look up whether any non-deleted filament references this row as
+      // parent. A single match is enough — we only need a boolean — so the
+      // sub-pipeline caps at one document. Drives the cross-hatch "multi
+      // color" swatch on the inventory list (rendered by FilamentSwatch
+      // whenever isParent is true). Per project agreement: a filament is
+      // a parent ONLY when it currently has ≥1 variant — there is no
+      // explicit flag.
+      {
+        $lookup: {
+          from: "filaments",
+          let: { fid: "$_id" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$parentId", "$$fid"] },
+                    { $eq: ["$_deletedAt", null] },
+                  ],
+                },
+              },
+            },
+            { $limit: 1 },
+            { $project: { _id: 1 } },
+          ],
+          as: "_variantProbe",
+        },
+      },
       {
         $project: {
           name: 1,
@@ -88,6 +116,7 @@ export async function GET(request: NextRequest) {
               },
             ],
           },
+          hasVariants: { $gt: [{ $size: "$_variantProbe" }, 0] },
           spools: {
             $map: {
               input: { $ifNull: ["$spools", []] },
