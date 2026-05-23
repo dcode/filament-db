@@ -272,6 +272,36 @@ describe("PR A — API validation & semantics", () => {
       expect(body.error).toMatch(/_purged/);
     });
 
+    it("PUT caps notes at 2000 chars (mirrors POST guard, Codex P2 on PR #350)", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const huge = "x".repeat(5000);
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {
+          notes: huge,
+        }, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.notes.length).toBe(2000);
+    });
+
+    it("PUT caps jobLabel at 200 chars (mirrors POST guard)", async () => {
+      const job = await makeJob();
+      const { PUT } = await import("@/app/api/print-history/[id]/route");
+      const huge = "L".repeat(500);
+      const res = await PUT(
+        jsonReq(`http://localhost/api/print-history/${job._id}`, {
+          jobLabel: huge,
+        }, "PUT"),
+        { params: Promise.resolve({ id: job._id }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.jobLabel.length).toBe(200);
+    });
+
     it("PUT with empty body → 400", async () => {
       const job = await makeJob();
       const { PUT } = await import("@/app/api/print-history/[id]/route");

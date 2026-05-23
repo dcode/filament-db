@@ -85,13 +85,18 @@ export async function PUT(
       return errorResponse("Invalid id", 400);
     }
 
+    // GH #340 / Codex P2: mirror POST /api/print-history's size caps so a
+    // client can't bypass them by creating a normal entry and then PUT'ing
+    // a multi-megabyte string. POST caps jobLabel at 200, notes at 2000;
+    // without the same caps here the document can balloon and eventually
+    // trip MongoDB's 16 MiB doc limit as a 500 instead of a clean 400.
     const update: Record<string, unknown> = {};
     if (typeof body.jobLabel === "string") {
       const trimmed = body.jobLabel.trim();
       if (!trimmed) return errorResponse("jobLabel cannot be empty", 400);
-      update.jobLabel = trimmed;
+      update.jobLabel = trimmed.slice(0, 200);
     }
-    if (typeof body.notes === "string") update.notes = body.notes;
+    if (typeof body.notes === "string") update.notes = body.notes.slice(0, 2000);
     if (typeof body.startedAt === "string" || body.startedAt instanceof Date) {
       const d = new Date(body.startedAt as string);
       if (Number.isNaN(d.getTime())) return errorResponse("startedAt is not a valid date", 400);
