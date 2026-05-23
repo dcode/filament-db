@@ -1032,13 +1032,25 @@ async function initNfc(): Promise<void> {
 
 app.whenReady().then(async () => {
   diag("app ready");
+  // GH #344: React's RSC client uses `eval()` in dev mode for
+  // callstack reconstruction. `next.config.ts` already gates
+  // `'unsafe-eval'` on `NODE_ENV !== "production"`, but the Electron
+  // renderer applies the CSP below INSTEAD of (not in addition to) the
+  // web CSP — `next dev`'s header on its own is overwritten by the
+  // value we set here. So mirror the same dev-only gate, keyed on
+  // `app.isPackaged` (the source of truth for "this is a release
+  // build"). Production builds still get the tight, no-eval policy
+  // from #262.
+  const scriptSrc = app.isPackaged
+    ? "script-src 'self' 'unsafe-inline'"
+    : "script-src 'self' 'unsafe-inline' 'unsafe-eval'";
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
         ...details.responseHeaders,
-        // GH #262: `'unsafe-eval'` dropped — the production Electron build
-        // loads a compiled Next.js bundle that does not need runtime
-        // eval(), so allowing it only weakened CSP for no benefit.
+        // GH #262: `'unsafe-eval'` dropped from the PACKAGED build — the
+        // compiled Next.js bundle doesn't need runtime eval(); allowing
+        // it there only weakened CSP for no benefit.
         // `'unsafe-inline'` on script-src is still required because
         // Next.js streams the RSC payload via inline <script> tags and
         // the theme-init bootstrap is inline; migrating those to a
@@ -1047,7 +1059,7 @@ app.whenReady().then(async () => {
         // an embeddable vendor TDS document in an <iframe>; without it the
         // load falls back to default-src 'self' and is blocked even after
         // /api/embed-check confirms the vendor allows framing.
-        "Content-Security-Policy": ["default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:; frame-src https:;"],
+        "Content-Security-Policy": [`default-src 'self'; ${scriptSrc}; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws://localhost:* http://localhost:*; font-src 'self' data:; frame-src https:;`],
       },
     });
   });
