@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import CopyButton from "@/components/CopyButton";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
@@ -24,6 +25,7 @@ interface FilamentOption {
 export default function ShareManagementPage() {
   const { t } = useTranslation();
   const { toast } = useToast();
+  const confirm = useConfirm();
   const [catalogs, setCatalogs] = useState<SharedCatalog[]>([]);
   const [filaments, setFilaments] = useState<FilamentOption[]>([]);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -98,7 +100,7 @@ export default function ShareManagementPage() {
   };
 
   const handleUnpublish = async (slug: string) => {
-    if (!confirm(t("share.unpublishConfirm"))) return;
+    if (!(await confirm({ message: t("share.unpublishConfirm"), destructive: true, confirmLabel: t("common.delete") }))) return;
     const res = await fetch(`/api/share/${slug}`, { method: "DELETE" });
     if (!res.ok) {
       toast(t("share.unpublishError"), "error");

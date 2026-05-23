@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
 interface BedType {
@@ -21,6 +22,7 @@ export default function BedTypesPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { t } = useTranslation();
 
   const fetchBedTypes = useCallback(async (signal?: AbortSignal) => {
@@ -66,7 +68,7 @@ export default function BedTypesPage() {
   };
 
   const handleDelete = async (id: string, name: string) => {
-    if (!confirm(t("bedTypes.deleteConfirm", { name }))) return;
+    if (!(await confirm({ message: t("bedTypes.deleteConfirm", { name }), destructive: true, confirmLabel: t("common.delete") }))) return;
     const res = await fetch(`/api/bed-types/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const body = await res.json().catch(() => null);
@@ -79,7 +81,7 @@ export default function BedTypesPage() {
 
   const handleBulkDelete = async () => {
     const count = selected.size;
-    if (!confirm(t("bedTypes.bulkDeleteConfirm", { count }))) return;
+    if (!(await confirm({ message: t("bedTypes.bulkDeleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") }))) return;
     setBulkDeleting(true);
     let deleted = 0;
     const errors: string[] = [];

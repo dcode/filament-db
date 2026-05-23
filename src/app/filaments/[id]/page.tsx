@@ -7,6 +7,7 @@ import { useNfcContext } from "@/components/NfcProvider";
 import { generateOpenPrintTagBinary } from "@/lib/openprinttag";
 import { safeHttpUrl } from "@/lib/safeRenderUrl";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { useCurrency } from "@/hooks/useCurrency";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import CopyButton from "@/components/CopyButton";
@@ -99,6 +100,7 @@ export default function FilamentDetail() {
   const [nfcWriteSuccess, setNfcWriteSuccess] = useState<boolean | null>(null);
   const nfcWriteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { toast } = useToast();
+  const confirm = useConfirm();
 
   const [notFound, setNotFound] = useState(false);
 
@@ -502,7 +504,7 @@ export default function FilamentDetail() {
 
   const handleRemoveSpool = async (spoolId: string) => {
     if (!filament) return;
-    if (!confirm(t("detail.spool.confirmRemove"))) return;
+    if (!(await confirm({ message: t("detail.spool.confirmRemove"), destructive: true, confirmLabel: t("common.delete") }))) return;
     try {
       const res = await fetch(`/api/filaments/${filament._id}/spools/${spoolId}`, {
         method: "DELETE",

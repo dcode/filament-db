@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useToast } from "@/components/Toast";
+import { useConfirm } from "@/components/ConfirmDialog";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
 interface Nozzle {
@@ -34,6 +35,7 @@ export default function PrintersPage() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const { toast } = useToast();
+  const confirm = useConfirm();
   const { t } = useTranslation();
 
   const fetchPrinters = useCallback(async (signal?: AbortSignal) => {
@@ -79,7 +81,7 @@ export default function PrintersPage() {
   };
 
   const handleDelete = async (id: string, name: string) => {
-    if (!confirm(t("printers.deleteConfirm", { name }))) return;
+    if (!(await confirm({ message: t("printers.deleteConfirm", { name }), destructive: true, confirmLabel: t("common.delete") }))) return;
     const res = await fetch(`/api/printers/${id}`, { method: "DELETE" });
     if (!res.ok) {
       const body = await res.json().catch(() => null);
@@ -92,7 +94,7 @@ export default function PrintersPage() {
 
   const handleBulkDelete = async () => {
     const count = selected.size;
-    if (!confirm(t("printers.bulkDeleteConfirm", { count }))) return;
+    if (!(await confirm({ message: t("printers.bulkDeleteConfirm", { count }), destructive: true, confirmLabel: t("common.delete") }))) return;
     setBulkDeleting(true);
     let deleted = 0;
     const errors: string[] = [];
