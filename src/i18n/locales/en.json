@@ -668,6 +668,7 @@
   "common.delete": "Delete",
   "common.restore": "Restore",
   "common.ok": "OK",
+  "common.confirmDialog": "Confirm",
 
   "detail.back": "Back to list",
   "detail.backToFilaments": "Back to Filaments",

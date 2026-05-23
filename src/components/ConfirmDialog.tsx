@@ -73,6 +73,10 @@ export default function ConfirmProvider({ children }: { children: ReactNode }) {
   const { t } = useTranslation();
   const [pending, setPending] = useState<PendingState | null>(null);
   const confirmBtnRef = useRef<HTMLButtonElement>(null);
+  // Codex P2 round 2: needed for the Tab-key focus trap below — the
+  // confirm-button ref alone wasn't enough to cycle focus between the
+  // two buttons.
+  const cancelBtnRef = useRef<HTMLButtonElement>(null);
 
   const confirm = useCallback<ConfirmFn>((arg) => {
     const opts: ConfirmOptions =
@@ -95,14 +99,19 @@ export default function ConfirmProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // Focus the confirm button when the dialog opens; Esc cancels from
-  // anywhere. Codex P1 on PR #351: the previous document-level handler
-  // ALSO mapped Enter→decide(true) unconditionally, so a keyboard user
-  // who tabbed to Cancel and hit Enter still confirmed the destructive
-  // action (and `preventDefault` suppressed the focused button's normal
-  // activation). Enter is now left to the browser — autoFocus on the
-  // confirm button means Enter naturally triggers it when nothing else
-  // has been focused, and pressing Enter on a different focused button
-  // (e.g. Cancel) activates THAT button, which is what the user expects.
+  // anywhere. Codex P1 on PR #351 round 1: the previous document-level
+  // handler ALSO mapped Enter→decide(true) unconditionally, so a keyboard
+  // user who tabbed to Cancel and hit Enter still confirmed the
+  // destructive action (and `preventDefault` suppressed the focused
+  // button's normal activation). Enter is now left to the browser —
+  // autoFocus on the confirm button means Enter naturally triggers it
+  // when nothing else has been focused; on a different focused button
+  // (e.g. Cancel), pressing Enter activates THAT button.
+  //
+  // Codex P2 round 2: aria-modal="true" on its own doesn't trap Tab —
+  // after the two buttons, focus escapes to background page controls
+  // while the overlay is still up. Cycle Tab/Shift+Tab between the two
+  // buttons so focus stays inside the dialog until it's dismissed.
   useEffect(() => {
     if (!pending) return;
     confirmBtnRef.current?.focus();
@@ -110,6 +119,25 @@ export default function ConfirmProvider({ children }: { children: ReactNode }) {
       if (e.key === "Escape") {
         e.preventDefault();
         decide(false);
+        return;
+      }
+      if (e.key === "Tab") {
+        const focusables = [cancelBtnRef.current, confirmBtnRef.current].filter(
+          (el): el is HTMLButtonElement => el != null,
+        );
+        if (focusables.length === 0) return;
+        const active = document.activeElement as HTMLElement | null;
+        const idx = active ? focusables.indexOf(active as HTMLButtonElement) : -1;
+        // Focus is outside the modal — yank it back to the first focusable.
+        if (idx === -1) {
+          e.preventDefault();
+          focusables[0].focus();
+          return;
+        }
+        const dir = e.shiftKey ? -1 : 1;
+        const next = (idx + dir + focusables.length) % focusables.length;
+        e.preventDefault();
+        focusables[next].focus();
       }
     };
     document.addEventListener("keydown", onKey);
@@ -124,7 +152,14 @@ export default function ConfirmProvider({ children }: { children: ReactNode }) {
           className="fixed inset-0 z-[150] flex items-center justify-center bg-black/50"
           role="dialog"
           aria-modal="true"
+          // Codex P2 round 2: when the caller doesn't pass a `title`,
+          // `aria-labelledby` used to be `undefined` and there was no
+          // accessible name at all — screen readers announced an unnamed
+          // dialog. Fall back to a translated `aria-label` so the dialog
+          // always has a name. The message text is reachable separately
+          // via `aria-describedby`.
           aria-labelledby={pending.opts.title ? "confirm-title" : undefined}
+          aria-label={pending.opts.title ? undefined : t("common.confirmDialog")}
           aria-describedby="confirm-message"
           onClick={(e) => {
             // Outside-click = cancel
@@ -142,6 +177,7 @@ export default function ConfirmProvider({ children }: { children: ReactNode }) {
             </p>
             <div className="mt-5 flex justify-end gap-2">
               <button
+                ref={cancelBtnRef}
                 type="button"
                 onClick={() => decide(false)}
                 className="px-4 py-1.5 rounded border border-gray-300 dark:border-gray-600 text-sm hover:bg-gray-100 dark:hover:bg-gray-700"
