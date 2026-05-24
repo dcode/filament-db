@@ -751,8 +751,21 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         calibrations: Object.entries(calibrations)
           .filter(([, cal]) => Object.values(cal).some((v) => v !== ""))
           .filter(([key]) => {
-            const [, nozzleId] = key.split(":");
-            return form.compatibleNozzles.includes(nozzleId);
+            const [printerId, nozzleId] = key.split(":");
+            // Drop calibrations whose nozzle is no longer compatible.
+            if (!form.compatibleNozzles.includes(nozzleId)) return false;
+            // Drop printer-specific calibrations whose printer no longer
+            // owns this nozzle. The Calibrations UI hides those tabs (see
+            // `relevantPrinters` above), so the user has no way to view
+            // or clear them through the form — without this prune-on-save
+            // the entries would persist in the DB indefinitely as
+            // orphans. Codex round-1 P2 on PR #358. The "default" scope
+            // (printerId === "default") is always kept — it's the
+            // baseline that applies regardless of which printer has
+            // the nozzle at the moment.
+            if (printerId === "default") return true;
+            const nozzle = nozzles.find((n) => n._id === nozzleId);
+            return nozzle?.printers?.some((p) => p._id === printerId) ?? false;
           })
           .map(([key, cal]) => {
             const [printerId, nozzleId, bedTypeId] = key.split(":");
