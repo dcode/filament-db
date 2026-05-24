@@ -331,14 +331,24 @@ export default function Home() {
   }, [inventoryFilaments]);
 
   const visibleFilaments = useMemo(() => {
-    if (quickFilter === "all") return filaments;
-    return filaments.filter((f) => {
+    // The "all" view keeps parents in the dataset so the list renders
+    // them as grouping headers above their color variants. Every other
+    // filter resolves against `inventoryFilaments` instead — otherwise
+    // the chip badge (derived from `inventoryFilaments`, see
+    // `quickFilterCounts` above) disagrees with the rendered row count
+    // whenever a parent happens to match the filter criterion.
+    // `noCalibration` is the obvious case: a parent without
+    // calibrations would otherwise appear in the list even though the
+    // badge excluded it from the count. Codex round-1 P2 on PR #356.
+    const source = quickFilter === "all" ? filaments : inventoryFilaments;
+    if (quickFilter === "all") return source;
+    return source.filter((f) => {
       if (quickFilter === "lowStock") return isLowStock(f);
       if (quickFilter === "hasSpools") return (f.spools?.length ?? 0) > 0;
       if (quickFilter === "noCalibration") return !f.hasCalibrations;
       return true;
     });
-  }, [filaments, quickFilter]);
+  }, [filaments, inventoryFilaments, quickFilter]);
 
   const groupedFilaments = useMemo(() => {
     const parentMap = new Map<string, GroupedFilament>();
