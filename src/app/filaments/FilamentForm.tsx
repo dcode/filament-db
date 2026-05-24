@@ -532,6 +532,41 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
     () => JSON.stringify({ form, calibrations, presets }),
     [form, calibrations, presets],
   );
+
+  // Printer tabs in the Calibrations section should only offer printers
+  // that physically own at least one of this filament's compatible
+  // nozzles. A nozzle lives on exactly one printer at a time (GH #232,
+  // enforced by `findNozzleConflicts`), so selecting the Bambu 0.4mm
+  // nozzle as compatible should not invite a Core One calibration row
+  // — Core One literally doesn't have that nozzle installed and any
+  // calibration captured against (Core One, Bambu 0.4mm) is meaningless.
+  // Built from the `NozzleOption.printers` reverse-mapping already
+  // populated by `/api/nozzles?withPrinters` so this stays in sync with
+  // printer-form edits without an extra fetch.
+  const relevantPrinters = useMemo(() => {
+    if (form.compatibleNozzles.length === 0) return [];
+    const relevantIds = new Set<string>();
+    for (const nozzleId of form.compatibleNozzles) {
+      const nozzle = nozzles.find((n) => n._id === nozzleId);
+      if (!nozzle?.printers) continue;
+      for (const p of nozzle.printers) relevantIds.add(p._id);
+    }
+    return printers.filter((p) => relevantIds.has(p._id));
+  }, [printers, nozzles, form.compatibleNozzles]);
+
+  // Derive the effective selection rather than syncing it via an effect.
+  // When the user removes a compatible nozzle that was the only reason
+  // a printer tab existed, `selectedPrinter` may still hold that id —
+  // the tab is gone but the state lingers. Falling back to "default"
+  // here keeps rendering and the calibration-key lookup consistent
+  // without paying the extra-render cost of a setState-in-effect.
+  // Project rule `react-hooks/set-state-in-effect` (see CLAUDE.md)
+  // forbids the alternative.
+  const effectiveSelectedPrinter =
+    selectedPrinter === "default" ||
+    relevantPrinters.some((p) => p._id === selectedPrinter)
+      ? selectedPrinter
+      : "default";
   // The clean baseline. Seeded once with the initial snapshot via the
   // lazy useState initializer; re-pointed after a successful save.
   const [dirtyBaseline, setDirtyBaseline] = useState(dirtySnapshot);
@@ -716,8 +751,34 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
         calibrations: Object.entries(calibrations)
           .filter(([, cal]) => Object.values(cal).some((v) => v !== ""))
           .filter(([key]) => {
-            const [, nozzleId] = key.split(":");
-            return form.compatibleNozzles.includes(nozzleId);
+            const [printerId, nozzleId] = key.split(":");
+            // Drop calibrations whose nozzle is no longer compatible.
+            if (!form.compatibleNozzles.includes(nozzleId)) return false;
+            // Drop printer-specific calibrations whose printer no longer
+            // owns this nozzle. The Calibrations UI hides those tabs (see
+            // `relevantPrinters` above), so the user has no way to view
+            // or clear them through the form — without this prune-on-save
+            // the entries would persist in the DB indefinitely as
+            // orphans. Codex round-1 P2 on PR #358. The "default" scope
+            // (printerId === "default") is always kept — it's the
+            // baseline that applies regardless of which printer has
+            // the nozzle at the moment.
+            //
+            // FAIL-OPEN when ownership data isn't available (codex
+            // round-2 P1 on PR #358). The catalog is fetched async via
+            // `/api/nozzles`; if the user saves while it's still
+            // loading — or if the fetch failed — `nozzles` is empty,
+            // the lookup returns `undefined`, and a strict predicate
+            // would silently delete every valid per-printer
+            // calibration. Treat absence of ownership data as
+            // "uncertain" and keep the entry; only drop when we have
+            // positive evidence (catalog loaded, nozzle found,
+            // printers populated, and the printer is not in the
+            // installed list).
+            if (printerId === "default") return true;
+            const nozzle = nozzles.find((n) => n._id === nozzleId);
+            if (!nozzle || !nozzle.printers) return true;
+            return nozzle.printers.some((p) => p._id === printerId);
           })
           .map(([key, cal]) => {
             const [printerId, nozzleId, bedTypeId] = key.split(":");
@@ -2095,27 +2156,31 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             {printers.length > 0 && ` ${t("form.calibrationsPrinterHint")}`}
           </p>
 
-          {/* Printer selector tabs */}
-          {!printersLoading && printers.length > 0 && (
+          {/* Printer selector tabs — restricted to printers that
+              physically own at least one of this filament's compatible
+              nozzles. See the `relevantPrinters` memo above for the
+              rationale (a calibration against a printer that doesn't
+              have the nozzle is meaningless). */}
+          {!printersLoading && relevantPrinters.length > 0 && (
             <div className="flex flex-wrap gap-1 mb-4 border-b border-gray-200 dark:border-gray-700 pb-2">
               <button
                 type="button"
                 onClick={() => setSelectedPrinter("default")}
                 className={`px-3 py-1.5 text-sm rounded-t ${
-                  selectedPrinter === "default"
+                  effectiveSelectedPrinter === "default"
                     ? "bg-blue-600 text-white"
                     : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
                 }`}
               >
                 {t("form.defaultAnyPrinter")}
               </button>
-              {printers.map((p) => (
+              {relevantPrinters.map((p) => (
                 <button
                   key={p._id}
                   type="button"
                   onClick={() => setSelectedPrinter(p._id)}
                   className={`px-3 py-1.5 text-sm rounded-t ${
-                    selectedPrinter === p._id
+                    effectiveSelectedPrinter === p._id
                       ? "bg-blue-600 text-white"
                       : "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-700"
                   }`}
@@ -2158,23 +2223,34 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
           )}
 
           <div className="space-y-4">
-            {form.compatibleNozzles.map((nozzleId) => {
+            {form.compatibleNozzles
+              // Filter calibration rows to nozzles physically installed on
+              // the selected printer. The Default / Any-printer tab keeps
+              // every compatible nozzle so the user can capture the
+              // baseline calibration for each, regardless of which printer
+              // currently owns it.
+              .filter((nozzleId) => {
+                if (effectiveSelectedPrinter === "default") return true;
+                const nozzle = nozzles.find((n) => n._id === nozzleId);
+                return nozzle?.printers?.some((p) => p._id === effectiveSelectedPrinter) ?? false;
+              })
+              .map((nozzleId) => {
               const nozzle = nozzles.find((n) => n._id === nozzleId);
               if (!nozzle) return null;
-              const printerId = selectedPrinter === "default" ? null : selectedPrinter;
+              const printerId = effectiveSelectedPrinter === "default" ? null : effectiveSelectedPrinter;
               const bedTypeId = selectedBedType === "any" ? null : selectedBedType;
               const key = calKey(printerId, nozzleId, bedTypeId);
               const cal = calibrations[key] || emptyCalibrationEntry;
               // Show default values as placeholders when viewing printer/bed-specific calibrations
               const defaultKey = calKey(null, nozzleId, null);
-              const isOverride = selectedPrinter !== "default" || selectedBedType !== "any";
+              const isOverride = effectiveSelectedPrinter !== "default" || selectedBedType !== "any";
               const defaultCal = isOverride ? calibrations[defaultKey] : undefined;
               // The calibration scope — shown in the card header so it's clear
               // that switching the printer/bed tab stores values independently.
               const printerName =
-                selectedPrinter === "default"
+                effectiveSelectedPrinter === "default"
                   ? t("form.cal.scope.anyPrinter")
-                  : printers.find((p) => p._id === selectedPrinter)?.name ?? "";
+                  : printers.find((p) => p._id === effectiveSelectedPrinter)?.name ?? "";
               const bedName =
                 selectedBedType === "any"
                   ? t("form.cal.scope.anyBed")
