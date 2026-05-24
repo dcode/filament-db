@@ -95,9 +95,13 @@ export async function GET(
       }
     }
 
-    // If this is a parent, include its variants
+    // If this is a parent, include its variants.
+    // optTags is selected so the color-variants list on the parent's
+    // detail page can render finish-derived swatch textures + chips
+    // (matte/silk/sparkle/glow/translucent/transparent) without a second
+    // fetch per variant — see `src/lib/filamentFinish.ts`.
     const variants = await Filament.find({ parentId: id, _deletedAt: null })
-      .select("name color cost")
+      .select("name color cost optTags")
       .sort({ name: 1 })
       .lean();
 

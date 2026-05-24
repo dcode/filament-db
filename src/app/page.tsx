@@ -9,6 +9,8 @@ import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import SpoolCsvImportDialog from "@/components/SpoolCsvImportDialog";
 import QuickFilterChips, { type QuickFilter } from "@/components/QuickFilterChips";
 import FilamentSwatch from "@/components/FilamentSwatch";
+import FinishChip from "@/components/FinishChip";
+import { deriveFinish } from "@/lib/filamentFinish";
 import { useCurrency } from "@/hooks/useCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import type { FilamentSummary } from "@/types/filament";
@@ -496,6 +498,7 @@ export default function Home() {
           <FilamentSwatch
             color={f.color}
             isParent={!isVariant && f.hasVariants === true}
+            finish={deriveFinish(f.optTags)}
             size={isVariant ? 20 : 24}
             title={f.color}
           />
@@ -513,6 +516,10 @@ export default function Home() {
             {t("filaments.variant")}
           </span>
         )}
+        {(() => {
+          const finish = deriveFinish(f.optTags);
+          return finish ? <FinishChip finish={finish} className="ml-1.5" /> : null;
+        })()}
         {isLowStock(f) && (
           <span
             className="ml-1.5 text-[10px] text-red-700 dark:text-red-300 bg-red-100 dark:bg-red-900/40 px-1.5 py-0.5 rounded"
@@ -666,6 +673,7 @@ export default function Home() {
                   >
                     <FilamentSwatch
                       color={v.color}
+                      finish={deriveFinish(v.optTags)}
                       size={16}
                       className="hover:ring-2 hover:ring-blue-400 transition-all"
                       title={v.name}

@@ -1,0 +1,68 @@
+import { describe, it, expect } from "vitest";
+import { deriveFinish } from "@/lib/filamentFinish";
+
+/**
+ * deriveFinish() is the single source of truth for the texture treatment
+ * on `<FilamentSwatch>` and the label on `<FinishChip>`. Two invariants:
+ *
+ *   1. Only specific optTag IDs map to a finish. Anything else (abrasive,
+ *      water-soluble, food-safe, carbon-fiber, …) is ignored.
+ *   2. When multiple finishes coexist, a fixed priority order chooses
+ *      one: transparent → translucent → sparkle → silk → glow → matte.
+ */
+describe("deriveFinish", () => {
+  it("returns null for empty / nullish input", () => {
+    expect(deriveFinish(undefined)).toBeNull();
+    expect(deriveFinish(null)).toBeNull();
+    expect(deriveFinish([])).toBeNull();
+  });
+
+  it("returns null when no recognised finish tag is present", () => {
+    // 4=abrasive, 9=flexible, 31=carbonFiber, 49=recycled — none map to a finish.
+    expect(deriveFinish([4, 9, 31, 49])).toBeNull();
+  });
+
+  it("maps each individual finish tag to its canonical string", () => {
+    expect(deriveFinish([16])).toBe("matte");
+    expect(deriveFinish([17])).toBe("silk");
+    expect(deriveFinish([22])).toBe("sparkle");
+    expect(deriveFinish([24])).toBe("glow");
+    expect(deriveFinish([3])).toBe("translucent");
+    expect(deriveFinish([2])).toBe("transparent");
+  });
+
+  it("ignores non-finish tags around a real finish tag", () => {
+    expect(deriveFinish([4, 16, 71])).toBe("matte"); // matte sandwiched between abrasive + highSpeed
+    expect(deriveFinish([22, 9])).toBe("sparkle");
+  });
+
+  it("transparent beats every other finish", () => {
+    expect(deriveFinish([2, 3, 16, 17, 22, 24])).toBe("transparent");
+  });
+
+  it("translucent beats silk/sparkle/glow/matte when transparent is absent", () => {
+    expect(deriveFinish([3, 22])).toBe("translucent");
+    expect(deriveFinish([3, 17])).toBe("translucent");
+    expect(deriveFinish([3, 16, 24])).toBe("translucent");
+  });
+
+  it("sparkle outranks silk/glow/matte", () => {
+    // Realistic case: sparkle PLA that's also marketed as 'matte sparkle'
+    expect(deriveFinish([16, 22])).toBe("sparkle");
+    // Glow + sparkle (rare but possible)
+    expect(deriveFinish([22, 24])).toBe("sparkle");
+  });
+
+  it("silk outranks glow + matte", () => {
+    expect(deriveFinish([16, 17, 24])).toBe("silk");
+  });
+
+  it("glow outranks matte", () => {
+    expect(deriveFinish([16, 24])).toBe("glow");
+  });
+
+  it("matte is the lowest-priority finish", () => {
+    // Only matte present — it wins by default.
+    expect(deriveFinish([16, 4, 13])).toBe("matte");
+  });
+});

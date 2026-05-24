@@ -96,6 +96,12 @@ export async function GET(request: NextRequest) {
           totalWeight: 1,
           lowStockThreshold: 1,
           tdsUrl: 1,
+          // optTags rides the list payload so the inventory row can
+          // render the finish-derived swatch texture + chip beside the
+          // name without hitting /api/filaments/{id} for every row. It's
+          // a short numeric array; the cost vs. the alternative
+          // (per-row detail fetch) is negligible.
+          optTags: 1,
           "temperatures.nozzle": 1,
           "temperatures.bed": 1,
           hasCalibrations: {

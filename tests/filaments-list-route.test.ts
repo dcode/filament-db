@@ -223,6 +223,44 @@ describe("GET /api/filaments — projection to FilamentSummary", () => {
     expect(cal).not.toHaveProperty("calibrations");
   });
 
+  it("surfaces optTags in the list projection so the row can derive finish without a detail fetch", async () => {
+    // FilamentSwatch + FinishChip read deriveFinish(optTags) to render
+    // the texture treatment + chip beside the name. Without optTags in
+    // the list projection every row would need a follow-up GET to learn
+    // its finish — defeating the purpose of the aggregation.
+    const Filament = (await import("@/models/Filament")).default;
+    await Filament.create({
+      name: "Matte White",
+      vendor: "Test",
+      type: "PLA",
+      color: "#f5f5f5",
+      optTags: [16], // matte
+    });
+    await Filament.create({
+      name: "Plain Red",
+      vendor: "Test",
+      type: "PLA",
+      color: "#ef4444",
+      optTags: [], // no finish-relevant tags
+    });
+    await Filament.create({
+      name: "Sparkle Black",
+      vendor: "Test",
+      type: "PLA",
+      color: "#0a0a0a",
+      optTags: [22, 4], // sparkle + abrasive (abrasive shouldn't shadow sparkle)
+    });
+
+    const res = await listFilaments(
+      new NextRequest("http://localhost/api/filaments?vendor=Test"),
+    );
+    const body = await res.json();
+    const find = (name: string) => body.find((f: { name: string }) => f.name === name);
+    expect(find("Matte White").optTags).toEqual([16]);
+    expect(find("Plain Red").optTags).toEqual([]);
+    expect(find("Sparkle Black").optTags).toEqual([22, 4]);
+  });
+
   it("includes tdsUrl in the projection so FilamentForm vendor suggestions still work", async () => {
     // FilamentForm calls /api/filaments?vendor=... and reads tdsUrl off
     // each row to populate vendor-keyed TDS suggestions. Codex flagged

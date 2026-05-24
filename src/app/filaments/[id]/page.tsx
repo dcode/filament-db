@@ -12,6 +12,8 @@ import { useCurrency } from "@/hooks/useCurrency";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import CopyButton from "@/components/CopyButton";
 import FilamentSwatch from "@/components/FilamentSwatch";
+import FinishChip from "@/components/FinishChip";
+import { deriveFinish } from "@/lib/filamentFinish";
 import type { FilamentDetail, FilamentCalibration } from "@/types/filament";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
@@ -567,6 +569,11 @@ export default function FilamentDetail() {
   const inherited = new Set(filament._inherited || []);
   const isVariant = !!filament.parentId;
   const isParent = (filament._variants?.length ?? 0) > 0;
+  // Parents are finish-agnostic — only variants/standalones carry a
+  // texture treatment + chip. resolveFilament() doesn't inherit optTags,
+  // so a variant only shows a finish when its own optTags include one
+  // of the FINISH_TAG_IDS.
+  const finish = !isParent ? deriveFinish(filament.optTags) : null;
 
   return (
     <main className="max-w-4xl mx-auto px-4 py-8">
@@ -580,6 +587,7 @@ export default function FilamentDetail() {
         <FilamentSwatch
           color={filament.color}
           isParent={isParent}
+          finish={finish}
           size={40}
           className="border-2"
           ariaLabel={isParent ? "Multi-color parent" : `Color swatch: ${filament.color}`}
@@ -604,6 +612,7 @@ export default function FilamentDetail() {
                 {t("detail.colorCount", { count: filament._variants!.length })}
               </span>
             )}
+            {finish && <FinishChip finish={finish} size="sm" className="ml-2" />}
           </p>
         </div>
         <div className="ml-auto flex items-center gap-2 flex-shrink-0 flex-wrap justify-end">
@@ -751,23 +760,28 @@ export default function FilamentDetail() {
         <div className="mb-6">
           <h2 className="text-sm font-medium text-gray-500 mb-2">{t("detail.section.colorVariants")}</h2>
           <div className="flex flex-wrap gap-2">
-            {filament._variants.map((v) => (
-              <Link
-                key={v._id}
-                href={`/filaments/${v._id}`}
-                className="flex items-center gap-2 px-3 py-2 bg-gray-100 dark:bg-gray-800 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
-              >
-                <FilamentSwatch
-                  color={v.color}
-                  size={20}
-                  ariaLabel={`Color swatch: ${v.color}`}
-                />
-                <span className="text-sm">{v.name}</span>
-                {v.cost != null && (
-                  <span className="text-xs text-gray-500">{currencySymbol}{v.cost.toFixed(2)}</span>
-                )}
-              </Link>
-            ))}
+            {filament._variants.map((v) => {
+              const vFinish = deriveFinish(v.optTags);
+              return (
+                <Link
+                  key={v._id}
+                  href={`/filaments/${v._id}`}
+                  className="flex items-center gap-2 px-3 py-2 bg-gray-100 dark:bg-gray-800 rounded-lg hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
+                >
+                  <FilamentSwatch
+                    color={v.color}
+                    finish={vFinish}
+                    size={20}
+                    ariaLabel={`Color swatch: ${v.color}`}
+                  />
+                  <span className="text-sm">{v.name}</span>
+                  {vFinish && <FinishChip finish={vFinish} />}
+                  {v.cost != null && (
+                    <span className="text-xs text-gray-500">{currencySymbol}{v.cost.toFixed(2)}</span>
+                  )}
+                </Link>
+              );
+            })}
           </div>
         </div>
       )}
