@@ -298,24 +298,37 @@ export default function Home() {
     });
   }, [fetchFilaments]);
 
+  // Inventory aggregates exclude parent filaments. Parents don't
+  // represent a physical roll on the shelf — they're a template for
+  // their color variants (the variants own the spools, calibrations,
+  // and remaining weight). Counting them in totals double-counted what
+  // the user actually has and made "By Type" / "By Vendor" disagree
+  // with the headline number. Auto-detected via the `hasVariants` flag
+  // shipped by `/api/filaments`; parents collapse out of every count
+  // here but still render in the list as grouping headers.
+  const inventoryFilaments = useMemo(
+    () => filaments.filter((f) => !f.hasVariants),
+    [filaments],
+  );
+
   // Group filaments: parents with their variants, standalone filaments as-is
   // Client-side quick filter (low stock / has spools / missing calibrations).
   // Applied before grouping so a parent whose variants are filtered out is
   // still shown standalone if it matches itself.
   const quickFilterCounts = useMemo(() => {
     const counts: Record<QuickFilter, number> = {
-      all: filaments.length,
+      all: inventoryFilaments.length,
       lowStock: 0,
       hasSpools: 0,
       noCalibration: 0,
     };
-    for (const f of filaments) {
+    for (const f of inventoryFilaments) {
       if (isLowStock(f)) counts.lowStock++;
       if ((f.spools?.length ?? 0) > 0) counts.hasSpools++;
       if (!f.hasCalibrations) counts.noCalibration++;
     }
     return counts;
-  }, [filaments]);
+  }, [inventoryFilaments]);
 
   const visibleFilaments = useMemo(() => {
     if (quickFilter === "all") return filaments;
@@ -712,7 +725,7 @@ export default function Home() {
           className="text-sm text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-3"
         >
           <span>{showStats ? "▾" : "▸"}</span>
-          <span>{t("filaments.stats.total", { count: filaments.length })}</span>
+          <span>{t("filaments.stats.total", { count: inventoryFilaments.length })}</span>
           <span className="text-gray-600">·</span>
           <span>{t("filaments.stats.typeCount", { count: types.length })}</span>
           <span className="text-gray-600">·</span>
@@ -723,7 +736,7 @@ export default function Home() {
           just renders the expanded grid when the user opens it. */}
       {filaments.length > 0 && showStats && (
         <div className="mb-4">
-          <FilamentStats filaments={filaments} />
+          <FilamentStats filaments={inventoryFilaments} />
         </div>
       )}
 
