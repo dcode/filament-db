@@ -350,10 +350,45 @@ export default function Home() {
     });
   }, [filaments, inventoryFilaments, quickFilter]);
 
+  // Parent lookup built from the *full* filament list so variant
+  // enrichment (inherited nozzle/bed/cost/density/spool/net) works
+  // even when the parent has been filtered out of `visibleFilaments`.
+  // Codex round-2 P2 on PR #356 — previously the inheritance merge in
+  // `groupedFilaments` only ran when a parent row was present in
+  // `visibleFilaments`, so on filtered views (e.g. `noCalibration`)
+  // orphaned variants rendered with `—` for fields they should
+  // inherit from their parent.
+  const parentLookup = useMemo(() => {
+    const map = new Map<string, Filament>();
+    for (const f of filaments) {
+      if (!f.parentId) map.set(f._id, f);
+    }
+    return map;
+  }, [filaments]);
+
   const groupedFilaments = useMemo(() => {
     const parentMap = new Map<string, GroupedFilament>();
     const standalone: Filament[] = [];
     const variantsByParent = new Map<string, Filament[]>();
+
+    // Apply parent-field fallbacks to a variant. Used both for the
+    // grouped-under-parent and orphaned-variant paths so the same
+    // inheritance is visible regardless of whether the parent row
+    // happens to be in the current filter result set.
+    const enrichVariant = (v: Filament, parent: Filament | undefined): Filament => {
+      if (!parent) return v;
+      return {
+        ...v,
+        temperatures: {
+          nozzle: v.temperatures?.nozzle ?? parent.temperatures?.nozzle,
+          bed: v.temperatures?.bed ?? parent.temperatures?.bed,
+        },
+        cost: v.cost ?? parent.cost,
+        density: v.density ?? parent.density,
+        spoolWeight: v.spoolWeight ?? parent.spoolWeight,
+        netFilamentWeight: v.netFilamentWeight ?? parent.netFilamentWeight,
+      };
+    };
 
     // First pass: collect variants
     for (const f of visibleFilaments) {
@@ -367,17 +402,9 @@ export default function Home() {
     // Second pass: build groups, resolving inherited fields for variants
     for (const f of visibleFilaments) {
       if (f.parentId) continue; // variants are handled by their parent
-      const variants = (variantsByParent.get(f._id) || []).map((v) => ({
-        ...v,
-        temperatures: {
-          nozzle: v.temperatures?.nozzle ?? f.temperatures?.nozzle,
-          bed: v.temperatures?.bed ?? f.temperatures?.bed,
-        },
-        cost: v.cost ?? f.cost,
-        density: v.density ?? f.density,
-        spoolWeight: v.spoolWeight ?? f.spoolWeight,
-        netFilamentWeight: v.netFilamentWeight ?? f.netFilamentWeight,
-      }));
+      const variants = (variantsByParent.get(f._id) || []).map((v) =>
+        enrichVariant(v, f),
+      );
       if (variants.length > 0) {
         parentMap.set(f._id, { parent: f, variants });
       } else {
@@ -385,11 +412,14 @@ export default function Home() {
       }
     }
 
-    // Also include orphaned variants (parent not in current filter results)
+    // Also include orphaned variants (parent not in current filter
+    // results). Enrich from `parentLookup` so the inheritance still
+    // applies — the parent existing-but-filtered-out shouldn't change
+    // what the variant renders.
     for (const [parentId, variants] of variantsByParent) {
       if (!parentMap.has(parentId)) {
-        // Parent wasn't in the results — show variants as standalone
-        standalone.push(...variants);
+        const parent = parentLookup.get(parentId);
+        standalone.push(...variants.map((v) => enrichVariant(v, parent)));
       }
     }
 
@@ -407,7 +437,7 @@ export default function Home() {
     });
 
     return all;
-  }, [visibleFilaments, sortKey, sortDir]);
+  }, [visibleFilaments, parentLookup, sortKey, sortDir]);
 
   const toggleExpanded = (parentId: string) => {
     setExpandedParents((prev) => {
