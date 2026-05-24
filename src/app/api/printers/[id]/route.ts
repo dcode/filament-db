@@ -3,7 +3,7 @@ import dbConnect from "@/lib/mongodb";
 import Printer from "@/models/Printer";
 import Filament from "@/models/Filament";
 import Nozzle from "@/models/Nozzle";
-import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 import { findNozzleConflicts } from "@/lib/nozzleConflicts";
 import { clearSpoolsFromOtherPrinters } from "@/lib/spoolSlots";
 import BedType from "@/models/BedType";
@@ -121,6 +121,8 @@ export async function PUT(
 
     return NextResponse.json(printer);
   } catch (err) {
+    const dupResponse = handleDuplicateKeyError(err, "printer");
+    if (dupResponse) return dupResponse;
     return errorResponseFromCaught(err, "Failed to update printer");
   }
 }

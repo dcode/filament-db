@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useNfcContext } from "@/components/NfcProvider";
 import { generateOpenPrintTagBinary } from "@/lib/openprinttag";
@@ -47,6 +47,7 @@ export default function FilamentDetail() {
   const { t } = useTranslation();
   const { symbol: currencySymbol } = useCurrency();
   const params = useParams();
+  const router = useRouter();
   const [filament, setFilament] = useState<Filament | null>(null);
   const [showAllSettings, setShowAllSettings] = useState(false);
   /**
@@ -531,6 +532,42 @@ export default function FilamentDetail() {
     }
   };
 
+  /**
+   * Soft-delete this filament — moves it to the trash, where the user
+   * can either restore it or permanently purge it via `/trash`. Until
+   * this PR there was no UI affordance to do this from the detail page;
+   * variants in particular were hard to find since the inventory-list
+   * bulk-delete required first expanding the parent to surface the
+   * variant's checkbox. Now the action lives right next to Edit.
+   *
+   * Parents-with-live-variants are gated server-side (the API returns
+   * 400 with a clear message). We don't pre-check that here — the
+   * button is *enabled* even for parents so the user gets the API's
+   * specific error if they try, which is more helpful than silently
+   * disabling the button without saying why.
+   */
+  const handleDeleteFilament = async () => {
+    if (!filament) return;
+    const ok = await confirm({
+      message: t("detail.delete.confirm", { name: filament.name }),
+      destructive: true,
+      confirmLabel: t("common.delete"),
+    });
+    if (!ok) return;
+    try {
+      const res = await fetch(`/api/filaments/${filament._id}`, { method: "DELETE" });
+      if (res.ok) {
+        toast(t("detail.delete.success", { name: filament.name }));
+        router.push("/");
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      toast(body?.error || t("detail.delete.failed"), "error");
+    } catch {
+      toast(t("detail.delete.failed"), "error");
+    }
+  };
+
   const handleMigrateToSpools = async () => {
     if (!filament || filament.totalWeight == null) return;
     try {
@@ -730,6 +767,17 @@ export default function FilamentDetail() {
           >
             {t("detail.edit")}
           </Link>
+          <button
+            type="button"
+            onClick={handleDeleteFilament}
+            className="px-4 py-2 bg-red-600 text-white rounded hover:bg-red-700 text-sm inline-flex items-center gap-1.5"
+            title={t("detail.delete.title")}
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6M1 7h22M9 7V4a1 1 0 011-1h4a1 1 0 011 1v3" />
+            </svg>
+            {t("detail.delete")}
+          </button>
         </div>
       </div>
 

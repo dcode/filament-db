@@ -3,7 +3,7 @@ import dbConnect from "@/lib/mongodb";
 import Nozzle from "@/models/Nozzle";
 import Filament from "@/models/Filament";
 import Printer from "@/models/Printer";
-import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function GET(
   _request: NextRequest,
@@ -91,6 +91,8 @@ export async function PUT(
 
     return NextResponse.json(nozzle);
   } catch (err) {
+    const dupResponse = handleDuplicateKeyError(err, "nozzle");
+    if (dupResponse) return dupResponse;
     return errorResponseFromCaught(err, "Failed to update nozzle");
   }
 }

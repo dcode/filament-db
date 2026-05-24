@@ -108,4 +108,37 @@ describe("PUT /api/filaments/[id] — client-input rejections return 400", () =>
     const res = await putFilament(req, { params: Promise.resolve({ id: "notavalidobjectid" }) });
     expect(res.status).toBe(400);
   });
+
+  it("PUT renaming to an existing name surfaces a specific 409 instead of the generic 'Failed to update filament' 500 (PR #357)", async () => {
+    // User-reported: renaming a filament to a name already in use only
+    // showed "Failed to update filament" — the duplicate-key error
+    // wasn't being unwrapped, so the toast couldn't tell the user
+    // *why* the save failed. The POST handler always called
+    // handleDuplicateKeyError; the PUT didn't. Lock down the symmetry.
+    //
+    // The unique-on-non-deleted-name index is declared on the schema
+    // but not auto-built by the in-memory MongoDB for these tests
+    // (`tests/setup.ts` wipes `mongoose.models` between tests, so the
+    // dbConnect-side `syncIndexes` migration doesn't run). Force-build
+    // it here so the duplicate-key error actually fires.
+    await Filament.syncIndexes();
+    await Filament.create({ name: "Galaxy Black", vendor: "Test", type: "PLA" });
+    const second = await Filament.create({ name: "Spectrum Orange", vendor: "Test", type: "PLA" });
+
+    const req = new NextRequest(`http://localhost/api/filaments/${second._id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "Galaxy Black" }),
+    });
+    const res = await putFilament(req, { params: Promise.resolve({ id: String(second._id) }) });
+
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toMatch(/already exists/i);
+    expect(body.error).toMatch(/Galaxy Black/);
+    // The 5xx-fallback shape (`{ error, detail }`) must NOT be used —
+    // monitoring branches on shape, and a clean 409 should look
+    // distinct from a server fault.
+    expect(body.detail).toBeUndefined();
+  });
 });
