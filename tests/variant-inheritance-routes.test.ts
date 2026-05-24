@@ -238,3 +238,74 @@ describe("GH #223 — variant inheritance in slicer + analytics + restore routes
     expect(variantNow).not.toBeNull();
   });
 });
+
+/**
+ * Codex round-1 P2 on PR #353 — same class of bug as the cases above.
+ * The detail endpoint's color-variants subquery used to project the
+ * variant's own optTags only, so a variant with an empty optTags array
+ * whose parent is matte rendered plain on the parent's color-variants
+ * list (and on the inventory list) while its own detail page rendered
+ * matte (because that path goes through resolveFilament). Lock down the
+ * effective-optTags merge.
+ */
+describe("PR #353 — parent's color-variants list inherits optTags via the detail-endpoint variants subquery", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let GET: any;
+
+  beforeEach(async () => {
+    // The detail route .populate()s compatibleNozzles + calibrations.nozzle/
+    // printer/bedType. setup.ts wipes mongoose.models between tests so we
+    // re-register everything the populate touches — same pattern as
+    // tests/api-route-correctness.test.ts.
+    const filMod = await import("@/models/Filament");
+    const prtMod = await import("@/models/Printer");
+    const nozMod = await import("@/models/Nozzle");
+    const bedMod = await import("@/models/BedType");
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    if (!mongoose.models.BedType) mongoose.model("BedType", bedMod.default.schema);
+    Filament = mongoose.models.Filament;
+    GET = (await import("@/app/api/filaments/[id]/route")).GET;
+  });
+
+  it("variants with empty optTags inherit the parent's optTags in _variants", async () => {
+    const parent = await Filament.create({
+      name: "Matte Parent",
+      vendor: "Test",
+      type: "PLA",
+      color: "#888888",
+      optTags: [16], // matte
+    });
+    await Filament.create({
+      name: "Inheriting Variant",
+      vendor: "Test",
+      type: "PLA",
+      color: "#f0f0f0",
+      parentId: parent._id,
+      // optTags omitted — must inherit [16]
+    });
+    await Filament.create({
+      name: "Override Variant",
+      vendor: "Test",
+      type: "PLA",
+      color: "#0a0a0a",
+      parentId: parent._id,
+      optTags: [22], // sparkle — explicit override wins
+    });
+
+    const res = await GET(
+      new NextRequest(`http://localhost/api/filaments/${parent._id}`),
+      { params: Promise.resolve({ id: String(parent._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    const variants: Array<{ name: string; optTags: number[] }> = body._variants;
+    const inheriting = variants.find((v) => v.name === "Inheriting Variant");
+    const override = variants.find((v) => v.name === "Override Variant");
+    expect(inheriting?.optTags).toEqual([16]);
+    expect(override?.optTags).toEqual([22]);
+  });
+});

@@ -100,10 +100,24 @@ export async function GET(
     // detail page can render finish-derived swatch textures + chips
     // (matte/silk/sparkle/glow/translucent/transparent) without a second
     // fetch per variant — see `src/lib/filamentFinish.ts`.
-    const variants = await Filament.find({ parentId: id, _deletedAt: null })
+    //
+    // We project the *effective* optTags, not the variant's own array.
+    // resolveFilament inherits optTags (and the other array fields) from
+    // the parent when the variant's array is empty, so a variant whose
+    // own optTags is `[]` should still render with the parent's finish
+    // in the parent's color-variants list. Without this merge, the chip
+    // is missing here even though clicking through to the variant's
+    // detail page shows it (that path goes through resolveFilament).
+    // Codex round-1 P2 on PR #353.
+    const rawVariants = await Filament.find({ parentId: id, _deletedAt: null })
       .select("name color cost optTags")
       .sort({ name: 1 })
       .lean();
+    const parentOptTags = (filament.optTags ?? []) as number[];
+    const variants = rawVariants.map((v) => ({
+      ...v,
+      optTags: v.optTags && v.optTags.length > 0 ? v.optTags : parentOptTags,
+    }));
 
     if (parentSummary) {
       return NextResponse.json({

@@ -51,7 +51,7 @@ export async function GET(request: NextRequest) {
           localField: "parentId",
           foreignField: "_id",
           as: "_parent",
-          pipeline: [{ $project: { calibrations: 1 } }],
+          pipeline: [{ $project: { calibrations: 1, optTags: 1 } }],
         },
       },
       // Look up whether any non-deleted filament references this row as
@@ -98,10 +98,24 @@ export async function GET(request: NextRequest) {
           tdsUrl: 1,
           // optTags rides the list payload so the inventory row can
           // render the finish-derived swatch texture + chip beside the
-          // name without hitting /api/filaments/{id} for every row. It's
-          // a short numeric array; the cost vs. the alternative
-          // (per-row detail fetch) is negligible.
-          optTags: 1,
+          // name without hitting /api/filaments/{id} for every row.
+          //
+          // We project the *effective* optTags rather than the variant's
+          // own array — variants with an empty optTags inherit from the
+          // parent per resolveFilament's array-field rule. Without this
+          // merge, a variant whose parent is matte but whose own optTags
+          // is `[]` would render plain on the list and on the parent's
+          // color-variants chips, even though clicking through to the
+          // variant's detail page shows it as matte (because that path
+          // does go through resolveFilament). Codex round-1 P2 on PR
+          // #353.
+          optTags: {
+            $cond: [
+              { $gt: [{ $size: { $ifNull: ["$optTags", []] } }, 0] },
+              "$optTags",
+              { $ifNull: [{ $arrayElemAt: ["$_parent.optTags", 0] }, []] },
+            ],
+          },
           "temperatures.nozzle": 1,
           "temperatures.bed": 1,
           hasCalibrations: {
