@@ -901,6 +901,8 @@
   "form.type": "Typ",
   "form.color": "Farbe",
   "form.colorName": "Farbname",
+  "form.colorName.section.db": "Aus deinen Filamenten",
+  "form.colorName.section.css": "Standardfarben",
   "form.cost": "Preis ({symbol}/kg)",
   "form.density": "Dichte (g/cm³)",
   "form.diameter": "Durchmesser (mm)",

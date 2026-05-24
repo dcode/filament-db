@@ -901,6 +901,8 @@
   "form.type": "Type",
   "form.color": "Color",
   "form.colorName": "Color Name",
+  "form.colorName.section.db": "From your filaments",
+  "form.colorName.section.css": "Standard colors",
   "form.cost": "Cost ({symbol}/kg)",
   "form.density": "Density (g/cm³)",
   "form.diameter": "Diameter (mm)",

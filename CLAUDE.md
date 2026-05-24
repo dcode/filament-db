@@ -168,6 +168,25 @@ scripts/            CLI tools (read-nfc-tag, seed import, backfill)
 
 - **Spool printer-slot assignment (#242)**: a spool can be assigned to a printer AMS/MMU slot directly from the spool card, distinct from its Location — Location is the spool's semi-permanent "home", the slot is its transient position while loaded in a printer. `src/lib/spoolSlots.ts` is the enforcement point: `findSpoolSlot` (reverse lookup over `Printer.amsSlots[].spoolId`), `assignSpoolToSlot` (clears the spool from every slot, then sets the target — a spool occupies at most one slot, and bad data with a spool in two slots self-heals), `clearSpoolsFromOtherPrinters` (post-save reconciliation wired into the printer PUT/POST so the one-slot invariant holds no matter which form wrote it). New endpoint `GET/PUT/DELETE /api/spools/[spoolId]/assignment` writes only `Printer.amsSlots[].spoolId`, never the spool's `locationId`; PUT rejects retired spools (out of inventory, not loadable). The spool DELETE handler also clears the slot so a deleted spool can't linger. Legacy printer documents predating the `amsSlots` field come back from lean queries without it — all iteration sites guard the missing array. **Hybrid-sync limitation**: `amsSlots[].spoolId` is wiped on cross-side sync remap (spool subdocuments have no stable cross-side id), so slot assignments are reliable only in single-database deployments — the spool card surfaces this caveat.
 
+## Color-name typeahead → hex
+
+`FilamentForm`'s "Color Name" input is a combobox: typing populates a dropdown of suggestions, picking one sets BOTH the color name and the hex color picker. Two suggestion sources, in priority order:
+
+- **From your filaments** — the user's previously-saved `(colorName, color)` pairs, served by a new `GET /api/filaments/colors` endpoint that runs `$group` over non-deleted filaments. Multiple filaments with the same name+hex collapse to one row; different hexes under the same name (e.g. three brands of "Galaxy Black" with slightly different shades) stay separate so the user can pick the right shade.
+- **Standard colors** — the 148 CSS Color Module Level 4 named colors plus the gray/grey + cyan/aqua + fuchsia/magenta + slategray/slategrey synonyms. `src/lib/cssNamedColors.ts` is the source of truth.
+
+Lookup helpers in `src/lib/cssNamedColors.ts`:
+- `lookupCssNamedColor(name)` — case- and whitespace-insensitive. Returns the canonical uppercase hex (`#000080` for any of `navy`, `Navy`, `  NAVY  `) or `null`.
+- `filterColorSuggestions(dbSuggestions, query, maxResults?)` — substring-matches the query against both sources, dedupes by `(lowercase name, uppercase hex)` (DB wins ties), and orders DB entries above CSS entries. Exported because the combobox can't unit-test through it.
+
+Commit-on-write rules in the combobox:
+- **Click / Enter on a dropdown row** sets both `colorName` and `color`.
+- **Tab-out / blur with an exact CSS named-color match** updates the hex even without opening the dropdown — covers users who already know "navy" and just want to type it.
+- **DB-side blur lookup is intentionally NOT auto-applied** — the same name can have multiple legitimate hexes in the DB; the user has to pick which one they meant via the dropdown.
+- **Plain typing never overwrites the hex** — only an explicit commit (click/Enter/exact-CSS-on-blur) changes the color picker, so the user's free-text "I'm naming this whatever I want" path stays uninterrupted.
+
+Translation keys: `form.colorName.section.db` ("From your filaments" / "Aus deinen Filamenten") and `form.colorName.section.css` ("Standard colors" / "Standardfarben") in both `en.json` and `de.json`.
+
 ## Finish indicator on the swatch + name chip
 
 When two filaments share the same color but a different finish (the canonical case: white plain / matte / silk), the inventory list, detail page header, and the color-variants list under a parent now distinguish them visually:
