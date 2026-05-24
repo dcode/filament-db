@@ -8,6 +8,11 @@ export interface FilamentVariant {
   name: string;
   color: string;
   cost: number | null;
+  /** Tag IDs that drive the finish-derived swatch texture + chip when
+   * this variant is rendered under its parent on the detail page. The
+   * parent-detail variants projection in `/api/filaments/{id}` includes
+   * this for the same reason `FilamentSummary` carries it on list rows. */
+  optTags?: number[];
 }
 
 export interface FilamentNozzle {
@@ -161,4 +166,9 @@ export interface FilamentSummary {
    * parent. Drives the cross-hatch swatch render: parents have no
    * canonical color of their own. Auto-detected — no schema flag. */
   hasVariants?: boolean;
+  /** Numeric optTag IDs ridden through the list aggregation so the row
+   * can render its finish-derived swatch texture (matte/silk/sparkle/
+   * glow/translucent/transparent) and the matching chip beside the
+   * name. See `src/lib/filamentFinish.ts` for the tag-id → finish map. */
+  optTags?: number[];
 }

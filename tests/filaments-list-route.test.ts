@@ -223,6 +223,87 @@ describe("GET /api/filaments — projection to FilamentSummary", () => {
     expect(cal).not.toHaveProperty("calibrations");
   });
 
+  it("variants with empty optTags inherit the parent's optTags in the list projection (matches resolveFilament)", async () => {
+    // Codex round-1 P2 on PR #353. Variants inherit array fields from
+    // the parent when their own array is empty (resolveFilament's
+    // INHERIT-WHEN-EMPTY rule for compatibleNozzles / optTags /
+    // calibrations / presets). The list aggregation must mirror that
+    // rule, or a matte parent's variant with `optTags: []` would render
+    // plain on the inventory list while its detail page (which goes
+    // through resolveFilament) correctly renders matte.
+    const Filament = (await import("@/models/Filament")).default;
+    const parent = await Filament.create({
+      name: "Matte Parent",
+      vendor: "Test",
+      type: "PLA",
+      optTags: [16], // matte
+    });
+    await Filament.create({
+      name: "Inheriting Variant",
+      vendor: "Test",
+      type: "PLA",
+      parentId: parent._id,
+      color: "#f0f0f0",
+      // optTags intentionally omitted — must inherit [16] from parent
+    });
+    await Filament.create({
+      name: "Override Variant",
+      vendor: "Test",
+      type: "PLA",
+      parentId: parent._id,
+      color: "#0a0a0a",
+      optTags: [22], // sparkle — explicit override
+    });
+
+    const res = await listFilaments(
+      new NextRequest("http://localhost/api/filaments?vendor=Test"),
+    );
+    const body = await res.json();
+    const find = (name: string) => body.find((f: { name: string }) => f.name === name);
+
+    expect(find("Matte Parent").optTags).toEqual([16]);
+    expect(find("Inheriting Variant").optTags).toEqual([16]); // <-- the bug fix
+    expect(find("Override Variant").optTags).toEqual([22]);
+  });
+
+  it("surfaces optTags in the list projection so the row can derive finish without a detail fetch", async () => {
+    // FilamentSwatch + FinishChip read deriveFinish(optTags) to render
+    // the texture treatment + chip beside the name. Without optTags in
+    // the list projection every row would need a follow-up GET to learn
+    // its finish — defeating the purpose of the aggregation.
+    const Filament = (await import("@/models/Filament")).default;
+    await Filament.create({
+      name: "Matte White",
+      vendor: "Test",
+      type: "PLA",
+      color: "#f5f5f5",
+      optTags: [16], // matte
+    });
+    await Filament.create({
+      name: "Plain Red",
+      vendor: "Test",
+      type: "PLA",
+      color: "#ef4444",
+      optTags: [], // no finish-relevant tags
+    });
+    await Filament.create({
+      name: "Sparkle Black",
+      vendor: "Test",
+      type: "PLA",
+      color: "#0a0a0a",
+      optTags: [22, 4], // sparkle + abrasive (abrasive shouldn't shadow sparkle)
+    });
+
+    const res = await listFilaments(
+      new NextRequest("http://localhost/api/filaments?vendor=Test"),
+    );
+    const body = await res.json();
+    const find = (name: string) => body.find((f: { name: string }) => f.name === name);
+    expect(find("Matte White").optTags).toEqual([16]);
+    expect(find("Plain Red").optTags).toEqual([]);
+    expect(find("Sparkle Black").optTags).toEqual([22, 4]);
+  });
+
   it("includes tdsUrl in the projection so FilamentForm vendor suggestions still work", async () => {
     // FilamentForm calls /api/filaments?vendor=... and reads tdsUrl off
     // each row to populate vendor-keyed TDS suggestions. Codex flagged
