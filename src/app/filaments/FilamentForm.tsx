@@ -763,9 +763,22 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             // (printerId === "default") is always kept — it's the
             // baseline that applies regardless of which printer has
             // the nozzle at the moment.
+            //
+            // FAIL-OPEN when ownership data isn't available (codex
+            // round-2 P1 on PR #358). The catalog is fetched async via
+            // `/api/nozzles`; if the user saves while it's still
+            // loading — or if the fetch failed — `nozzles` is empty,
+            // the lookup returns `undefined`, and a strict predicate
+            // would silently delete every valid per-printer
+            // calibration. Treat absence of ownership data as
+            // "uncertain" and keep the entry; only drop when we have
+            // positive evidence (catalog loaded, nozzle found,
+            // printers populated, and the printer is not in the
+            // installed list).
             if (printerId === "default") return true;
             const nozzle = nozzles.find((n) => n._id === nozzleId);
-            return nozzle?.printers?.some((p) => p._id === printerId) ?? false;
+            if (!nozzle || !nozzle.printers) return true;
+            return nozzle.printers.some((p) => p._id === printerId);
           })
           .map(([key, cal]) => {
             const [printerId, nozzleId, bedTypeId] = key.split(":");
