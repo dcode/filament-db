@@ -298,39 +298,97 @@ export default function Home() {
     });
   }, [fetchFilaments]);
 
+  // Inventory aggregates exclude parent filaments. Parents don't
+  // represent a physical roll on the shelf — they're a template for
+  // their color variants (the variants own the spools, calibrations,
+  // and remaining weight). Counting them in totals double-counted what
+  // the user actually has and made "By Type" / "By Vendor" disagree
+  // with the headline number. Auto-detected via the `hasVariants` flag
+  // shipped by `/api/filaments`; parents collapse out of every count
+  // here but still render in the list as grouping headers.
+  const inventoryFilaments = useMemo(
+    () => filaments.filter((f) => !f.hasVariants),
+    [filaments],
+  );
+
   // Group filaments: parents with their variants, standalone filaments as-is
   // Client-side quick filter (low stock / has spools / missing calibrations).
   // Applied before grouping so a parent whose variants are filtered out is
   // still shown standalone if it matches itself.
   const quickFilterCounts = useMemo(() => {
     const counts: Record<QuickFilter, number> = {
-      all: filaments.length,
+      all: inventoryFilaments.length,
       lowStock: 0,
       hasSpools: 0,
       noCalibration: 0,
     };
-    for (const f of filaments) {
+    for (const f of inventoryFilaments) {
       if (isLowStock(f)) counts.lowStock++;
       if ((f.spools?.length ?? 0) > 0) counts.hasSpools++;
       if (!f.hasCalibrations) counts.noCalibration++;
     }
     return counts;
-  }, [filaments]);
+  }, [inventoryFilaments]);
 
   const visibleFilaments = useMemo(() => {
-    if (quickFilter === "all") return filaments;
-    return filaments.filter((f) => {
+    // The "all" view keeps parents in the dataset so the list renders
+    // them as grouping headers above their color variants. Every other
+    // filter resolves against `inventoryFilaments` instead — otherwise
+    // the chip badge (derived from `inventoryFilaments`, see
+    // `quickFilterCounts` above) disagrees with the rendered row count
+    // whenever a parent happens to match the filter criterion.
+    // `noCalibration` is the obvious case: a parent without
+    // calibrations would otherwise appear in the list even though the
+    // badge excluded it from the count. Codex round-1 P2 on PR #356.
+    const source = quickFilter === "all" ? filaments : inventoryFilaments;
+    if (quickFilter === "all") return source;
+    return source.filter((f) => {
       if (quickFilter === "lowStock") return isLowStock(f);
       if (quickFilter === "hasSpools") return (f.spools?.length ?? 0) > 0;
       if (quickFilter === "noCalibration") return !f.hasCalibrations;
       return true;
     });
-  }, [filaments, quickFilter]);
+  }, [filaments, inventoryFilaments, quickFilter]);
+
+  // Parent lookup built from the *full* filament list so variant
+  // enrichment (inherited nozzle/bed/cost/density/spool/net) works
+  // even when the parent has been filtered out of `visibleFilaments`.
+  // Codex round-2 P2 on PR #356 — previously the inheritance merge in
+  // `groupedFilaments` only ran when a parent row was present in
+  // `visibleFilaments`, so on filtered views (e.g. `noCalibration`)
+  // orphaned variants rendered with `—` for fields they should
+  // inherit from their parent.
+  const parentLookup = useMemo(() => {
+    const map = new Map<string, Filament>();
+    for (const f of filaments) {
+      if (!f.parentId) map.set(f._id, f);
+    }
+    return map;
+  }, [filaments]);
 
   const groupedFilaments = useMemo(() => {
     const parentMap = new Map<string, GroupedFilament>();
     const standalone: Filament[] = [];
     const variantsByParent = new Map<string, Filament[]>();
+
+    // Apply parent-field fallbacks to a variant. Used both for the
+    // grouped-under-parent and orphaned-variant paths so the same
+    // inheritance is visible regardless of whether the parent row
+    // happens to be in the current filter result set.
+    const enrichVariant = (v: Filament, parent: Filament | undefined): Filament => {
+      if (!parent) return v;
+      return {
+        ...v,
+        temperatures: {
+          nozzle: v.temperatures?.nozzle ?? parent.temperatures?.nozzle,
+          bed: v.temperatures?.bed ?? parent.temperatures?.bed,
+        },
+        cost: v.cost ?? parent.cost,
+        density: v.density ?? parent.density,
+        spoolWeight: v.spoolWeight ?? parent.spoolWeight,
+        netFilamentWeight: v.netFilamentWeight ?? parent.netFilamentWeight,
+      };
+    };
 
     // First pass: collect variants
     for (const f of visibleFilaments) {
@@ -344,17 +402,9 @@ export default function Home() {
     // Second pass: build groups, resolving inherited fields for variants
     for (const f of visibleFilaments) {
       if (f.parentId) continue; // variants are handled by their parent
-      const variants = (variantsByParent.get(f._id) || []).map((v) => ({
-        ...v,
-        temperatures: {
-          nozzle: v.temperatures?.nozzle ?? f.temperatures?.nozzle,
-          bed: v.temperatures?.bed ?? f.temperatures?.bed,
-        },
-        cost: v.cost ?? f.cost,
-        density: v.density ?? f.density,
-        spoolWeight: v.spoolWeight ?? f.spoolWeight,
-        netFilamentWeight: v.netFilamentWeight ?? f.netFilamentWeight,
-      }));
+      const variants = (variantsByParent.get(f._id) || []).map((v) =>
+        enrichVariant(v, f),
+      );
       if (variants.length > 0) {
         parentMap.set(f._id, { parent: f, variants });
       } else {
@@ -362,11 +412,14 @@ export default function Home() {
       }
     }
 
-    // Also include orphaned variants (parent not in current filter results)
+    // Also include orphaned variants (parent not in current filter
+    // results). Enrich from `parentLookup` so the inheritance still
+    // applies — the parent existing-but-filtered-out shouldn't change
+    // what the variant renders.
     for (const [parentId, variants] of variantsByParent) {
       if (!parentMap.has(parentId)) {
-        // Parent wasn't in the results — show variants as standalone
-        standalone.push(...variants);
+        const parent = parentLookup.get(parentId);
+        standalone.push(...variants.map((v) => enrichVariant(v, parent)));
       }
     }
 
@@ -384,7 +437,7 @@ export default function Home() {
     });
 
     return all;
-  }, [visibleFilaments, sortKey, sortDir]);
+  }, [visibleFilaments, parentLookup, sortKey, sortDir]);
 
   const toggleExpanded = (parentId: string) => {
     setExpandedParents((prev) => {
@@ -712,7 +765,7 @@ export default function Home() {
           className="text-sm text-gray-500 hover:text-gray-300 flex items-center gap-1 mb-3"
         >
           <span>{showStats ? "▾" : "▸"}</span>
-          <span>{t("filaments.stats.total", { count: filaments.length })}</span>
+          <span>{t("filaments.stats.total", { count: inventoryFilaments.length })}</span>
           <span className="text-gray-600">·</span>
           <span>{t("filaments.stats.typeCount", { count: types.length })}</span>
           <span className="text-gray-600">·</span>
@@ -723,7 +776,7 @@ export default function Home() {
           just renders the expanded grid when the user opens it. */}
       {filaments.length > 0 && showStats && (
         <div className="mb-4">
-          <FilamentStats filaments={filaments} />
+          <FilamentStats filaments={inventoryFilaments} />
         </div>
       )}
 
