@@ -192,9 +192,18 @@ export class NfcService extends EventEmitter {
    * `"Cannot connect to tag"`, this method is called to corrective-
    * clear the state. The renderer pill recovers to "Ready, place a
    * tag" once the corrective status update propagates.
+   *
+   * NOTE: we do NOT blanket-clear `readerPresent`. In a multi-reader
+   * setup (multiple physical readers, or mixed virtual/physical PC/SC
+   * entries) another reader may legitimately have a real tag whose
+   * presence event we already recorded. Wiping every entry would let
+   * a subsequent `isEmpty` event for that other reader incorrectly
+   * conclude `anyPresent === false` and clobber a valid `tagPresent:
+   * true` later on. Codex round-1 P2 on PR #359. Only `tagPresent` is
+   * force-cleared here; subsequent reader status events maintain
+   * `readerPresent` organically as physical changes occur.
    */
   clearPhantomPresence(): void {
-    this.readerPresent.clear();
     if (this.status.tagPresent) {
       this.updateStatus({ tagPresent: false, tagUid: null });
     }
