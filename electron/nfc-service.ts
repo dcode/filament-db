@@ -168,6 +168,47 @@ export class NfcService extends EventEmitter {
     return { ...this.status };
   }
 
+  /**
+   * Force-clear the phantom "tag present" state when an auto-read
+   * verification fails because PC/SC said `isPresent=true` but
+   * `connect()` couldn't establish a connection after multiple retries.
+   *
+   * The first-event skip at the top of the reader status handler already
+   * dodges the documented ACR1552U phantom on plug-in (GH #230). But on
+   * some drivers the `SCARD_STATE_CHANGED` bit can toggle on a later
+   * status event without any real physical change in the field —
+   * `changes != 0`, `isPresent=true`, and the service flips
+   * `tagPresent: true` on the strength of that bit alone. The status
+   * pill in the renderer is then stuck at "Tag detected" indefinitely:
+   *
+   *   - No subsequent status event will clear it (the driver thinks
+   *     present=true is the current state).
+   *   - Unplug+replug resets state momentarily but the same phantom
+   *     path runs on every replug, re-sticking `tagPresent: true`.
+   *
+   * The auto-read in `electron/main.ts` fires on the present=true
+   * transition. If the tag is real, the read succeeds and we leave
+   * `tagPresent: true` alone. If the connect retries exhaust with
+   * `"Cannot connect to tag"`, this method is called to corrective-
+   * clear the state. The renderer pill recovers to "Ready, place a
+   * tag" once the corrective status update propagates.
+   *
+   * NOTE: we do NOT blanket-clear `readerPresent`. In a multi-reader
+   * setup (multiple physical readers, or mixed virtual/physical PC/SC
+   * entries) another reader may legitimately have a real tag whose
+   * presence event we already recorded. Wiping every entry would let
+   * a subsequent `isEmpty` event for that other reader incorrectly
+   * conclude `anyPresent === false` and clobber a valid `tagPresent:
+   * true` later on. Codex round-1 P2 on PR #359. Only `tagPresent` is
+   * force-cleared here; subsequent reader status events maintain
+   * `readerPresent` organically as physical changes occur.
+   */
+  clearPhantomPresence(): void {
+    if (this.status.tagPresent) {
+      this.updateStatus({ tagPresent: false, tagUid: null });
+    }
+  }
+
   // ── Connection helpers ──────────────────────────────────────────
 
   private trySharedConnect(reader: CardReader): Promise<number | null> {

@@ -1011,6 +1011,18 @@ async function initNfc(): Promise<void> {
             mainWindow?.webContents.send("nfc-tag-detected", { data });
           })
           .catch((err) => {
+            // Phantom-present recovery: PC/SC said `isPresent=true` but
+            // the connect retries (up to ~6s) all failed — the present
+            // bit was a driver/SCARD_STATE_CHANGED artifact, not a real
+            // tag. Without this corrective clear, the renderer pill is
+            // stuck at "Tag detected" indefinitely (the reason behind
+            // this fix). The service handles the actual state mutation;
+            // we don't emit a separate nfc-tag-detected here because
+            // there is no tag to report on.
+            if (err.message?.includes("Cannot connect to tag")) {
+              nfcService?.clearPhantomPresence();
+              return;
+            }
             // Blank/erased tags have no NDEF data — tell the renderer so it
             // can show an "empty tag" indication instead of silently ignoring.
             if (err.message?.includes("No NDEF TLV") || err.message?.includes("No NDEF record")) {
