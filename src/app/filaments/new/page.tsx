@@ -239,12 +239,38 @@ function NewFilamentContent() {
     return () => document.removeEventListener("mousedown", handleClick);
   }, []);
 
-  // Handle NFC tag read while on this page
+  // Handle NFC tag read while on this page.
+  //
+  // NfcProvider intentionally keeps `tagReadResult` alive after the tag
+  // is lifted off the reader — the scan-match dialog's action buttons
+  // (View Filament / Create New / candidates) need to remain usable
+  // after the user dismisses the modal. That design is fine for the
+  // dialog; it's wrong for this page, which has no concept of "stale
+  // result vs. fresh scan." Without the `tagPresent` gate, clicking
+  // "+ Add Filament" any time after a scan-and-lift sequence would
+  // pre-fill the form with whatever was last scanned — even when the
+  // user has clearly moved on.
+  //
+  // `tagPresent` is read through a ref rather than the deps array
+  // (codex round-1 P1 on PR #354). The naive form — listing
+  // `nfcStatus.tagPresent` as a dep — re-runs this effect on every
+  // present↔absent transition with whatever `tagReadResult` is
+  // currently in scope. `electron/main.ts` emits `nfc-status-changed`
+  // immediately when a tag is detected, BEFORE the async tag read
+  // completes; during that window the effect would re-fire with
+  // `tagPresent=true` and the PREVIOUS tag's `tagReadResult`, prefilling
+  // the form from stale data. Routing the read through a ref means the
+  // prefill effect only runs when `tagReadResult` itself changes, but
+  // can still consult the latest tag-presence state at that moment.
+  const tagPresentRef = useRef(nfcStatus.tagPresent);
+  useEffect(() => {
+    tagPresentRef.current = nfcStatus.tagPresent;
+  }, [nfcStatus.tagPresent]);
   useEffect(() => {
     if (!tagReadResult?.data) return;
+    if (!tagPresentRef.current) return;
     const data = tagReadResult.data;
     // Syncing NFC tag payload into form initial data — same pattern as above.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setInitialData({
       name: data.materialName || "",
       vendor: data.brandName || "",
@@ -268,6 +294,8 @@ function NewFilamentContent() {
     setFormKey((k) => k + 1);
     dismissTagRead();
     toast(t("new.toast.populatedFromNfc"));
+    // `nfcStatus.tagPresent` is read via `tagPresentRef` (see the block
+    // above) and intentionally omitted from this dep array.
   }, [tagReadResult, dismissTagRead, toast, t]);
 
   // Handle INI file selection

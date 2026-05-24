@@ -6,6 +6,11 @@ import { useTranslation } from "@/i18n/TranslationProvider";
 import CollapsibleSection, { expandAndScrollToSection } from "@/components/CollapsibleSection";
 import FormToc, { FormTocMobileButton, type TocEntry } from "@/components/FormToc";
 import FilamentSwatch from "@/components/FilamentSwatch";
+import {
+  filterColorSuggestions,
+  lookupCssNamedColor,
+  type ColorSuggestion,
+} from "@/lib/cssNamedColors";
 
 interface BedTypeTempEntry {
   /** Client-only stable row id for React keys. Stripped before API submission. */
@@ -328,6 +333,16 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
   const [vendorDropdownOpen, setVendorDropdownOpen] = useState(false);
   const [vendorHighlight, setVendorHighlight] = useState(-1);
   const vendorRef = useRef<HTMLDivElement>(null);
+  // colorName typeahead — suggestions come from the user's own
+  // (colorName, color) pairs first ("Prusa Orange" remembers the hex
+  // you saved last time), then the 148 CSS named colors as a fallback
+  // for generic names. Selecting a suggestion sets BOTH the colorName
+  // and the hex `color` field, so the user gets a working swatch
+  // without leaving the keyboard.
+  const [colorNameSuggestions, setColorNameSuggestions] = useState<ColorSuggestion[]>([]);
+  const [colorNameDropdownOpen, setColorNameDropdownOpen] = useState(false);
+  const [colorNameHighlight, setColorNameHighlight] = useState(-1);
+  const colorNameRef = useRef<HTMLDivElement>(null);
   const [fetchErrors, setFetchErrors] = useState<string[]>([]);
 
   const addFetchError = (label: string) =>
@@ -362,6 +377,24 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
     return () => ac.abort();
   }, []);
 
+  // Fetch the user's previously-saved (colorName, color) pairs so the
+  // colorName typeahead can suggest "Prusa Orange → #FA6E1C" etc.
+  // Falls back to CSS named colors when the DB has no match for what
+  // the user is typing.
+  useEffect(() => {
+    const ac = new AbortController();
+    fetch("/api/filaments/colors", { signal: ac.signal })
+      .then((r) => {
+        if (!r.ok) throw new Error();
+        return r.json();
+      })
+      .then((pairs: { name: string; hex: string }[]) => {
+        setColorNameSuggestions(pairs.map((p) => ({ name: p.name, hex: p.hex, source: "db" })));
+      })
+      .catch(() => { if (!ac.signal.aborted) addFetchError("color suggestions"); });
+    return () => ac.abort();
+  }, []);
+
   // Fetch potential parent filaments
   useEffect(() => {
     const ac = new AbortController();
@@ -388,6 +421,9 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
       }
       if (parentRef.current && !parentRef.current.contains(e.target as Node)) {
         setParentDropdownOpen(false);
+      }
+      if (colorNameRef.current && !colorNameRef.current.contains(e.target as Node)) {
+        setColorNameDropdownOpen(false);
       }
     }
     document.addEventListener("mousedown", handleClick);
@@ -1207,14 +1243,136 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
             />
           </div>
         </div>
-        <div>
-          <label className={labelClass}>{t("form.colorName")}</label>
+        <div ref={colorNameRef} className="relative">
+          <label className={labelClass} id="colorName-label">{t("form.colorName")}</label>
           <input
+            id="filament-colorName"
             className={inputClass}
             value={form.colorName}
-            onChange={(e) => setForm({ ...form, colorName: e.target.value })}
+            role="combobox"
+            aria-expanded={colorNameDropdownOpen}
+            aria-controls="colorName-listbox"
+            aria-labelledby="colorName-label"
+            aria-autocomplete="list"
+            aria-activedescendant={
+              colorNameHighlight >= 0 ? `colorName-opt-${colorNameHighlight}` : undefined
+            }
             placeholder={t("form.placeholder.colorName")}
+            onChange={(e) => {
+              // Typing the colorName never overwrites `color` on its own —
+              // we wait for the user to commit (Enter, click, or exact-
+              // match-then-blur) so we don't churn the hex picker on every
+              // keystroke. The user's free-text "I'm naming this whatever
+              // I want" path stays uninterrupted.
+              setForm({ ...form, colorName: e.target.value });
+              setColorNameDropdownOpen(true);
+              setColorNameHighlight(-1);
+            }}
+            onFocus={() => {
+              setColorNameDropdownOpen(true);
+              setColorNameHighlight(-1);
+            }}
+            onBlur={() => {
+              // Exact (case- and whitespace-insensitive) match on a CSS
+              // named color — populate the hex even though the user
+              // never opened the dropdown. Mirrors how a user expects
+              // the picker to behave after typing "navy" and tabbing.
+              // DB matches are NOT auto-applied on blur because there
+              // can be multiple hexes under the same name (e.g. several
+              // brands of "Galaxy Black"); the user must explicitly
+              // pick which one they meant via the dropdown.
+              const cssHex = lookupCssNamedColor(form.colorName);
+              if (cssHex && form.color.toUpperCase() !== cssHex) {
+                setForm({ ...form, color: cssHex });
+              }
+            }}
+            onKeyDown={(e) => {
+              if (!colorNameDropdownOpen) return;
+              const filtered = filterColorSuggestions(
+                colorNameSuggestions,
+                form.colorName,
+              );
+              if (e.key === "ArrowDown") {
+                e.preventDefault();
+                setColorNameHighlight((h) => Math.min(h + 1, filtered.length - 1));
+              } else if (e.key === "ArrowUp") {
+                e.preventDefault();
+                setColorNameHighlight((h) => Math.max(h - 1, 0));
+              } else if (
+                e.key === "Enter" &&
+                colorNameHighlight >= 0 &&
+                filtered[colorNameHighlight]
+              ) {
+                e.preventDefault();
+                const s = filtered[colorNameHighlight];
+                setForm({ ...form, colorName: s.name, color: s.hex });
+                setColorNameDropdownOpen(false);
+                setColorNameHighlight(-1);
+              } else if (e.key === "Escape") {
+                setColorNameDropdownOpen(false);
+                setColorNameHighlight(-1);
+              }
+            }}
           />
+          {colorNameDropdownOpen && (() => {
+            const filtered = filterColorSuggestions(colorNameSuggestions, form.colorName);
+            if (filtered.length === 0) return null;
+            // Section boundaries — render a small "From your filaments"
+            // / "Standard colors" header before each source group.
+            // Pre-computing the first-of-each-source flag avoids an
+            // extra pass during render.
+            let lastSource: "db" | "css" | null = null;
+            return (
+              <ul
+                id="colorName-listbox"
+                role="listbox"
+                aria-labelledby="colorName-label"
+                className="absolute z-50 w-full mt-1 max-h-64 overflow-y-auto bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg"
+              >
+                {filtered.map((s, i) => {
+                  const showHeader = s.source !== lastSource;
+                  lastSource = s.source;
+                  return (
+                    <span key={`${s.source}-${s.name}-${s.hex}`}>
+                      {showHeader && (
+                        <li
+                          aria-hidden="true"
+                          className="px-3 py-1 text-[10px] uppercase tracking-wide text-gray-400 bg-gray-50 dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700"
+                        >
+                          {s.source === "db"
+                            ? t("form.colorName.section.db")
+                            : t("form.colorName.section.css")}
+                        </li>
+                      )}
+                      <li
+                        id={`colorName-opt-${i}`}
+                        role="option"
+                        aria-selected={i === colorNameHighlight}
+                        className={`px-3 py-1.5 cursor-pointer text-gray-800 dark:text-gray-100 hover:bg-gray-100 dark:hover:bg-gray-700 flex items-center gap-2 ${i === colorNameHighlight ? "bg-gray-100 dark:bg-gray-600" : ""}`}
+                        onMouseDown={(e) => {
+                          // mousedown beats blur — without preventDefault the
+                          // input's onBlur fires first and the dropdown closes
+                          // before the click registers.
+                          e.preventDefault();
+                          setForm({ ...form, colorName: s.name, color: s.hex });
+                          setColorNameDropdownOpen(false);
+                          setColorNameHighlight(-1);
+                        }}
+                      >
+                        <span
+                          aria-hidden="true"
+                          className="inline-block w-4 h-4 rounded-full border border-gray-300 dark:border-gray-500 flex-shrink-0"
+                          style={{ backgroundColor: s.hex }}
+                        />
+                        <span className="flex-1 truncate">{s.name}</span>
+                        <span className="text-xs font-mono text-gray-400">{s.hex.toUpperCase()}</span>
+                      </li>
+                    </span>
+                  );
+                })}
+              </ul>
+            );
+          })()}
         </div>
         <div>
           <label className={labelClass}>{t("form.cost", { symbol: currencySymbol })}</label>
