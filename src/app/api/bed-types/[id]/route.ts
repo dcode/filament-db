@@ -3,7 +3,7 @@ import dbConnect from "@/lib/mongodb";
 import BedType from "@/models/BedType";
 import Filament from "@/models/Filament";
 import Printer from "@/models/Printer";
-import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function GET(
   _request: NextRequest,
@@ -53,6 +53,8 @@ export async function PUT(
     }
     return NextResponse.json(bedType);
   } catch (err) {
+    const dupResponse = handleDuplicateKeyError(err, "bed type");
+    if (dupResponse) return dupResponse;
     return errorResponseFromCaught(err, "Failed to update bed type");
   }
 }

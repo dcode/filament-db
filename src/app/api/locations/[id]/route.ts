@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Location from "@/models/Location";
 import Filament from "@/models/Filament";
-import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 
 export async function GET(
   _request: NextRequest,
@@ -52,6 +52,8 @@ export async function PUT(
     }
     return NextResponse.json(location);
   } catch (err) {
+    const dupResponse = handleDuplicateKeyError(err, "location");
+    if (dupResponse) return dupResponse;
     return errorResponseFromCaught(err, "Failed to update location");
   }
 }

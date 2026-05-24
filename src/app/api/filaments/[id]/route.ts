@@ -5,7 +5,7 @@ import Nozzle from "@/models/Nozzle";
 import Printer from "@/models/Printer";
 import "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
-import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError } from "@/lib/apiErrorHandler";
 import { mergeSlicerSettings } from "@/lib/slicerSettings";
 import { assignSpoolToSlot } from "@/lib/spoolSlots";
 
@@ -209,6 +209,13 @@ export async function PUT(
     }
     return NextResponse.json(filament);
   } catch (err) {
+    // Surface MongoDB duplicate-key errors (renaming a filament to a
+    // name that already exists) as a specific 409 rather than the
+    // generic 500 "Failed to update filament" toast. The POST handler
+    // does this already; the PUT was missing it, so users saw a vague
+    // error toast on the most common rename-collision case.
+    const dupResponse = handleDuplicateKeyError(err, "filament");
+    if (dupResponse) return dupResponse;
     return errorResponseFromCaught(err, "Failed to update filament");
   }
 }
