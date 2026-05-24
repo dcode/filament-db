@@ -6,6 +6,7 @@ import { parseCsv } from "@/lib/parseCsv";
 import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { unsanitizeCsvCell } from "@/lib/csvWriter";
+import { isValidIsoDateString } from "@/lib/validateSpoolBody";
 
 /**
  * POST /api/spools/import — bulk-create OR upsert spools from CSV.
@@ -175,12 +176,40 @@ export async function POST(request: NextRequest) {
         continue;
       }
 
+      // GH #372 (Codex follow-up): treat ISO-shaped-but-impossible dates
+      // (Feb 29 outside a leap year, etc.) as bad input rather than
+      // silently normalising them to a different day. `new Date(s)` alone
+      // would shift "2025-02-29" to March 1st without warning.
+      //
+      // Validate BEFORE `resolveLocationId` — that call auto-creates a
+      // Location row whose name matches the cell, and any row that fails
+      // a later check would otherwise leave behind an orphan location
+      // (Codex P2 on PR #375). Per-row failures must remain side-effect
+      // free so an invalid CSV doesn't dirty the catalog.
+      const rawPurchase = (r.purchaseDate || "").trim();
+      if (rawPurchase && !isValidIsoDateString(rawPurchase)) {
+        results.push({
+          row: i + 2,
+          ok: false,
+          error: "purchaseDate must be a valid ISO date (YYYY-MM-DD or full ISO 8601)",
+        });
+        continue;
+      }
+      const rawOpened = (r.openedDate || "").trim();
+      if (rawOpened && !isValidIsoDateString(rawOpened)) {
+        results.push({
+          row: i + 2,
+          ok: false,
+          error: "openedDate must be a valid ISO date (YYYY-MM-DD or full ISO 8601)",
+        });
+        continue;
+      }
+      const purchaseDate = rawPurchase ? new Date(rawPurchase) : null;
+      const openedDate = rawOpened ? new Date(rawOpened) : null;
+
       const locationId = await resolveLocationId(
         unsanitizeCsvCell((r.location || "").trim()),
       );
-
-      const purchaseDate = r.purchaseDate ? new Date(r.purchaseDate) : null;
-      const openedDate = r.openedDate ? new Date(r.openedDate) : null;
 
       // Build the field set for a NEW spool — defaults fill in for any
       // optional column the user didn't include.
@@ -236,8 +265,22 @@ export async function POST(request: NextRequest) {
         // push signature.
         filament.spools.push(newSpoolFields as unknown as Parameters<typeof filament.spools.push>[0]);
       }
-      await filament.save();
-      results.push({ row: i + 2, ok: true, action, filament: filament.name });
+      // GH #370: per-row try/catch. Filament has `optimisticConcurrency:
+      // true`, so a concurrent writer (UI edit, NFC scan, parallel import)
+      // can make `save()` throw VersionError. Without this guard the throw
+      // escaped the row loop, falling into the outer 500 catch — every
+      // already-processed row's outcome was discarded and the user got no
+      // partial-results payload from a documented best-effort importer.
+      try {
+        await filament.save();
+        results.push({ row: i + 2, ok: true, action, filament: filament.name });
+      } catch (saveErr) {
+        results.push({
+          row: i + 2,
+          ok: false,
+          error: `save failed: ${getErrorMessage(saveErr)}`,
+        });
+      }
     }
 
     const ok = results.filter((r) => r.ok).length;
