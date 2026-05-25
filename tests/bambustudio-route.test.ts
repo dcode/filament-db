@@ -1,0 +1,284 @@
+import { describe, it, expect, beforeEach } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+
+/**
+ * Route-level tests for the Bambu Studio importer (`POST
+ * /api/filaments/bambustudio` + `POST /api/filaments/{id}/bambustudio`).
+ *
+ * Covers:
+ *   - both content-types (multipart upload + raw JSON body)
+ *   - upsert by name on the bulk route + id-pinned target on the per-id route
+ *   - calibration auto-detect when a Printer + matching nozzle exist
+ *   - calibration "unresolved" path when the printer hint doesn't match
+ *   - required-field validation on create
+ *   - non-multipart / non-JSON body rejection
+ *
+ * Schema re-registration in beforeEach is the same pattern as the other
+ * route-level tests (tests/setup.ts wipes mongoose.models between tests).
+ */
+describe("Bambu Studio importer routes", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  let Filament: any;
+  let Printer: any;
+  let Nozzle: any;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  beforeEach(async () => {
+    const filMod = await import("@/models/Filament");
+    const prtMod = await import("@/models/Printer");
+    const nozMod = await import("@/models/Nozzle");
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    Filament = mongoose.models.Filament;
+    Printer = mongoose.models.Printer;
+    Nozzle = mongoose.models.Nozzle;
+  });
+
+  function multipartReq(url: string, profile: unknown) {
+    const fd = new FormData();
+    fd.append("file", new File([JSON.stringify(profile)], "preset.json", { type: "application/json" }));
+    return new NextRequest(url, { method: "POST", body: fd });
+  }
+
+  function jsonReq(url: string, profile: unknown) {
+    return new NextRequest(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(profile),
+    });
+  }
+
+  function minimalProfile(overrides: Record<string, unknown> = {}) {
+    return {
+      type: "filament",
+      from: "User",
+      filament_settings_id: ["QA Bambu PLA"],
+      filament_type: ["PLA"],
+      filament_vendor: ["QA Labs"],
+      filament_diameter: ["1.75"],
+      nozzle_temperature: ["210"],
+      hot_plate_temp: ["60"],
+      ...overrides,
+    };
+  }
+
+  describe("POST /api/filaments/bambustudio (bulk / upsert by name)", () => {
+    it("creates a new filament from a multipart upload", async () => {
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        multipartReq("http://localhost/api/filaments/bambustudio", minimalProfile()),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(true);
+      expect(body.name).toBe("QA Bambu PLA");
+
+      const stored = await Filament.findOne({ name: "QA Bambu PLA" });
+      expect(stored).toBeTruthy();
+      expect(stored.type).toBe("PLA");
+      expect(stored.vendor).toBe("QA Labs");
+      expect(stored.diameter).toBe(1.75);
+      expect(stored.temperatures.nozzle).toBe(210);
+      expect(stored.temperatures.bed).toBe(60);
+    });
+
+    it("updates an existing filament when the name matches (raw JSON body)", async () => {
+      await Filament.create({
+        name: "QA Bambu PLA",
+        vendor: "QA Labs",
+        type: "PLA",
+        diameter: 1.75,
+        temperatures: { nozzle: 200, bed: 50 },
+      });
+
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({ nozzle_temperature: ["225"], hot_plate_temp: ["65"] }),
+        ),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.updated).toBe(true);
+      expect(body.created).toBe(false);
+
+      const stored = await Filament.findOne({ name: "QA Bambu PLA" });
+      expect(stored.temperatures.nozzle).toBe(225);
+      expect(stored.temperatures.bed).toBe(65);
+    });
+
+    it("requires filament_type AND filament_vendor on create", async () => {
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const noType = await POST(
+        multipartReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({ filament_type: [] }),
+        ),
+      );
+      expect(noType.status).toBe(400);
+      expect((await noType.json()).error).toMatch(/filament_type/);
+
+      const noVendor = await POST(
+        multipartReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({ filament_vendor: [] }),
+        ),
+      );
+      expect(noVendor.status).toBe(400);
+      expect((await noVendor.json()).error).toMatch(/filament_vendor/);
+    });
+
+    it("rejects a non-multipart / non-JSON body with 400", async () => {
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const req = new NextRequest("http://localhost/api/filaments/bambustudio", {
+        method: "POST",
+        headers: { "content-type": "text/plain" },
+        body: "not a profile",
+      });
+      const res = await POST(req);
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 400 on a payload missing the identifier", async () => {
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq("http://localhost/api/filaments/bambustudio", { filament_type: ["PLA"] }),
+      );
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/filament_settings_id/);
+    });
+  });
+
+  describe("calibration auto-detect", () => {
+    async function seedPrinterWithNozzle() {
+      const nozzle = await Nozzle.create({
+        name: "P1S 0.4 Brass",
+        diameter: 0.4,
+        type: "Brass",
+      });
+      const printer = await Printer.create({
+        name: "Bambu Lab P1S",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [nozzle._id],
+      });
+      return { printer, nozzle };
+    }
+
+    it("attaches calibration values to the matching printer + nozzle", async () => {
+      const { printer, nozzle } = await seedPrinterWithNozzle();
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({
+            printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+            filament_flow_ratio: ["0.978"],
+            pressure_advance: ["0.028"],
+            filament_retract_length: ["0.8"],
+          }),
+        ),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.calibrationApplied).toBe(true);
+      expect(body.calibrationContext.printerName).toBe("Bambu Lab P1S");
+      expect(body.calibrationContext.nozzleDiameter).toBe(0.4);
+
+      const stored = await Filament.findOne({ name: "QA Bambu PLA" });
+      const cal = stored.calibrations.find(
+        (c: { printer: unknown; nozzle: unknown }) =>
+          String(c.printer) === String(printer._id) && String(c.nozzle) === String(nozzle._id),
+      );
+      expect(cal).toBeTruthy();
+      expect(cal.extrusionMultiplier).toBe(0.978);
+      expect(cal.pressureAdvance).toBe(0.028);
+      expect(cal.retractLength).toBe(0.8);
+    });
+
+    it("flags calibrationUnresolved when no printer matches the hint", async () => {
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({
+            printer_settings_id: ["Some Other Brand 0.4 nozzle"],
+            filament_flow_ratio: ["0.99"],
+          }),
+        ),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.calibrationApplied).toBeFalsy();
+      expect(body.calibrationUnresolved).toBe(true);
+    });
+
+    it("doesn't flag unresolved when there are no calibration hints at all", async () => {
+      await seedPrinterWithNozzle();
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile(), // no calibration values
+        ),
+      );
+      const body = await res.json();
+      expect(body.calibrationApplied).toBeFalsy();
+      expect(body.calibrationUnresolved).toBeFalsy();
+    });
+  });
+
+  describe("POST /api/filaments/[id]/bambustudio (per-id sync)", () => {
+    it("pins by id and ignores the parsed filament name", async () => {
+      const target = await Filament.create({
+        name: "Original Name",
+        vendor: "QA",
+        type: "PLA",
+        diameter: 1.75,
+      });
+
+      const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          `http://localhost/api/filaments/${target._id}/bambustudio`,
+          minimalProfile({
+            filament_settings_id: ["DIFFERENT NAME"], // ignored — pinned by id
+            nozzle_temperature: ["230"],
+          }),
+        ),
+        { params: Promise.resolve({ id: String(target._id) }) },
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.updated).toBe(true);
+      expect(body.name).toBe("Original Name"); // name didn't change
+
+      const stored = await Filament.findById(target._id);
+      expect(stored.name).toBe("Original Name");
+      expect(stored.temperatures.nozzle).toBe(230);
+    });
+
+    it("returns 400 for a malformed id", async () => {
+      const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+      const res = await POST(
+        jsonReq("http://localhost/api/filaments/not-an-id/bambustudio", minimalProfile()),
+        { params: Promise.resolve({ id: "not-an-id" }) },
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("returns 404 when the filament doesn't exist", async () => {
+      const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+      const missing = "000000000000000000000000";
+      const res = await POST(
+        jsonReq(`http://localhost/api/filaments/${missing}/bambustudio`, minimalProfile()),
+        { params: Promise.resolve({ id: missing }) },
+      );
+      expect(res.status).toBe(404);
+    });
+  });
+});

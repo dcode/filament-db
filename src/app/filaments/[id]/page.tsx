@@ -123,6 +123,55 @@ export default function FilamentDetail() {
   // doesn't collapse on outside click on its own.
   const slicerExportRef = useRef<HTMLDetailsElement>(null);
 
+  // "Sync from Bambu Studio" file input + in-flight flag. Pinned to this
+  // filament's id (POST /api/filaments/{id}/bambustudio) so the user is
+  // updating exactly the record they're looking at, regardless of the
+  // file's filament_settings_id.
+  const bambuSyncRef = useRef<HTMLInputElement>(null);
+  const [bambuSyncing, setBambuSyncing] = useState(false);
+
+  const handleBambuSync = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (!filament) return;
+      const file = e.target.files?.[0];
+      if (!file) return;
+      setBambuSyncing(true);
+      const form = new FormData();
+      form.append("file", file);
+      try {
+        const res = await fetch(`/api/filaments/${filament._id}/bambustudio`, {
+          method: "POST",
+          body: form,
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          toast(t("filaments.importFailed", { error: data.error }), "error");
+          return;
+        }
+        toast(t("bambuImport.success", { verb: t("bambuImport.updated"), name: data.name }));
+        if (data.calibrationApplied && data.calibrationContext) {
+          toast(
+            t("bambuImport.calibrationApplied", {
+              printer: data.calibrationContext.printerName,
+              diameter: data.calibrationContext.nozzleDiameter,
+            }),
+          );
+        } else if (data.calibrationUnresolved) {
+          toast(t("bambuImport.calibrationUnresolved"), "info");
+        }
+        // Re-fetch so the page reflects the new values.
+        const refreshed = await fetch(`/api/filaments/${filament._id}`);
+        if (refreshed.ok) setFilament(await refreshed.json());
+      } catch {
+        toast(t("filaments.importNetworkError"), "error");
+      } finally {
+        setBambuSyncing(false);
+        if (bambuSyncRef.current) bambuSyncRef.current.value = "";
+      }
+    },
+    [filament, t, toast],
+  );
+
   // Clear NFC write timeout on unmount
   useEffect(() => {
     return () => { if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current); };
@@ -763,6 +812,29 @@ export default function FilamentDetail() {
               ))}
             </div>
           </details>
+          {/* Sync FROM Bambu Studio — inverse of the slicer-export menu
+              above. Pinned to this filament's id (the file's name doesn't
+              have to match), so it's the right entry point when the user
+              has calibrated in Bambu and wants the values back here. */}
+          <button
+            type="button"
+            onClick={() => bambuSyncRef.current?.click()}
+            disabled={bambuSyncing}
+            className="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50 text-sm inline-flex items-center gap-1.5"
+            title={t("bambuImport.syncFromBambuTitle")}
+          >
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1M16 12l-4-4m0 0l-4 4m4-4v12" />
+            </svg>
+            {bambuSyncing ? t("bambuImport.importing") : t("bambuImport.syncFromBambu")}
+          </button>
+          <input
+            ref={bambuSyncRef}
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={handleBambuSync}
+          />
           {/* Clone is available on every filament — root or variant. The new-
               page clone path at src/app/filaments/new/page.tsx:192 does
               `filament.parentId || filament._id`, so cloning a variant
