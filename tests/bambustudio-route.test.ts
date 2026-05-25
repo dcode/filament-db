@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import mongoose from "mongoose";
 import { NextRequest } from "next/server";
 
@@ -159,6 +159,110 @@ describe("Bambu Studio importer routes", () => {
       });
       const res = await POST(req);
       expect(res.status).toBe(400);
+    });
+
+    it("resurrects a TRASHED filament of the same name instead of creating a duplicate (Codex P1 #387 r5)", async () => {
+      // GH #213 trash workflow: a trashed (non-purged) filament owns
+      // the name (partial-unique index is on _deletedAt: null only). If
+      // import created a second active row, the trashed one's restore
+      // would 409 forever on the name conflict — the same trap the INI
+      // importer fixed in #297.
+      const trashed = await Filament.create({
+        name: "QA Bambu PLA",
+        vendor: "Old Vendor",
+        type: "PLA",
+        diameter: 1.75,
+        _deletedAt: new Date(),
+      });
+
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({ filament_vendor: ["New Vendor"] }),
+        ),
+      );
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      // Resurrected = `updated`, not `created`.
+      expect(body.updated).toBe(true);
+      expect(body.created).toBe(false);
+      // The SAME _id as the trashed row — no second active doc.
+      expect(body.filamentId).toBe(String(trashed._id));
+
+      // On disk: exactly one row, _deletedAt cleared, fields updated.
+      const all = await Filament.find({ name: "QA Bambu PLA" });
+      expect(all).toHaveLength(1);
+      expect(all[0]._deletedAt).toBeNull();
+      expect(all[0].vendor).toBe("New Vendor");
+    });
+
+    it("recovers from a concurrent create race by updating the racing winner (Codex P2 #387 r5)", async () => {
+      // Simulate the race: phase-1 findOne returns null, but between
+      // that and the create() call another request wins and inserts a
+      // row with the same name. The partial-unique index throws E11000
+      // for our create; the route catches it, re-fetches the racing
+      // winner, and falls through to a normal phase-1 update.
+      //
+      // Subtlety: `tests/setup.ts` clears `mongoose.models` after every
+      // test, so the route module's cached `import Filament from ...`
+      // reference goes stale after the first run. Reset module cache
+      // BEFORE re-importing the route, then capture the SAME Filament
+      // the route will actually call create on, then spy on THAT.
+      vi.resetModules();
+      Filament = (await import("@/models/Filament")).default;
+
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+
+      // Patch Filament.create exactly ONCE to throw an E11000 the
+      // first time it's called. In the catch path the route falls back
+      // to findOneAndUpdate, so a real row needs to exist when it
+      // looks. Set that up in the same spy.
+      const realCreate = Filament.create.bind(Filament);
+      const e11000 = Object.assign(new Error("E11000 duplicate key"), {
+        code: 11000,
+      });
+      const spy = vi
+        .spyOn(Filament, "create")
+        .mockImplementationOnce(async () => {
+          // Pretend the racing winner already inserted while we were
+          // about to call create. Insert a row through the real path,
+          // THEN throw E11000 as if our own create had collided.
+          await realCreate({
+            name: "QA Bambu PLA",
+            vendor: "Racing Winner",
+            type: "PLA",
+            diameter: 1.75,
+          });
+          throw e11000;
+        });
+
+      try {
+        const res = await POST(
+          jsonReq(
+            "http://localhost/api/filaments/bambustudio",
+            minimalProfile({ filament_vendor: ["From Bambu"] }),
+          ),
+        );
+        const body = await res.json();
+        if (res.status !== 200) {
+          // Debugging aid: surface what the route actually returned so a
+          // failure here doesn't bottom out at a meaningless assertion.
+          throw new Error(`unexpected status ${res.status}: ${JSON.stringify(body)}`);
+        }
+        expect(res.status).toBe(200);
+        // `updated` because we converged on the racing winner instead
+        // of creating a second row.
+        expect(body.updated).toBe(true);
+        expect(body.created).toBe(false);
+        // Exactly one active row with the merged values from BOTH the
+        // racing winner (existing) and our Bambu import (override).
+        const all = await Filament.find({ name: "QA Bambu PLA" });
+        expect(all).toHaveLength(1);
+        expect(all[0].vendor).toBe("From Bambu"); // import overrode
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it("returns 400 on a payload missing the identifier", async () => {

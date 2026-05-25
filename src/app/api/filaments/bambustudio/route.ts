@@ -5,18 +5,15 @@ import {
   parseBambuStudioProfile,
   type BambuParseResult,
 } from "@/lib/bambuStudioImport";
-import {
-  buildStructuredUpdate,
-  resolveAndApplyCalibration,
-} from "@/lib/bambuStudioApply";
+import { prepareBambuUpdate } from "@/lib/bambuStudioApply";
 import {
   assertMultipartFormData,
   checkFileSize,
   errorResponse,
   errorResponseFromCaught,
+  isDuplicateKeyError,
 } from "@/lib/apiErrorHandler";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
-import { mergeSlicerSettings } from "@/lib/slicerSettings";
 
 /**
  * POST /api/filaments/bambustudio
@@ -108,85 +105,148 @@ export async function POST(request: NextRequest) {
   try {
     await dbConnect();
 
-    const { filament: parsedFilament, calibrationHints } = parsed;
+    const name = parsed.filament.name;
 
-    // ── Find existing OR create ───────────────────────────────────────
-    // Match by name first. `filament_settings_id` is the canonical Bambu
-    // identifier so the export filename and this lookup line up.
-    let existing = await Filament.findOne({
-      name: parsedFilament.name,
+    // ── Three-phase upsert ─────────────────────────────────────────────
+    // Pattern mirrors `src/app/api/filaments/import/route.ts` (#327):
+    //   1. update an existing ACTIVE row
+    //   2. resurrect a TRASHED (non-purged) row
+    //   3. create — handling the E11000 race against a concurrent create
+    //
+    // Each phase uses an atomic `findOneAndUpdate` guarded by the doc's
+    // `_id` (and the soft-delete state at the time it was read) so a
+    // concurrent soft-delete / purge / restore can't slip through the
+    // findOne→write window. `runValidators: true` so the GH #337 numeric
+    // validators fire on every write path (Codex P2 round 2).
+    //
+    // The merge logic in `prepareBambuUpdate` depends on the existing
+    // doc (settings carry-over + calibration row dedup), so we have to
+    // recompute the payload per phase against whatever `existing` we
+    // resolved.
+
+    // Phase 1 — active update.
+    const existingActive = await Filament.findOne({
+      name,
       _deletedAt: null,
     });
-
-    // ── Build the structured update ───────────────────────────────────
-    const update = buildStructuredUpdate(parsedFilament, existing);
-
-    // ── Merge unknown keys into the settings passthrough bag ─────────
-    // mergeSlicerSettings enforces the per-key size + key-count caps so
-    // a bloated profile can't blow up the document.
-    const settingsResult = mergeSlicerSettings(
-      (existing?.settings as Record<string, unknown>) || {},
-      parsedFilament.settings,
-      // Already-structured keys we own — skip them in the merge.
-      new Set(Object.keys(parsedFilament.settings).filter(() => false)),
-    );
-    if (settingsResult.error) {
-      return errorResponse(settingsResult.error, 400);
-    }
-    if (settingsResult.added.length > 0) {
-      update.settings = settingsResult.settings;
-    }
-
-    // ── Resolve calibration context + apply hints ─────────────────────
-    const calibrationOutcome = await resolveAndApplyCalibration(
-      parsedFilament,
-      calibrationHints,
-      update,
-      existing,
-    );
-
-    // ── Upsert ────────────────────────────────────────────────────────
-    let created = false;
-    if (!existing) {
-      // Create. Mongoose `create` runs validators; required fields
-      // (vendor, type) had better be present in the Bambu profile, else
-      // we bubble the validation error to 400.
-      if (!parsedFilament.type) {
-        return errorResponse(
-          "Bambu Studio profile is missing filament_type — required to create a new filament",
-          400,
-        );
+    if (existingActive) {
+      const payload = await prepareBambuUpdate(parsed, existingActive);
+      if (payload.settingsResult.error) {
+        return errorResponse(payload.settingsResult.error, 400);
       }
-      if (!parsedFilament.vendor) {
-        return errorResponse(
-          "Bambu Studio profile is missing filament_vendor — required to create a new filament",
-          400,
-        );
-      }
+      delete (payload.update as Record<string, unknown>).spools;
       try {
-        existing = await Filament.create({
-          name: parsedFilament.name,
-          ...update,
-        });
-        created = true;
-      } catch (createErr) {
+        const updated = await Filament.findOneAndUpdate(
+          { _id: existingActive._id, _deletedAt: null },
+          { $set: payload.update },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (updated) {
+          return importResponse(updated, false, payload);
+        }
+      } catch (validationErr) {
+        return errorResponseFromCaught(
+          validationErr,
+          "Bambu Studio profile contained invalid values",
+        );
+      }
+      // Phase-1 update returned null → the row was deleted between our
+      // findOne and the atomic write. Fall through to phase 2 / 3.
+    }
+
+    // Phase 2 — resurrect a trashed (non-purged) row of the same name
+    // rather than creating a duplicate that would strand the trashed
+    // record (its restore would 409 forever on the name conflict).
+    // (Codex P1 on PR #387 round 5.)
+    const existingTrashed = await Filament.findOne({
+      name,
+      _deletedAt: { $ne: null },
+      _purged: { $ne: true },
+    });
+    if (existingTrashed) {
+      const payload = await prepareBambuUpdate(parsed, existingTrashed);
+      if (payload.settingsResult.error) {
+        return errorResponse(payload.settingsResult.error, 400);
+      }
+      delete (payload.update as Record<string, unknown>).spools;
+      try {
+        const resurrected = await Filament.findOneAndUpdate(
+          {
+            _id: existingTrashed._id,
+            _deletedAt: { $ne: null },
+            _purged: { $ne: true },
+          },
+          { $set: { ...payload.update, _deletedAt: null } },
+          { runValidators: true, context: "query", returnDocument: "after" },
+        );
+        if (resurrected) {
+          return importResponse(resurrected, false, payload);
+        }
+      } catch (validationErr) {
+        return errorResponseFromCaught(
+          validationErr,
+          "Bambu Studio profile contained invalid values",
+        );
+      }
+      // Phase-2 returned null → the row was purged or restored between
+      // findOne and write. Fall through to phase 3.
+    }
+
+    // Phase 3 — create. Required fields (vendor + type) must be present
+    // in the Bambu profile or the create can't satisfy the schema.
+    if (!parsed.filament.type) {
+      return errorResponse(
+        "Bambu Studio profile is missing filament_type — required to create a new filament",
+        400,
+      );
+    }
+    if (!parsed.filament.vendor) {
+      return errorResponse(
+        "Bambu Studio profile is missing filament_vendor — required to create a new filament",
+        400,
+      );
+    }
+
+    const createPayload = await prepareBambuUpdate(parsed, null);
+    if (createPayload.settingsResult.error) {
+      return errorResponse(createPayload.settingsResult.error, 400);
+    }
+    try {
+      const created = await Filament.create({
+        name,
+        ...createPayload.update,
+      });
+      return importResponse(created, true, createPayload);
+    } catch (createErr) {
+      // Codex P2 on PR #387 round 5: another concurrent import created
+      // a row with the same name between our phase-1 findOne and our
+      // create. Recompute the payload against THAT row (its settings
+      // and calibrations[] differ from the null baseline used above)
+      // and update it as if we'd taken the phase-1 path.
+      if (!isDuplicateKeyError(createErr)) {
         return errorResponseFromCaught(createErr, "Failed to create filament");
       }
-    } else {
-      // Update — never touch spools/usageHistory/dryCycles.
-      delete (update as Record<string, unknown>).spools;
-      // Codex P2 on PR #387: `runValidators` so the new numeric range
-      // validators (#337) actually fire on a Bambu import — without it,
-      // a profile carrying e.g. negative density would persist invalid
-      // data and corrupt downstream math. `context: "query"` is the
-      // mongoose recipe for getting the doc context inside validators
-      // (matches the import-atlas route's pattern).
+      const racing = await Filament.findOne({ name, _deletedAt: null });
+      if (!racing) {
+        // The winning row was already deleted; bail out with the
+        // original error rather than spinning.
+        return errorResponseFromCaught(createErr, "Failed to create filament");
+      }
+      const racePayload = await prepareBambuUpdate(parsed, racing);
+      if (racePayload.settingsResult.error) {
+        return errorResponse(racePayload.settingsResult.error, 400);
+      }
+      delete (racePayload.update as Record<string, unknown>).spools;
       try {
-        await Filament.updateOne(
-          { _id: existing._id },
-          { $set: update },
-          { runValidators: true, context: "query" },
+        const merged = await Filament.findOneAndUpdate(
+          { _id: racing._id, _deletedAt: null },
+          { $set: racePayload.update },
+          { runValidators: true, context: "query", returnDocument: "after" },
         );
+        if (!merged) {
+          return errorResponseFromCaught(createErr, "Failed to create filament");
+        }
+        return importResponse(merged, false, racePayload);
       } catch (validationErr) {
         return errorResponseFromCaught(
           validationErr,
@@ -194,20 +254,28 @@ export async function POST(request: NextRequest) {
         );
       }
     }
-
-    return NextResponse.json({
-      created,
-      updated: !created,
-      filamentId: String(existing._id),
-      name: existing.name,
-      calibrationApplied: calibrationOutcome.applied,
-      calibrationUnresolved: calibrationOutcome.unresolved || undefined,
-      calibrationContext: calibrationOutcome.context || undefined,
-      settingsAdded: settingsResult.added,
-    });
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to import Bambu Studio profile");
   }
+}
+
+/** Common response shape so all three upsert phases return the same
+ * envelope. */
+function importResponse(
+  doc: { _id: unknown; name: string },
+  created: boolean,
+  payload: Awaited<ReturnType<typeof prepareBambuUpdate>>,
+) {
+  return NextResponse.json({
+    created,
+    updated: !created,
+    filamentId: String(doc._id),
+    name: doc.name,
+    calibrationApplied: payload.calibrationOutcome.applied,
+    calibrationUnresolved: payload.calibrationOutcome.unresolved || undefined,
+    calibrationContext: payload.calibrationOutcome.context || undefined,
+    settingsAdded: payload.settingsResult.added,
+  });
 }
 
 // ─── Helpers live in src/lib/bambuStudioApply.ts so the per-id route

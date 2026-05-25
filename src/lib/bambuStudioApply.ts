@@ -20,7 +20,12 @@
 
 import Printer from "@/models/Printer";
 import Nozzle from "@/models/Nozzle";
+import {
+  mergeSlicerSettings,
+  type SettingsMergeResult,
+} from "@/lib/slicerSettings";
 import type {
+  BambuParseResult,
   CalibrationHints,
   ParsedFilament,
 } from "@/lib/bambuStudioImport";
@@ -41,6 +46,66 @@ export interface ExistingFilamentForApply {
     temperature?: number | null;
     firstLayerTemperature?: number | null;
   }>;
+  settings?: Record<string, unknown>;
+  calibrations?: unknown[];
+}
+
+export interface BambuUpdatePayload {
+  /** The `$set` body for `Filament.updateOne` / `findOneAndUpdate`, or
+   * the doc body passed to `Filament.create`. Already contains structured
+   * fields, settings, and the calibrations[] row (when resolved). */
+  update: Record<string, unknown>;
+  /** Settings-merge outcome — passed back so the caller can include
+   * `settingsAdded` in the response and return early on a size-cap error. */
+  settingsResult: SettingsMergeResult;
+  /** Calibration resolution outcome — included in the response so the
+   * UI can show "applied to printer X / nozzle Y" or the unresolved
+   * nudge. */
+  calibrationOutcome: CalibrationOutcome;
+}
+
+/**
+ * One-shot builder used by both the bulk and per-id routes to turn a
+ * parsed Bambu profile + the existing filament doc into the update
+ * payload. Centralises:
+ *   1. structured-field projection (buildStructuredUpdate)
+ *   2. settings-bag merge with size caps (mergeSlicerSettings)
+ *   3. calibration row dedup + resolve (resolveAndApplyCalibration)
+ *
+ * The bulk route calls this from each phase of its upsert (active /
+ * trashed / race-on-create branch) since `existing` differs per phase.
+ * The per-id route calls it once with the pinned target.
+ *
+ * `existing === null` is the create branch: no merge anchor, no
+ * settings carryover, no calibration row dedup against existing rows.
+ */
+export async function prepareBambuUpdate(
+  parsed: BambuParseResult,
+  existing: ExistingFilamentForApply | null,
+): Promise<BambuUpdatePayload> {
+  const update = buildStructuredUpdate(parsed.filament, existing);
+
+  const settingsResult = mergeSlicerSettings(
+    (existing?.settings as Record<string, unknown>) || {},
+    parsed.filament.settings,
+    // Already-structured keys we own — pulled into `update` above; the
+    // parser already excludes them from `parsed.filament.settings`, so
+    // pass an empty owned-keys set here (the merge has no extra keys
+    // to strip).
+    new Set<string>(),
+  );
+  if (settingsResult.added.length > 0) {
+    update.settings = settingsResult.settings;
+  }
+
+  const calibrationOutcome = await resolveAndApplyCalibration(
+    parsed.filament,
+    parsed.calibrationHints,
+    update,
+    existing,
+  );
+
+  return { update, settingsResult, calibrationOutcome };
 }
 
 export function buildStructuredUpdate(
