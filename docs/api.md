@@ -31,6 +31,9 @@
 | `GET` | `/api/filaments/:id/calibration` | Get calibration data for a filament and nozzle diameter |
 | `GET` | `/api/filaments/:id/spool-check` | Check if a spool has enough filament for a print job |
 | `POST` | `/api/filaments/:id` | Sync a filament preset back from PrusaSlicer |
+| `GET` | `/api/filaments/:id/bambustudio` | Download one filament as a Bambu Studio preset (.json) |
+| `POST` | `/api/filaments/:id/bambustudio` | Sync a Bambu Studio preset INTO this filament (pinned by id) |
+| `POST` | `/api/filaments/bambustudio` | Import a Bambu Studio preset by name (upsert + auto-detect calibration) |
 
 ### Spools
 
@@ -419,6 +422,58 @@ Returns:
   "filament": "Prusament PLA Galaxy Black",
   "updated": ["temperatures", "density", "settings"],
   "settingsAdded": ["filament_start_gcode"]
+}
+```
+
+## Bambu Studio Profiles
+
+Bambu Studio is a fork of OrcaSlicer and the two share the filament-preset `.json` schema. Export reuses the OrcaSlicer generator with a single Bambu-specific tweak (`from: "User"` so Bambu Studio files the preset under the user's custom filaments). Import inverts that mapping and adds auto-detect of the printer/nozzle pair from `printer_settings_id`.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET`  | `/api/filaments/:id/bambustudio` | Download one filament as a Bambu Studio preset (`.json`) |
+| `POST` | `/api/filaments/:id/bambustudio` | Sync a Bambu Studio preset INTO this specific filament (pinned by id) |
+| `POST` | `/api/filaments/bambustudio`     | Import a Bambu Studio preset by name (upsert) |
+
+### GET /api/filaments/:id/bambustudio
+
+Downloads a single filament as a Bambu Studio filament-preset `.json`. Variants are resolved against their parent before serialisation. No `inherits` base preset is set — the server can't know which system presets the user has installed, so the exported preset is standalone (imports fine via Bambu Studio's custom-filament import; the user just doesn't get system-preset inheritance).
+
+### POST /api/filaments/:id/bambustudio
+
+Sync a Bambu Studio preset INTO the filament identified by `:id`. The parsed `name` from the file is ignored — pinning is by id, so renaming the preset in Bambu Studio doesn't break the link to the app's record. Body is either `multipart/form-data` (file upload, 10 MB cap) or `application/json` with the Bambu profile.
+
+Spool subdocuments, `usageHistory`, and `dryCycles` are NEVER touched on a sync — that's strictly inventory state and isn't in the Bambu file.
+
+### POST /api/filaments/bambustudio
+
+Bulk import. Matches by `filament_settings_id` (preferred — that's what the slicer treats as the preset name) or top-level `name`. Three-phase atomic upsert:
+
+1. Update an existing ACTIVE row with that name.
+2. Resurrect a TRASHED (non-purged) row with that name — clears `_deletedAt` in the same atomic write. Without this step, a profile whose name matches a trashed filament would create a duplicate that strands the trashed record.
+3. Create new. If a concurrent identical import wins the race (E11000 on the unique-name index), the route re-fetches the racing winner and merges into it — concurrent identical imports are idempotent.
+
+Required fields on create: `filament_type` and `filament_vendor`.
+
+### Calibration auto-detect (both POST routes)
+
+Bambu calibration values (flow ratio, pressure advance, retraction, fan speeds) live IN the filament preset. The route parses `printer_settings_id` (format roughly `"Vendor Model 0.4 nozzle"`), looks up a Printer whose name or `manufacturer + printerModel` matches, and picks the unique installed nozzle at that diameter. When the match succeeds, a `calibrations[]` row is added/updated tagged with `(printer, nozzle)`. When it fails (no printer matches, >1 printer matches, or >1 nozzle at that diameter on the matched printer), the response carries `calibrationUnresolved: true` so the UI can prompt the user to attach manually — the top-level `maxVolumetricSpeed` still lands.
+
+Response:
+```json
+{
+  "created": false,
+  "updated": true,
+  "filamentId": "...",
+  "name": "Generic PLA",
+  "calibrationApplied": true,
+  "calibrationContext": {
+    "printerId": "...",
+    "printerName": "Bambu Lab P1S",
+    "nozzleId": "...",
+    "nozzleDiameter": 0.4
+  },
+  "settingsAdded": ["overhang_fan_speed", "filament_z_hop"]
 }
 ```
 

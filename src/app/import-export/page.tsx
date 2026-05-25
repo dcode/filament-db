@@ -26,7 +26,51 @@ export default function ImportExportPage() {
   const [showPrusament, setShowPrusament] = useState(false);
   const [showSpoolCsv, setShowSpoolCsv] = useState(false);
   const [importingFile, setImportingFile] = useState(false);
+  const [importingBambu, setImportingBambu] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const bambuFileInputRef = useRef<HTMLInputElement>(null);
+
+  /**
+   * Bambu Studio (.json) import. Separate from `handleFileImport` because:
+   *   - the endpoint is different (/api/filaments/bambustudio)
+   *   - the response carries `calibrationApplied` / `calibrationUnresolved`
+   *     flags we want to surface as distinct toasts, not a generic "imported"
+   *   - the input accept-list is JSON only, not the INI/CSV/XLSX trio
+   */
+  const handleBambuImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportingBambu(true);
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      const res = await fetch("/api/filaments/bambustudio", { method: "POST", body: formData });
+      const data = await res.json();
+      if (!res.ok) {
+        toast(t("filaments.importFailed", { error: data.error }), "error");
+        return;
+      }
+      // Primary outcome
+      const verb = data.created ? t("bambuImport.created") : t("bambuImport.updated");
+      toast(t("bambuImport.success", { verb, name: data.name }));
+      // Calibration follow-up
+      if (data.calibrationApplied && data.calibrationContext) {
+        toast(
+          t("bambuImport.calibrationApplied", {
+            printer: data.calibrationContext.printerName,
+            diameter: data.calibrationContext.nozzleDiameter,
+          }),
+        );
+      } else if (data.calibrationUnresolved) {
+        toast(t("bambuImport.calibrationUnresolved"), "info");
+      }
+    } catch {
+      toast(t("filaments.importNetworkError"), "error");
+    } finally {
+      setImportingBambu(false);
+      if (bambuFileInputRef.current) bambuFileInputRef.current.value = "";
+    }
+  };
 
   const handleFileImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -104,6 +148,20 @@ export default function ImportExportPage() {
           accept=".csv,.xlsx,.ini"
           className="hidden"
           onChange={handleFileImport}
+        />
+        <Tile
+          dot="bg-indigo-500"
+          label={importingBambu ? t("bambuImport.importing") : t("bambuImport.tileLabel")}
+          desc={t("bambuImport.tileDesc")}
+          onClick={() => bambuFileInputRef.current?.click()}
+          disabled={importingBambu}
+        />
+        <input
+          ref={bambuFileInputRef}
+          type="file"
+          accept=".json,application/json"
+          className="hidden"
+          onChange={handleBambuImport}
         />
       </Section>
 
