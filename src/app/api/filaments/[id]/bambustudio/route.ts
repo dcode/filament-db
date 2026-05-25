@@ -186,7 +186,20 @@ export async function POST(
     // state and not in the Bambu file.
     delete (update as Record<string, unknown>).spools;
 
-    await Filament.updateOne({ _id: existing._id }, { $set: update });
+    // Codex P2 on PR #387: `runValidators` so the new numeric range
+    // validators (#337) actually fire on a Bambu sync.
+    try {
+      await Filament.updateOne(
+        { _id: existing._id },
+        { $set: update },
+        { runValidators: true, context: "query" },
+      );
+    } catch (validationErr) {
+      return errorResponseFromCaught(
+        validationErr,
+        "Bambu Studio profile contained invalid values",
+      );
+    }
 
     return NextResponse.json({
       created: false,

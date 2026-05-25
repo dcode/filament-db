@@ -98,6 +98,19 @@ const STRUCTURED_KEYS = new Set<string>([
  * settings bag (otherwise the calibration row's values would race the
  * top-level passthrough on round-trip).
  */
+// Codex P1 on PR #387: keys listed here are pulled into `calibrationHints`
+// and EXCLUDED from the settings bag. Any key in this set that isn't also
+// extracted into a hint would be silently dropped on import — round-trip
+// breaks. So a key only belongs here when:
+//   1. The parser extracts it into a `CalibrationHints` field, AND
+//   2. The applier writes that field to the calibrations[] row.
+//
+// `additional_cooling_fan_speed` and `overhang_fan_speed` were
+// previously listed without a corresponding hint, which dropped them.
+// The Filament calibrations[] schema only models fanMin/Max/Bridge, so
+// extracting them would require a schema change — out of scope here.
+// Instead we let them fall through to the settings bag (passthrough on
+// next export), so no data is lost.
 const CALIBRATION_KEYS = new Set<string>([
   "filament_flow_ratio",
   "filament_extrusion_multiplier",
@@ -108,8 +121,6 @@ const CALIBRATION_KEYS = new Set<string>([
   "filament_max_volumetric_speed", // also structured (top-level)
   "fan_min_speed",
   "fan_max_speed",
-  "additional_cooling_fan_speed",
-  "overhang_fan_speed",
   "bridge_fan_speed",
 ]);
 

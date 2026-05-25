@@ -120,6 +120,21 @@ describe("parseBambuStudioProfile", () => {
     expect(calibrationHints.hasAnyHint).toBe(false);
   });
 
+  it("preserves additional_cooling_fan_speed + overhang_fan_speed in settings (Codex P1 #387)", () => {
+    // These two fan keys USED to be in CALIBRATION_KEYS but had no
+    // corresponding `CalibrationHints` field or model column — so they
+    // were silently dropped from both the calibration row AND the
+    // settings bag. Removing them from CALIBRATION_KEYS lets them
+    // passthrough into settings so the round-trip preserves them.
+    const { filament } = parseBambuStudioProfile({
+      name: ["X"],
+      additional_cooling_fan_speed: ["80"],
+      overhang_fan_speed: ["60"],
+    });
+    expect(filament.settings.additional_cooling_fan_speed).toBe("80");
+    expect(filament.settings.overhang_fan_speed).toBe("60");
+  });
+
   it("stashes unknown keys in the settings passthrough bag", () => {
     const { filament } = parseBambuStudioProfile({
       name: ["X"],

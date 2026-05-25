@@ -217,6 +217,66 @@ describe("Bambu Studio importer routes", () => {
       expect(body.calibrationUnresolved).toBe(true);
     });
 
+    it("flags unresolved when the printer hint matches MULTIPLE printers (Codex P2 #387)", async () => {
+      // Two printers whose names BOTH contain the hint substring "Bambu
+      // Lab P1S" — the previous `printers.find(...)` would silently
+      // pick whichever Mongo returned first, tagging calibration to the
+      // wrong record. Now ambiguous → unresolved.
+      const nozzle = await Nozzle.create({ name: "Brass 0.4", diameter: 0.4, type: "Brass" });
+      await Printer.create({
+        name: "Bambu Lab P1S",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [nozzle._id],
+      });
+      await Printer.create({
+        name: "Bambu Lab P1S (downstairs)",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [nozzle._id],
+      });
+
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({
+            printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+            filament_flow_ratio: ["0.99"],
+          }),
+        ),
+      );
+      const body = await res.json();
+      expect(body.calibrationApplied).toBeFalsy();
+      expect(body.calibrationUnresolved).toBe(true);
+    });
+
+    it("rejects an update that violates the model's numeric validators (Codex P2 #387)", async () => {
+      // GH #337 added `min` validators on cost/density/temperatures.
+      // The Bambu update path now passes `runValidators: true` so a
+      // profile with e.g. a negative density gets a 4xx instead of
+      // silently persisting bad data.
+      await Filament.create({
+        name: "QA Bambu PLA",
+        vendor: "QA Labs",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({ filament_density: ["-1"] }),
+        ),
+      );
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
+
+      // The on-disk filament was NOT mutated to the bad value.
+      const stored = await Filament.findOne({ name: "QA Bambu PLA" });
+      expect(stored.density).not.toBe(-1);
+    });
+
     it("doesn't flag unresolved when there are no calibration hints at all", async () => {
       await seedPrinterWithNozzle();
       const { POST } = await import("@/app/api/filaments/bambustudio/route");

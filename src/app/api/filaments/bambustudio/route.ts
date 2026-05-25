@@ -167,7 +167,24 @@ export async function POST(request: NextRequest) {
     } else {
       // Update — never touch spools/usageHistory/dryCycles.
       delete (update as Record<string, unknown>).spools;
-      await Filament.updateOne({ _id: existing._id }, { $set: update });
+      // Codex P2 on PR #387: `runValidators` so the new numeric range
+      // validators (#337) actually fire on a Bambu import — without it,
+      // a profile carrying e.g. negative density would persist invalid
+      // data and corrupt downstream math. `context: "query"` is the
+      // mongoose recipe for getting the doc context inside validators
+      // (matches the import-atlas route's pattern).
+      try {
+        await Filament.updateOne(
+          { _id: existing._id },
+          { $set: update },
+          { runValidators: true, context: "query" },
+        );
+      } catch (validationErr) {
+        return errorResponseFromCaught(
+          validationErr,
+          "Bambu Studio profile contained invalid values",
+        );
+      }
     }
 
     return NextResponse.json({

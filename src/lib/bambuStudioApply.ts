@@ -199,17 +199,25 @@ async function matchPrinterNozzle(hints: CalibrationHints): Promise<
     .replace(/[-—]\s*$/, "");
   if (!modelHint) return null;
 
-  // Find a Printer whose name CONTAINS the model hint (case-insensitive).
+  // Find printers whose name CONTAINS the model hint (case-insensitive).
   // Users name their printers freely ("My Bambu", "Prusa in the garage"),
   // so the contains check on either side is a pragmatic heuristic.
+  //
+  // Codex P2 on PR #387: collect ALL matches and punt to unresolved when
+  // >1 — silently picking the first when "Bambu Lab P1S" matches both
+  // "Bambu Lab P1S" and "Bambu Lab P1S (downstairs)" would tag the
+  // calibration to whichever Mongo returned first (nondeterministic, and
+  // wrong on average). Same posture as the ambiguous-nozzle branch
+  // below.
   const printers = await Printer.find({ _deletedAt: null })
     .populate("installedNozzles")
     .lean();
   const re = new RegExp(escapeRegex(modelHint), "i");
-  const matched = printers.find(
+  const matches = printers.filter(
     (p) => re.test(p.name) || re.test(`${p.manufacturer} ${p.printerModel}`),
   );
-  if (!matched) return null;
+  if (matches.length !== 1) return null;
+  const matched = matches[0];
 
   // `installedNozzles` is typed as ObjectId[] on the model, but
   // `.populate()` replaces those refs with the full Nozzle docs at
