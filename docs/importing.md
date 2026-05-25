@@ -113,6 +113,52 @@ This also works from a filament's detail page to add another spool of the same m
 
 ---
 
+## Bambu Studio Filament Preset Import
+
+Bambu Studio stores each filament preset as a `.json` file under `~/Library/Application Support/BambuStudio/user/<user>/filament/` (macOS) or the equivalent `%APPDATA%` path on Windows. The app accepts these files directly — including their calibration values (flow ratio, pressure advance, retraction, fan speeds) — and tries to attach the calibration to the right printer + nozzle automatically.
+
+There are two entry points depending on what you want to do.
+
+### Sync a calibrated preset INTO an existing filament
+
+Best for the "I just calibrated this filament in Bambu Studio" workflow.
+
+1. In Bambu Studio, right-click the calibrated filament → **Export Preset** to get a `.json`
+2. In Filament DB, open the filament's detail page
+3. Click **Sync from Bambu Studio** (next to the slicer export menu) and pick the file
+4. The page re-fetches so the new values appear immediately
+
+The filament is targeted by id — renaming the preset in Bambu Studio doesn't break the link.
+
+### Import a new filament from a Bambu preset
+
+For the "I have a Bambu preset for a filament I don't have in the app yet" case.
+
+1. Open **Import / Export** (top-right or `/import-export`)
+2. Click the **Bambu Studio (.json)** tile and select the file
+3. The route upserts by name (uses `filament_settings_id` from the file): an existing active filament is updated, a soft-deleted one with the same name is resurrected, otherwise a new filament is created
+
+For a folder full of presets, the API endpoint (`POST /api/filaments/bambustudio`) can be scripted to loop through them.
+
+### Calibration auto-detect
+
+Bambu's calibration values live IN the filament preset. The importer reads `printer_settings_id` (something like `"Bambu Lab P1S 0.4 nozzle"`), finds a Printer in the app whose name or model matches, and picks the unique installed nozzle at that diameter. When the match succeeds, a `calibrations[]` row lands tagged with that printer + nozzle — you don't have to retype flow ratio, pressure advance, etc.
+
+When the match fails (no printer, ambiguous printer, multiple nozzles at the same diameter on the matched printer, or no nozzle at that diameter anywhere in the catalog), a toast says **"Calibration values found but couldn't be tagged to a printer — open the filament and pick the right printer/nozzle to apply them."** The top-level `Max Volumetric Speed` still lands; only the per-nozzle values that can't be unambiguously placed are skipped.
+
+### What's preserved on round-trip
+
+Export the filament back via **Export for slicer → Bambu Studio**, edit / re-calibrate in Bambu, and re-import — every field the exporter writes is read back by the parser. Unknown Bambu-specific keys ride in a settings passthrough bag so they survive across rounds without the app needing to model each one.
+
+What's NOT touched on import (so the round-trip can't damage your inventory):
+
+- Spool subdocuments (label, weight, location, photo)
+- `usageHistory` (print-history-driven gram refunds)
+- `dryCycles`
+- Parent/variant relationships
+
+---
+
 ## CSV / XLSX Import
 
 1. Open the **Import/Export** dropdown on the home page and click **"Import File (INI / CSV / XLSX)"** — the app routes by extension (`.csv` → CSV importer, `.xlsx` → XLSX importer, `.ini` → PrusaSlicer bundle)

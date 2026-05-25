@@ -1748,6 +1748,117 @@
           "200": { "description": "Bambu Studio filament preset (.json download)", "content": { "application/json": { "schema": { "type": "object" } } } },
           "404": { "description": "Filament not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
+      },
+      "post": {
+        "tags": ["OrcaSlicer"],
+        "summary": "Sync a Bambu Studio preset INTO this filament (by id)",
+        "description": "Inverse of the per-id export above. Pinned by id so the user updates exactly the filament they're looking at, even if the file's `filament_settings_id` doesn't match (renamed in the slicer, lost the link to the app's record). The parsed `name` field is intentionally ignored. Spool subdocuments, usageHistory and dryCycles are NEVER touched. Calibration values (flow ratio, pressure advance, retraction, fan speeds, max volumetric speed) auto-attach to a `calibrations[]` row tagged with the printer + nozzle inferred from `printer_settings_id` — when a printer matches but the nozzle context is ambiguous or no match exists, the response carries `calibrationUnresolved: true` so the UI can prompt the user to pick manually. Body is either `multipart/form-data` (file upload, 10 MB cap) or `application/json` with the Bambu profile directly.",
+        "parameters": [
+          { "name": "id", "in": "path", "required": true, "schema": { "type": "string" }, "description": "MongoDB ObjectId of the filament to update" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": { "file": { "type": "string", "format": "binary", "description": "Bambu Studio filament-preset .json file" } }
+              }
+            },
+            "application/json": { "schema": { "type": "object", "description": "Bambu Studio filament-preset payload" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Filament synced. Top-level fields, `bedTypeTemps[]`, settings-bag passthrough, and (when resolved) a `calibrations[]` row are all updated atomically.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["created", "updated", "filamentId", "name", "settingsAdded"],
+                  "properties": {
+                    "created": { "type": "boolean", "enum": [false] },
+                    "updated": { "type": "boolean", "enum": [true] },
+                    "filamentId": { "type": "string" },
+                    "name": { "type": "string" },
+                    "calibrationApplied": { "type": "boolean", "description": "True when a `calibrations[]` row was added or updated for the matched (printer, nozzle)." },
+                    "calibrationUnresolved": { "type": "boolean", "description": "True when calibration values were present but the printer/nozzle couldn't be matched unambiguously. The top-level `maxVolumetricSpeed` still lands, but per-nozzle-only hints (flow ratio, pressure advance, retraction, fan speeds) are dropped — the UI surfaces a nudge to attach manually." },
+                    "calibrationContext": {
+                      "type": "object",
+                      "description": "When `calibrationApplied` is true, identifies which (printer, nozzle) the calibration row was tagged to.",
+                      "properties": {
+                        "printerId": { "type": "string" },
+                        "printerName": { "type": "string" },
+                        "nozzleId": { "type": "string" },
+                        "nozzleDiameter": { "type": "number" }
+                      }
+                    },
+                    "settingsAdded": { "type": "array", "items": { "type": "string" }, "description": "Profile keys not mapped to structured fields, preserved in the settings bag for round-trip on next export." }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Malformed JSON, missing identifier, wrong content-type, oversized upload (413 on size cap), or values that fail the model's numeric validators.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Cross-origin request rejected by the trusted-origin guard.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "404": { "description": "Filament not found, OR was soft-deleted between findOne and the atomic update.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "description": "Uploaded file exceeds the 10 MB cap.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/filaments/bambustudio": {
+      "post": {
+        "tags": ["OrcaSlicer"],
+        "summary": "Import a Bambu Studio preset (upsert by name)",
+        "description": "Bulk-import companion to the per-id sync above. Matches by `filament_settings_id` (preferred — what the slicer treats as the preset name) or top-level `name`. Three-phase atomic upsert: (1) update an existing ACTIVE row, (2) resurrect a TRASHED non-purged row with the same name (clears `_deletedAt` in the same write), or (3) create new — catching E11000 from a concurrent identical import and converging on the racing winner's row. Spool subdocuments are NEVER touched. Calibration resolution is identical to the per-id variant. Body is either `multipart/form-data` (10 MB cap) or `application/json`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "required": ["file"],
+                "properties": { "file": { "type": "string", "format": "binary", "description": "Bambu Studio filament-preset .json file" } }
+              }
+            },
+            "application/json": { "schema": { "type": "object", "description": "Bambu Studio filament-preset payload" } }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Filament imported. `created` is true on the create path (or the create→update fallback after an E11000 race), false on update / resurrect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["created", "updated", "filamentId", "name", "settingsAdded"],
+                  "properties": {
+                    "created": { "type": "boolean" },
+                    "updated": { "type": "boolean" },
+                    "filamentId": { "type": "string" },
+                    "name": { "type": "string" },
+                    "calibrationApplied": { "type": "boolean" },
+                    "calibrationUnresolved": { "type": "boolean" },
+                    "calibrationContext": {
+                      "type": "object",
+                      "properties": {
+                        "printerId": { "type": "string" },
+                        "printerName": { "type": "string" },
+                        "nozzleId": { "type": "string" },
+                        "nozzleDiameter": { "type": "number" }
+                      }
+                    },
+                    "settingsAdded": { "type": "array", "items": { "type": "string" } }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "description": "Malformed JSON, missing identifier (`filament_settings_id`/`name`), missing `filament_type`/`filament_vendor` on create, wrong content-type, or values that fail the model's numeric validators.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "403": { "description": "Cross-origin request rejected by the trusted-origin guard.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "413": { "description": "Uploaded file exceeds the 10 MB cap.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
       }
     },
     "/api/scan/stream": {
