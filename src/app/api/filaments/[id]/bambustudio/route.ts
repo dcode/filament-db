@@ -17,6 +17,7 @@ import {
 } from "@/lib/bambuStudioApply";
 import {
   assertMultipartFormData,
+  checkFileSize,
   errorResponse,
   errorResponseFromCaught,
 } from "@/lib/apiErrorHandler";
@@ -121,6 +122,11 @@ export async function POST(
     if (!(file instanceof File)) {
       return errorResponse("multipart upload must include a 'file' field", 400);
     }
+    // Codex P2 on PR #387 round 2: cap upload size before `file.text()`
+    // materialises the body in memory. Same 10 MB cap as the bulk route
+    // and the existing /api/filaments/import* family.
+    const sizeErr = checkFileSize(file);
+    if (sizeErr) return sizeErr;
     const text = await file.text();
     try {
       raw = JSON.parse(text);

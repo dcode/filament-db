@@ -88,10 +88,14 @@ describe("parseBambuStudioProfile", () => {
     expect(filament.shrinkageZ).toBe(1.2);
   });
 
-  it("parses the soluble flag from '0'/'1'", () => {
-    expect(parseBambuStudioProfile({ name: ["X"], filament_soluble: ["1"] }).filament.soluble).toBe(true);
-    expect(parseBambuStudioProfile({ name: ["X"], filament_soluble: ["0"] }).filament.soluble).toBe(false);
-    expect(parseBambuStudioProfile({ name: ["X"] }).filament.soluble).toBeUndefined();
+  it("passes filament_soluble through the settings bag (no model column yet, Codex P1 #387 r2)", () => {
+    // The Filament model has no `soluble` field, so we let the value
+    // ride in the passthrough settings bag instead of trying to store
+    // it on a column that doesn't exist (Mongoose strict mode would
+    // silently drop it). Round-trip is preserved.
+    expect(parseBambuStudioProfile({ name: ["X"], filament_soluble: ["1"] }).filament.settings.filament_soluble).toBe("1");
+    expect(parseBambuStudioProfile({ name: ["X"], filament_soluble: ["0"] }).filament.settings.filament_soluble).toBe("0");
+    expect(parseBambuStudioProfile({ name: ["X"] }).filament.settings.filament_soluble).toBeUndefined();
   });
 
   it("extracts calibration hints when present and flags hasAnyHint", () => {

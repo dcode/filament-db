@@ -72,7 +72,11 @@ const STRUCTURED_KEYS = new Set<string>([
   "filament_cost",
   "filament_max_volumetric_speed",
   "filament_notes",
-  "filament_soluble",
+  // `filament_soluble` deliberately NOT here — the Filament model has no
+  // `soluble` column, so even if the parser extracted it Mongoose strict
+  // mode would silently drop the value on the update. Letting it fall
+  // through to the settings bag preserves the round-trip exactly the way
+  // we handle other model-less Bambu keys (Codex P1 on PR #387 round 2).
   "filament_shrink",
   "filament_shrinkage_compensation_z",
   // temperatures
@@ -182,7 +186,6 @@ export interface ParsedFilament {
   cost?: number;
   maxVolumetricSpeed?: number;
   notes?: string;
-  soluble?: boolean;
   shrinkageXY?: number;
   shrinkageZ?: number;
   temperatures: ParsedTemperatures;
@@ -263,11 +266,6 @@ export function parseBambuStudioProfile(raw: unknown): BambuParseResult {
     bedTypeTemps: [],
     settings: {},
   };
-
-  // Soluble flag — Bambu writes "0"/"1"
-  const solubleStr = unwrap(json.filament_soluble);
-  if (solubleStr === "1" || solubleStr === "true") filament.soluble = true;
-  else if (solubleStr === "0" || solubleStr === "false") filament.soluble = false;
 
   // Shrinkage — "0.5%" → 0.5
   const shrink = num(json.filament_shrink);

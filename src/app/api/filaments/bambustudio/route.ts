@@ -11,6 +11,7 @@ import {
 } from "@/lib/bambuStudioApply";
 import {
   assertMultipartFormData,
+  checkFileSize,
   errorResponse,
   errorResponseFromCaught,
 } from "@/lib/apiErrorHandler";
@@ -70,6 +71,13 @@ export async function POST(request: NextRequest) {
     if (!(file instanceof File)) {
       return errorResponse("multipart upload must include a 'file' field", 400);
     }
+    // Codex P2 on PR #387 round 2: cap upload size BEFORE reading.
+    // `file.text()` materialises the entire body into memory; without
+    // this guard a multi-GB upload would happily exhaust the server.
+    // Matches the existing 10 MB cap used by /api/filaments/import* and
+    // /api/filaments/parse-ini.
+    const sizeErr = checkFileSize(file);
+    if (sizeErr) return sizeErr;
     const text = await file.text();
     try {
       raw = JSON.parse(text);

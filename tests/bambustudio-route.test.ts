@@ -131,6 +131,25 @@ describe("Bambu Studio importer routes", () => {
       expect((await noVendor.json()).error).toMatch(/filament_vendor/);
     });
 
+    it("rejects an oversized multipart upload with 413 (Codex P2 #387 r2)", async () => {
+      // The route caps multipart uploads at 10 MB. A real Bambu preset
+      // JSON is single-digit KB; reject obviously-over-budget bodies
+      // before `file.text()` materialises them in memory.
+      const huge = "x".repeat(11 * 1024 * 1024); // 11 MB > MAX_UPLOAD_SIZE
+      const fd = new FormData();
+      fd.append(
+        "file",
+        new File([huge], "huge.json", { type: "application/json" }),
+      );
+      const req = new NextRequest("http://localhost/api/filaments/bambustudio", {
+        method: "POST",
+        body: fd,
+      });
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(req);
+      expect(res.status).toBe(413);
+    });
+
     it("rejects a non-multipart / non-JSON body with 400", async () => {
       const { POST } = await import("@/app/api/filaments/bambustudio/route");
       const req = new NextRequest("http://localhost/api/filaments/bambustudio", {
