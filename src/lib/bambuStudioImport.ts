@@ -109,20 +109,37 @@ const STRUCTURED_KEYS = new Set<string>([
 //   1. The parser extracts it into a `CalibrationHints` field, AND
 //   2. The applier writes that field to the calibrations[] row.
 //
-// `additional_cooling_fan_speed` and `overhang_fan_speed` were
-// previously listed without a corresponding hint, which dropped them.
-// The Filament calibrations[] schema only models fanMin/Max/Bridge, so
-// extracting them would require a schema change — out of scope here.
-// Instead we let them fall through to the settings bag (passthrough on
-// next export), so no data is lost.
+// Round 3 (Codex P1 #387): the previous round let
+// `additional_cooling_fan_speed` and `overhang_fan_speed` fall through
+// to settings because the parser had no matching hint. But the repo's
+// exporter (`calibrationToOrcaSlicerKeys` in
+// `src/lib/orcaSlicerBundle.ts`) actually emits the fan/retraction
+// values under THESE Bambu/Orca-canonical names:
+//
+//   calibration.fanMinSpeed     → overhang_fan_speed
+//   calibration.fanMaxSpeed     → additional_cooling_fan_speed
+//   calibration.retractLength   → filament_retraction_length
+//   calibration.retractSpeed    → filament_retraction_speed
+//   calibration.retractLift     → filament_z_hop
+//
+// So the round-trip export → import was silently dropping these — the
+// values landed in settings rather than the calibrations[] row. Pull
+// each through CALIBRATION_KEYS + extract into the right hint field
+// below. Older aliases (`fan_min_speed`, `filament_retract_*`) stay
+// listed as fallbacks so hand-edited / older profiles still work.
 const CALIBRATION_KEYS = new Set<string>([
   "filament_flow_ratio",
   "filament_extrusion_multiplier",
   "pressure_advance",
+  "filament_retraction_length",
+  "filament_retraction_speed",
+  "filament_z_hop",
   "filament_retract_length",
   "filament_retract_speed",
   "filament_retract_lift",
   "filament_max_volumetric_speed", // also structured (top-level)
+  "overhang_fan_speed",
+  "additional_cooling_fan_speed",
   "fan_min_speed",
   "fan_max_speed",
   "bridge_fan_speed",
@@ -298,12 +315,24 @@ export function parseBambuStudioProfile(raw: unknown): BambuParseResult {
     extrusionMultiplier:
       num(json.filament_flow_ratio) ?? num(json.filament_extrusion_multiplier),
     pressureAdvance: num(json.pressure_advance),
-    retractLength: num(json.filament_retract_length),
-    retractSpeed: num(json.filament_retract_speed),
-    retractLift: num(json.filament_retract_lift),
+    // Canonical Bambu/Orca key names (`filament_retraction_*`,
+    // `filament_z_hop`) come first; the shorter aliases stay as a
+    // fallback so hand-edited or older profiles still parse. Round-trip
+    // through the repo's own export → import path now works again
+    // (Codex P1 on PR #387 round 3).
+    retractLength:
+      num(json.filament_retraction_length) ?? num(json.filament_retract_length),
+    retractSpeed:
+      num(json.filament_retraction_speed) ?? num(json.filament_retract_speed),
+    retractLift: num(json.filament_z_hop) ?? num(json.filament_retract_lift),
     maxVolumetricSpeed: num(json.filament_max_volumetric_speed),
-    fanMinSpeed: num(json.fan_min_speed),
-    fanMaxSpeed: num(json.fan_max_speed),
+    // Same canonical-first pattern: the exporter writes
+    // `overhang_fan_speed` for fanMinSpeed and
+    // `additional_cooling_fan_speed` for fanMaxSpeed; the old
+    // `fan_min_speed`/`fan_max_speed` names stay as fallback aliases.
+    fanMinSpeed: num(json.overhang_fan_speed) ?? num(json.fan_min_speed),
+    fanMaxSpeed:
+      num(json.additional_cooling_fan_speed) ?? num(json.fan_max_speed),
     fanBridgeSpeed: num(json.bridge_fan_speed),
     hasAnyHint: false,
   };

@@ -124,19 +124,69 @@ describe("parseBambuStudioProfile", () => {
     expect(calibrationHints.hasAnyHint).toBe(false);
   });
 
-  it("preserves additional_cooling_fan_speed + overhang_fan_speed in settings (Codex P1 #387)", () => {
-    // These two fan keys USED to be in CALIBRATION_KEYS but had no
-    // corresponding `CalibrationHints` field or model column — so they
-    // were silently dropped from both the calibration row AND the
-    // settings bag. Removing them from CALIBRATION_KEYS lets them
-    // passthrough into settings so the round-trip preserves them.
-    const { filament } = parseBambuStudioProfile({
+  it("extracts overhang_fan_speed + additional_cooling_fan_speed as fan hints (Codex P1 #387 r3)", () => {
+    // These match what the exporter (calibrationToOrcaSlicerKeys) emits
+    // for `fanMinSpeed` and `fanMaxSpeed`. Round 2 wrongly passed them
+    // through settings — round 3 hooks them up properly so the
+    // export → import round-trip preserves the calibration row.
+    const { calibrationHints, filament } = parseBambuStudioProfile({
       name: ["X"],
-      additional_cooling_fan_speed: ["80"],
       overhang_fan_speed: ["60"],
+      additional_cooling_fan_speed: ["80"],
     });
-    expect(filament.settings.additional_cooling_fan_speed).toBe("80");
-    expect(filament.settings.overhang_fan_speed).toBe("60");
+    expect(calibrationHints.fanMinSpeed).toBe(60);
+    expect(calibrationHints.fanMaxSpeed).toBe(80);
+    expect(calibrationHints.hasAnyHint).toBe(true);
+    // Must NOT also leak into settings, else the round-trip would
+    // double-emit the key.
+    expect(filament.settings.overhang_fan_speed).toBeUndefined();
+    expect(filament.settings.additional_cooling_fan_speed).toBeUndefined();
+  });
+
+  it("falls back to fan_min_speed / fan_max_speed when the canonical names aren't present", () => {
+    const { calibrationHints } = parseBambuStudioProfile({
+      name: ["X"],
+      fan_min_speed: ["20"],
+      fan_max_speed: ["100"],
+    });
+    expect(calibrationHints.fanMinSpeed).toBe(20);
+    expect(calibrationHints.fanMaxSpeed).toBe(100);
+  });
+
+  it("round-trips calibration values via calibrationToOrcaSlicerKeys (Codex P1 #387 r3)", async () => {
+    // The bug Codex flagged would have been caught immediately by a
+    // test that runs a representative calibration through the export
+    // generator and then the import parser. Lock it in: every field
+    // the exporter emits MUST land in calibrationHints after the
+    // re-parse, so the export → calibrate-in-Bambu → re-import flow
+    // can't silently drop calibration data again.
+    const { calibrationToOrcaSlicerKeys } = await import("@/lib/orcaSlicerBundle");
+    const original = {
+      extrusionMultiplier: 0.965,
+      maxVolumetricSpeed: 12,
+      pressureAdvance: 0.028,
+      retractLength: 0.8,
+      retractSpeed: 35,
+      retractLift: 0.2,
+      nozzleTemp: 215,
+      nozzleTempFirstLayer: 220,
+      bedTemp: 60,
+      bedTempFirstLayer: 65,
+      fanMinSpeed: 50,
+      fanMaxSpeed: 100,
+    };
+    const exported = calibrationToOrcaSlicerKeys(original);
+    // Stamp a minimum identifier so the parser accepts the payload.
+    const profile = { name: ["X"], ...exported };
+    const { calibrationHints } = parseBambuStudioProfile(profile);
+    expect(calibrationHints.extrusionMultiplier).toBe(original.extrusionMultiplier);
+    expect(calibrationHints.maxVolumetricSpeed).toBe(original.maxVolumetricSpeed);
+    expect(calibrationHints.pressureAdvance).toBe(original.pressureAdvance);
+    expect(calibrationHints.retractLength).toBe(original.retractLength);
+    expect(calibrationHints.retractSpeed).toBe(original.retractSpeed);
+    expect(calibrationHints.retractLift).toBe(original.retractLift);
+    expect(calibrationHints.fanMinSpeed).toBe(original.fanMinSpeed);
+    expect(calibrationHints.fanMaxSpeed).toBe(original.fanMaxSpeed);
   });
 
   it("stashes unknown keys in the settings passthrough bag", () => {
