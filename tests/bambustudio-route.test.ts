@@ -236,6 +236,73 @@ describe("Bambu Studio importer routes", () => {
       expect(body.calibrationUnresolved).toBe(true);
     });
 
+    it("flags unresolved when matched printer has no nozzle at the diameter AND the global catalog has >1 candidate (Codex P2 #387 r4)", async () => {
+      // The matched printer has no 0.4 installed; the global catalog
+      // has two — Brass + Hardened — both at 0.4. The previous
+      // `Nozzle.findOne` fallback would pick whichever Mongo returned
+      // first; now we require a unique global match or punt.
+      const big = await Nozzle.create({ name: "Brass 0.6", diameter: 0.6, type: "Brass" });
+      await Nozzle.create({ name: "Cat Brass 0.4", diameter: 0.4, type: "Brass" });
+      await Nozzle.create({ name: "Cat Hardened 0.4", diameter: 0.4, type: "Hardened Steel" });
+      // Printer's only INSTALLED nozzle is a 0.6, so the 0.4 hint
+      // forces the global-catalog fallback path.
+      await Printer.create({
+        name: "Bambu Lab P1S",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [big._id],
+      });
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({
+            printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+            filament_flow_ratio: ["0.99"],
+          }),
+        ),
+      );
+      const body = await res.json();
+      expect(body.calibrationApplied).toBeFalsy();
+      expect(body.calibrationUnresolved).toBe(true);
+    });
+
+    it("falls back to the global catalog when matched printer has no nozzle at diameter AND exactly one candidate exists (Codex P2 #387 r4)", async () => {
+      // Same setup but only ONE 0.4 nozzle in the global catalog —
+      // adoption is unambiguous, calibration applies. This is the
+      // helpful branch the user originally wanted: "I forgot to attach
+      // the only 0.4 I own to the printer, just use it."
+      const big = await Nozzle.create({ name: "Brass 0.6", diameter: 0.6, type: "Brass" });
+      const onlyFour = await Nozzle.create({ name: "The 0.4", diameter: 0.4, type: "Brass" });
+      const printer = await Printer.create({
+        name: "Bambu Lab P1S",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [big._id],
+      });
+      const { POST } = await import("@/app/api/filaments/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          "http://localhost/api/filaments/bambustudio",
+          minimalProfile({
+            printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+            filament_flow_ratio: ["0.99"],
+          }),
+        ),
+      );
+      const body = await res.json();
+      expect(body.calibrationApplied).toBe(true);
+      expect(body.calibrationContext.printerName).toBe("Bambu Lab P1S");
+      expect(body.calibrationContext.nozzleDiameter).toBe(0.4);
+
+      const stored = await Filament.findOne({ name: "QA Bambu PLA" });
+      const cal = stored.calibrations.find(
+        (c: { printer: unknown; nozzle: unknown }) =>
+          String(c.printer) === String(printer._id) && String(c.nozzle) === String(onlyFour._id),
+      );
+      expect(cal).toBeTruthy();
+    });
+
     it("flags unresolved when the printer hint matches MULTIPLE printers (Codex P2 #387)", async () => {
       // Two printers whose names BOTH contain the hint substring "Bambu
       // Lab P1S" — the previous `printers.find(...)` would silently

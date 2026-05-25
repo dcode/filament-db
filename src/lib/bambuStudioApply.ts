@@ -236,16 +236,23 @@ async function matchPrinterNozzle(hints: CalibrationHints): Promise<
     };
   }
   if (sameDiameter.length === 0) {
-    // Fallback: the diameter exists in the global catalog but isn't yet
-    // attached to this printer's `installedNozzles`. Pick any nozzle at
-    // that diameter so the calibration row can land — the user can
-    // re-tag it later via the form.
-    const anyNozzle = await Nozzle.findOne({ diameter, _deletedAt: null }).lean();
-    if (!anyNozzle) return null;
+    // Fallback: the matched printer doesn't have a nozzle at this
+    // diameter installed yet, but maybe a matching one exists in the
+    // global catalog. Codex P2 on PR #387 round 4: `findOne` here was
+    // non-deterministic when MULTIPLE global nozzles share the
+    // diameter (Brass / Hardened / ObXidian variants — common). Use
+    // `find` + a length check so we only adopt a global nozzle when
+    // exactly one candidate exists; otherwise punt to unresolved, same
+    // posture as the in-printer ambiguous branch right below.
+    const globalCandidates = await Nozzle.find({
+      diameter,
+      _deletedAt: null,
+    }).lean();
+    if (globalCandidates.length !== 1) return null;
     return {
       printerId: String(matched._id),
       printerName: matched.name,
-      nozzleId: String(anyNozzle._id),
+      nozzleId: String(globalCandidates[0]._id),
       nozzleDiameter: diameter,
     };
   }
