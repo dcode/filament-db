@@ -124,6 +124,22 @@ describe("parseBambuStudioProfile", () => {
     expect(calibrationHints.hasAnyHint).toBe(false);
   });
 
+  it("hasAnyHint excludes filament_max_volumetric_speed alone (Codex P3 #387 r6)", () => {
+    // maxVolumetricSpeed is the one calibration-relevant value that
+    // ALSO writes to a top-level filament field, so when it's the only
+    // hint and the printer doesn't resolve, NOTHING is lost — the
+    // top-level update carries it. Previously hasAnyHint became true,
+    // driving a misleading "calibration couldn't be tagged" warning
+    // toast on otherwise-successful imports.
+    const { calibrationHints } = parseBambuStudioProfile({
+      name: ["X"],
+      printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+      filament_max_volumetric_speed: ["15"],
+    });
+    expect(calibrationHints.maxVolumetricSpeed).toBe(15); // still extracted
+    expect(calibrationHints.hasAnyHint).toBe(false); // but doesn't trigger unresolved
+  });
+
   it("extracts overhang_fan_speed + additional_cooling_fan_speed as fan hints (Codex P1 #387 r3)", () => {
     // These match what the exporter (calibrationToOrcaSlicerKeys) emits
     // for `fanMinSpeed` and `fanMaxSpeed`. Round 2 wrongly passed them

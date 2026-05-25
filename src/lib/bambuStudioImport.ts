@@ -336,13 +336,21 @@ export function parseBambuStudioProfile(raw: unknown): BambuParseResult {
     fanBridgeSpeed: num(json.bridge_fan_speed),
     hasAnyHint: false,
   };
+  // Codex P3 on PR #387 round 6: `maxVolumetricSpeed` is the ONE
+  // calibration-relevant value that ALSO lands on the top-level filament
+  // field (`buildStructuredUpdate` writes it). When it's the only hint
+  // present and we can't resolve a printer/nozzle context, nothing is
+  // actually lost — the top-level update carries the value. Flagging
+  // `calibrationUnresolved: true` in that case drove a misleading
+  // warning toast on successful imports. Exclude it from `hasAnyHint`
+  // so we only enter the unresolved path when there's per-nozzle data
+  // that would actually be dropped.
   calibrationHints.hasAnyHint =
     calibrationHints.extrusionMultiplier != null ||
     calibrationHints.pressureAdvance != null ||
     calibrationHints.retractLength != null ||
     calibrationHints.retractSpeed != null ||
     calibrationHints.retractLift != null ||
-    calibrationHints.maxVolumetricSpeed != null ||
     calibrationHints.fanMinSpeed != null ||
     calibrationHints.fanMaxSpeed != null ||
     calibrationHints.fanBridgeSpeed != null;

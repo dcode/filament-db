@@ -194,9 +194,16 @@ export async function POST(
 
     // Codex P2 on PR #387: `runValidators` so the new numeric range
     // validators (#337) actually fire on a Bambu sync.
+    //
+    // Codex P2 on PR #387 round 6: also include `_deletedAt: null` in
+    // the filter so a concurrent soft-delete between the findOne above
+    // and this write doesn't quietly mutate a tombstoned row and
+    // return updated:true. Check matchedCount and 404 if the row was
+    // removed in the race.
+    let updateRes: { matchedCount: number };
     try {
-      await Filament.updateOne(
-        { _id: existing._id },
+      updateRes = await Filament.updateOne(
+        { _id: existing._id, _deletedAt: null },
         { $set: update },
         { runValidators: true, context: "query" },
       );
@@ -204,6 +211,12 @@ export async function POST(
       return errorResponseFromCaught(
         validationErr,
         "Bambu Studio profile contained invalid values",
+      );
+    }
+    if (updateRes.matchedCount === 0) {
+      return errorResponse(
+        "Filament was deleted before the sync could complete",
+        404,
       );
     }
 

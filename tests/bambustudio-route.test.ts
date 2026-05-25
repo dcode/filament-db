@@ -521,6 +521,46 @@ describe("Bambu Studio importer routes", () => {
       expect(res.status).toBe(400);
     });
 
+    it("returns 404 if the filament is soft-deleted between findOne and updateOne (Codex P2 #387 r6)", async () => {
+      // Simulate the soft-delete race: the initial findOne returns the
+      // doc, but by the time the updateOne fires it's been tombstoned.
+      // Without the `_deletedAt: null` clause in the update filter
+      // (plus the matchedCount check) the route would happily update
+      // the deleted row and return updated:true, lying to the client.
+      vi.resetModules();
+      Filament = (await import("@/models/Filament")).default;
+      const target = await Filament.create({
+        name: "QA Bambu PLA",
+        vendor: "QA",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      // Soft-delete it now, AFTER our `Filament.create` but BEFORE the
+      // route runs — and spy on findOne to return the pre-delete view
+      // of the doc, simulating the race window (the real DB now has
+      // `_deletedAt` set, so the update filter's `_deletedAt: null`
+      // matches zero docs and the route 404s).
+      await Filament.updateOne({ _id: target._id }, { $set: { _deletedAt: new Date() } });
+      const fakeActive = { ...target.toObject(), _deletedAt: null };
+      const spy = vi.spyOn(Filament, "findOne").mockImplementationOnce(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (() => ({ lean: async () => fakeActive, exec: async () => fakeActive, then: (cb: any) => cb(fakeActive) })) as any,
+      );
+
+      try {
+        const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+        const res = await POST(
+          jsonReq(`http://localhost/api/filaments/${target._id}/bambustudio`, minimalProfile()),
+          { params: Promise.resolve({ id: String(target._id) }) },
+        );
+        expect(res.status).toBe(404);
+        const body = await res.json();
+        expect(body.error).toMatch(/deleted/i);
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
     it("returns 404 when the filament doesn't exist", async () => {
       const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
       const missing = "000000000000000000000000";
