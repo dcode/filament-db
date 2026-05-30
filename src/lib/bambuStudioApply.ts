@@ -38,8 +38,25 @@ import type {
 /** Loose shape for the `existing` filament parameter. The full Mongoose
  * doc type has stricter null-vs-undefined on its embedded arrays
  * (`number | null` vs `number | undefined`) — only `bedType` is read
- * here for dedup, so accept anything with that field. */
+ * here for dedup, so accept anything with that field.
+ *
+ * Codex P1 on PR #473 round 2: the inheritable scalar fields below
+ * (type, vendor, density, cost, diameter, maxVolumetricSpeed,
+ * shrinkageXY, shrinkageZ) are read by `buildStructuredUpdate` to
+ * decide whether a variant has a stale local override worth
+ * `$unset`-ing. They MUST be populated on whatever the caller passes —
+ * the previous augment helpers stripped them, so the unset path was
+ * unreachable in practice even though the unit tests passed against
+ * the unstripped shape. */
 export interface ExistingFilamentForApply {
+  type?: string | null;
+  vendor?: string | null;
+  diameter?: number | null;
+  density?: number | null;
+  cost?: number | null;
+  maxVolumetricSpeed?: number | null;
+  shrinkageXY?: number | null;
+  shrinkageZ?: number | null;
   temperatures?: Record<string, unknown>;
   bedTypeTemps?: Array<{
     bedType: string;
@@ -48,6 +65,13 @@ export interface ExistingFilamentForApply {
   }>;
   settings?: Record<string, unknown>;
   calibrations?: unknown[];
+  /** GH #403: variant detection. When the existing doc is a variant
+   * (has a parentId), inheritable scalars whose parsed value already
+   * matches what the parent provides should be SKIPPED — writing the
+   * field would pin the variant's local value and sever inheritance.
+   * `parent` is the resolved parent doc (or null if not a variant). */
+  parentId?: string | null;
+  parent?: Record<string, unknown> | null;
 }
 
 export interface BambuUpdatePayload {
@@ -55,6 +79,11 @@ export interface BambuUpdatePayload {
    * the doc body passed to `Filament.create`. Already contains structured
    * fields, settings, and the calibrations[] row (when resolved). */
   update: Record<string, unknown>;
+  /** Field names that must be `$unset` on the variant doc — the import
+   * matched the parent's value, but the variant currently carries a
+   * stale local override that's diverged from the parent. Empty for
+   * root filaments and create-branch calls. (Codex P1 on PR #473.) */
+  unsetKeys: string[];
   /** Settings-merge outcome — passed back so the caller can include
    * `settingsAdded` in the response and return early on a size-cap error. */
   settingsResult: SettingsMergeResult;
@@ -62,6 +91,15 @@ export interface BambuUpdatePayload {
    * UI can show "applied to printer X / nozzle Y" or the unresolved
    * nudge. */
   calibrationOutcome: CalibrationOutcome;
+}
+
+/** Structured-projection result. `set` is the `$set` body; `unset` lists
+ *  variant fields that should be cleared (the import matched the
+ *  parent's value but the variant had a stale local override that would
+ *  otherwise persist). Empty `unset` for root filaments. */
+export interface StructuredUpdateResult {
+  set: Record<string, unknown>;
+  unset: string[];
 }
 
 /**
@@ -83,7 +121,10 @@ export async function prepareBambuUpdate(
   parsed: BambuParseResult,
   existing: ExistingFilamentForApply | null,
 ): Promise<BambuUpdatePayload> {
-  const update = buildStructuredUpdate(parsed.filament, existing);
+  const { set: update, unset: unsetKeys } = buildStructuredUpdate(
+    parsed.filament,
+    existing,
+  );
 
   const settingsResult = mergeSlicerSettings(
     (existing?.settings as Record<string, unknown>) || {},
@@ -105,24 +146,89 @@ export async function prepareBambuUpdate(
     existing,
   );
 
-  return { update, settingsResult, calibrationOutcome };
+  return { update, unsetKeys, settingsResult, calibrationOutcome };
 }
 
 export function buildStructuredUpdate(
   parsed: ParsedFilament,
   existing: ExistingFilamentForApply | null,
-): Record<string, unknown> {
+): StructuredUpdateResult {
   const u: Record<string, unknown> = {};
-  if (parsed.type != null) u.type = parsed.type;
-  if (parsed.vendor != null) u.vendor = parsed.vendor;
-  if (parsed.color != null) u.color = parsed.color;
-  if (parsed.diameter != null) u.diameter = parsed.diameter;
-  if (parsed.density != null) u.density = parsed.density;
-  if (parsed.cost != null) u.cost = parsed.cost;
-  if (parsed.maxVolumetricSpeed != null) u.maxVolumetricSpeed = parsed.maxVolumetricSpeed;
-  if (parsed.notes != null) u.notes = parsed.notes;
-  if (parsed.shrinkageXY != null) u.shrinkageXY = parsed.shrinkageXY;
-  if (parsed.shrinkageZ != null) u.shrinkageZ = parsed.shrinkageZ;
+  const unset: string[] = [];
+
+  // GH #403: when the existing doc is a variant of another filament,
+  // only PIN an inheritable scalar to the variant when the parsed
+  // value DIFFERS from what the parent already provides. If the parent
+  // already carries the same value, leave the variant alone so it
+  // continues to inherit dynamically via `resolveFilament` at read
+  // time. Same class as the GH #106 / #223 / #265 guards the
+  // PrusaSlicer-sync path uses.
+  //
+  // Codex P1 on PR #473: "leave the variant alone" only works when the
+  // variant doesn't ALREADY carry a stale local override. If the
+  // imported value matches the parent AND the variant currently has its
+  // own diverging value, a no-op leaves the stale value in place forever
+  // (it would never be cleared by a subsequent identical-to-parent
+  // import either). Emit an `$unset` for that field so the variant
+  // returns to inheriting from the parent — which is what the user
+  // expects when their slicer profile finally agrees with the parent.
+  //
+  // `color` is intentionally NOT inheritable (each variant has its
+  // own color — that's the whole point of being a variant) so it
+  // sets unconditionally below.
+  const parent = existing?.parent ?? null;
+  const isVariantWithParent = !!(existing?.parentId && parent);
+  const existingRow = existing as Record<string, unknown> | null;
+  const variantHasLocalValue = (key: string): boolean => {
+    if (!existingRow) return false;
+    const v = existingRow[key];
+    return v != null && v !== "";
+  };
+
+  // Codex P2 on PR #473 round 3: the Filament schema declares `vendor`
+  // and `type` as required. Routing them into `$unset` with
+  // `runValidators: true` (which both Bambu routes pass) would fail
+  // schema validation. For required fields, leave the variant override
+  // in place — it's still serving its purpose (it's not null), even if
+  // it now happens to equal the parent's value. Optional fields
+  // (density, cost, diameter, etc.) are safe to unset because the
+  // schema accepts missing/null and `resolveFilament` falls back to
+  // the parent. This matches the rule the form-side honours too:
+  // required fields never get cleared, only re-pointed.
+  const REQUIRED_FIELDS = new Set<string>(["type", "vendor"]);
+
+  const setIfNotInherited = (
+    key: string,
+    parsedVal: unknown,
+  ) => {
+    if (parsedVal == null) return;
+    if (isVariantWithParent && parent && parent[key] === parsedVal) {
+      // Parent already carries this exact value. If the variant doc
+      // currently has a stale local value for this field AND the field
+      // is safe to unset (not required by the schema), emit $unset so
+      // inheritance resumes; otherwise leave the variant alone.
+      if (
+        !REQUIRED_FIELDS.has(key) &&
+        variantHasLocalValue(key) &&
+        existingRow?.[key] !== parsedVal
+      ) {
+        unset.push(key);
+      }
+      return;
+    }
+    u[key] = parsedVal;
+  };
+
+  setIfNotInherited("type", parsed.type);
+  setIfNotInherited("vendor", parsed.vendor);
+  if (parsed.color != null) u.color = parsed.color; // not inheritable
+  setIfNotInherited("diameter", parsed.diameter);
+  setIfNotInherited("density", parsed.density);
+  setIfNotInherited("cost", parsed.cost);
+  setIfNotInherited("maxVolumetricSpeed", parsed.maxVolumetricSpeed);
+  if (parsed.notes != null) u.notes = parsed.notes; // not inheritable
+  setIfNotInherited("shrinkageXY", parsed.shrinkageXY);
+  setIfNotInherited("shrinkageZ", parsed.shrinkageZ);
 
   // Temperatures: merge with whatever's already on the doc so we don't
   // clobber e.g. nozzleRangeMin when the import only carries `nozzle`.
@@ -158,7 +264,7 @@ export function buildStructuredUpdate(
     u.bedTypeTemps = [...byName.values()];
   }
 
-  return u;
+  return { set: u, unset };
 }
 
 export interface CalibrationOutcome {

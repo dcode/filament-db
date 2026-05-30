@@ -167,7 +167,43 @@ export async function POST(
       return errorResponse("Filament not found", 404);
     }
 
-    const update = buildStructuredUpdate(parsed.filament, existing);
+    // GH #403: when `existing` is a variant, load its parent so
+    // `buildStructuredUpdate` can detect inheritable scalars whose
+    // parsed value already matches the parent and skip writing them
+    // (preserves inheritance). Lookup is a no-op for root filaments.
+    let parent: Record<string, unknown> | null = null;
+    if (existing.parentId) {
+      parent = (await Filament.findOne({
+        _id: existing.parentId,
+        _deletedAt: null,
+      }).lean()) as Record<string, unknown> | null;
+    }
+
+    const existingWithParent = {
+      // Codex P1 on PR #473 round 2: inheritable scalars MUST ride
+      // along so `buildStructuredUpdate` can detect a stale variant
+      // override and emit $unset. Pre-fix these were stripped, leaving
+      // the unset branch unreachable in this route.
+      type: existing.type ?? null,
+      vendor: existing.vendor ?? null,
+      diameter: existing.diameter ?? null,
+      density: existing.density ?? null,
+      cost: existing.cost ?? null,
+      maxVolumetricSpeed: existing.maxVolumetricSpeed ?? null,
+      shrinkageXY: existing.shrinkageXY ?? null,
+      shrinkageZ: existing.shrinkageZ ?? null,
+      temperatures: existing.temperatures as Record<string, unknown> | undefined,
+      bedTypeTemps: existing.bedTypeTemps,
+      settings: existing.settings as Record<string, unknown> | undefined,
+      calibrations: existing.calibrations,
+      parentId: existing.parentId ? String(existing.parentId) : null,
+      parent,
+    };
+
+    const { set: update, unset: unsetKeys } = buildStructuredUpdate(
+      parsed.filament,
+      existingWithParent,
+    );
 
     const settingsResult = mergeSlicerSettings(
       (existing.settings as Record<string, unknown>) || {},
@@ -192,6 +228,15 @@ export async function POST(
     // state and not in the Bambu file.
     delete (update as Record<string, unknown>).spools;
 
+    // Codex P1 on PR #473: when the import value equals the parent's
+    // value AND the variant carries a diverging local override, unset
+    // that field so the variant returns to inheriting. `$unset` payload
+    // value is conventionally the empty string in Mongo.
+    const mongoUpdate: Record<string, unknown> = { $set: update };
+    if (unsetKeys.length > 0) {
+      mongoUpdate.$unset = Object.fromEntries(unsetKeys.map((k) => [k, ""]));
+    }
+
     // Codex P2 on PR #387: `runValidators` so the new numeric range
     // validators (#337) actually fire on a Bambu sync.
     //
@@ -204,7 +249,7 @@ export async function POST(
     try {
       updateRes = await Filament.updateOne(
         { _id: existing._id, _deletedAt: null },
-        { $set: update },
+        mongoUpdate,
         { runValidators: true, context: "query" },
       );
     } catch (validationErr) {

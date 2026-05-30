@@ -570,5 +570,103 @@ describe("Bambu Studio importer routes", () => {
       );
       expect(res.status).toBe(404);
     });
+
+    // Codex P1 on PR #473 round 2: pin the augment-helper wire-up. The
+    // unit tests in tests/bambuStudioApply.test.ts verify the
+    // $unset-on-revert-to-parent behavior of buildStructuredUpdate, but
+    // they pass in a hand-built `existing` shape that already includes
+    // the inheritable scalars. If the route's augment helper strips
+    // those scalars (as the first round of this PR did), the unset path
+    // is unreachable at runtime. This test goes through the real route
+    // with a real variant to prove the wire-up.
+    it("$unsets a stale variant override when the parsed value matches the parent (Codex P1 PR #473 r2)", async () => {
+      const parent = await Filament.create({
+        name: "QA Parent",
+        vendor: "QA",
+        type: "PLA",
+        diameter: 1.75,
+        density: 1.24,
+      });
+      // Variant with a stale local density that diverges from the parent.
+      const variant = await Filament.create({
+        name: "QA Variant",
+        vendor: "QA",
+        type: "PLA",
+        diameter: 1.75,
+        density: 1.30,
+        parentId: parent._id,
+      });
+      // Sanity: variant has its own density before the sync.
+      const before = await Filament.findById(variant._id).lean();
+      expect((before as { density: number }).density).toBe(1.30);
+
+      const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          `http://localhost/api/filaments/${variant._id}/bambustudio`,
+          minimalProfile({
+            // Sync an import whose density MATCHES the parent — the
+            // stale variant override should be cleared.
+            filament_density: ["1.24"],
+          }),
+        ),
+        { params: Promise.resolve({ id: String(variant._id) }) },
+      );
+      expect(res.status).toBe(200);
+
+      const after = await Filament.findById(variant._id).lean();
+      // Density should be unset (undefined or null) on the variant
+      // doc — `resolveFilament` then falls back to the parent's 1.24.
+      // `$unset` removes the field; depending on Mongoose schema
+      // defaults the lean read may surface it as undefined or null.
+      const afterDensity = (after as { density?: number | null }).density;
+      expect(afterDensity == null).toBe(true);
+    });
+
+    it("succeeds (does NOT $unset required fields) when stale type/vendor match parent (Codex P2 PR #473 r3)", async () => {
+      // Required schema fields can't be $unset under `runValidators:
+      // true` — the write would fail with a validation error. Pin the
+      // route behaviour: a sync that matches the parent's `type` AND
+      // `vendor` (both required) should succeed without trying to
+      // unset them. An optional field like density alongside still
+      // gets unset.
+      const parent = await Filament.create({
+        name: "QA Parent Required",
+        vendor: "Polymaker",
+        type: "PLA",
+        diameter: 1.75,
+        density: 1.24,
+      });
+      const variant = await Filament.create({
+        name: "QA Variant Required",
+        vendor: "OldVendor", // stale; differs from parent
+        type: "PLA+", // stale; differs from parent
+        diameter: 1.75,
+        density: 1.30, // stale; differs from parent
+        parentId: parent._id,
+      });
+
+      const { POST } = await import("@/app/api/filaments/[id]/bambustudio/route");
+      const res = await POST(
+        jsonReq(
+          `http://localhost/api/filaments/${variant._id}/bambustudio`,
+          minimalProfile({
+            filament_type: ["PLA"], // matches parent
+            filament_vendor: ["Polymaker"], // matches parent
+            filament_density: ["1.24"], // matches parent
+          }),
+        ),
+        { params: Promise.resolve({ id: String(variant._id) }) },
+      );
+      expect(res.status).toBe(200); // would be 500 if required-field $unset slipped through
+
+      const after = await Filament.findById(variant._id).lean();
+      // Required fields stay pinned (would fail validation if cleared).
+      expect((after as { type: string }).type).toBe("PLA+");
+      expect((after as { vendor: string }).vendor).toBe("OldVendor");
+      // Optional `density` got cleared so it now inherits from parent.
+      const afterDensity = (after as { density?: number | null }).density;
+      expect(afterDensity == null).toBe(true);
+    });
   });
 });

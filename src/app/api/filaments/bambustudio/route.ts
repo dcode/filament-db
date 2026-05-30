@@ -130,7 +130,10 @@ export async function POST(request: NextRequest) {
       _deletedAt: null,
     });
     if (existingActive) {
-      const payload = await prepareBambuUpdate(parsed, existingActive);
+      const payload = await prepareBambuUpdate(
+        parsed,
+        await augmentExistingWithParent(existingActive),
+      );
       if (payload.settingsResult.error) {
         return errorResponse(payload.settingsResult.error, 400);
       }
@@ -138,7 +141,7 @@ export async function POST(request: NextRequest) {
       try {
         const updated = await Filament.findOneAndUpdate(
           { _id: existingActive._id, _deletedAt: null },
-          { $set: payload.update },
+          composeMongoUpdate(payload),
           { runValidators: true, context: "query", returnDocument: "after" },
         );
         if (updated) {
@@ -164,19 +167,30 @@ export async function POST(request: NextRequest) {
       _purged: { $ne: true },
     });
     if (existingTrashed) {
-      const payload = await prepareBambuUpdate(parsed, existingTrashed);
+      const payload = await prepareBambuUpdate(
+        parsed,
+        await augmentExistingWithParent(existingTrashed),
+      );
       if (payload.settingsResult.error) {
         return errorResponse(payload.settingsResult.error, 400);
       }
       delete (payload.update as Record<string, unknown>).spools;
       try {
+        // Splice `_deletedAt: null` into the $set body so the resurrect
+        // atomic also drops the tombstone; $unset (if any) for stale
+        // variant overrides composes alongside.
+        const resurrectUpdate = composeMongoUpdate(payload);
+        resurrectUpdate.$set = {
+          ...(resurrectUpdate.$set as Record<string, unknown>),
+          _deletedAt: null,
+        };
         const resurrected = await Filament.findOneAndUpdate(
           {
             _id: existingTrashed._id,
             _deletedAt: { $ne: null },
             _purged: { $ne: true },
           },
-          { $set: { ...payload.update, _deletedAt: null } },
+          resurrectUpdate,
           { runValidators: true, context: "query", returnDocument: "after" },
         );
         if (resurrected) {
@@ -232,7 +246,10 @@ export async function POST(request: NextRequest) {
         // original error rather than spinning.
         return errorResponseFromCaught(createErr, "Failed to create filament");
       }
-      const racePayload = await prepareBambuUpdate(parsed, racing);
+      const racePayload = await prepareBambuUpdate(
+        parsed,
+        await augmentExistingWithParent(racing),
+      );
       if (racePayload.settingsResult.error) {
         return errorResponse(racePayload.settingsResult.error, 400);
       }
@@ -240,7 +257,7 @@ export async function POST(request: NextRequest) {
       try {
         const merged = await Filament.findOneAndUpdate(
           { _id: racing._id, _deletedAt: null },
-          { $set: racePayload.update },
+          composeMongoUpdate(racePayload),
           { runValidators: true, context: "query", returnDocument: "after" },
         );
         if (!merged) {
@@ -257,6 +274,63 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     return errorResponseFromCaught(err, "Failed to import Bambu Studio profile");
   }
+}
+
+/**
+ * GH #403: load the parent doc when `existing` is a variant, so
+ * `prepareBambuUpdate` → `buildStructuredUpdate` can skip pinning
+ * inheritable scalars whose parsed value already matches the parent
+ * (keeps inheritance live). A no-op for root filaments.
+ */
+async function augmentExistingWithParent(existing: {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  [k: string]: any;
+}) {
+  let parent: Record<string, unknown> | null = null;
+  if (existing.parentId) {
+    parent = (await Filament.findOne({
+      _id: existing.parentId,
+      _deletedAt: null,
+    }).lean()) as Record<string, unknown> | null;
+  }
+  return {
+    // Codex P1 on PR #473 round 2: inheritable scalars MUST ride along
+    // so `buildStructuredUpdate` can detect a stale variant override
+    // (variant=1.30, parent=1.24, import=1.24 → emit $unset). Pre-fix
+    // these were stripped, making the $unset branch unreachable in
+    // the actual route even though unit tests passed against a richer
+    // shape.
+    type: existing.type ?? null,
+    vendor: existing.vendor ?? null,
+    diameter: existing.diameter ?? null,
+    density: existing.density ?? null,
+    cost: existing.cost ?? null,
+    maxVolumetricSpeed: existing.maxVolumetricSpeed ?? null,
+    shrinkageXY: existing.shrinkageXY ?? null,
+    shrinkageZ: existing.shrinkageZ ?? null,
+    temperatures: existing.temperatures,
+    bedTypeTemps: existing.bedTypeTemps,
+    settings: existing.settings,
+    calibrations: existing.calibrations,
+    parentId: existing.parentId ? String(existing.parentId) : null,
+    parent,
+  };
+}
+
+/** Codex P1 on PR #473: when the parsed Bambu value equals the parent
+ *  and the variant carries a stale local override, `prepareBambuUpdate`
+ *  flags those fields in `unsetKeys` so they can be cleared. Compose a
+ *  Mongo update body that carries both `$set` and (when needed) `$unset`
+ *  in one atomic write — the resurrection branch then splices
+ *  `_deletedAt: null` into the `$set` portion. */
+function composeMongoUpdate(
+  payload: Awaited<ReturnType<typeof prepareBambuUpdate>>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { $set: payload.update };
+  if (payload.unsetKeys.length > 0) {
+    out.$unset = Object.fromEntries(payload.unsetKeys.map((k) => [k, ""]));
+  }
+  return out;
 }
 
 /** Common response shape so all three upsert phases return the same
