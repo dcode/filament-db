@@ -3,6 +3,36 @@ import { randomUUID } from "crypto";
 import { MongoClient, ObjectId, Document } from "mongodb";
 
 /**
+ * Recognise a duplicate-key error specifically on the `syncId` index,
+ * so the local-only push / pull paths can treat a concurrent peer
+ * winning that race as a no-op (GH #439).
+ *
+ * Codex follow-up on PR #464: an earlier version accepted ANY
+ * E11000 and silently swallowed real conflicts. Every synced
+ * collection also has unique indexes on at least one other field
+ * — filament `name` / `instanceId`, nozzle `name`, etc. A real
+ * collision on those would have left the doc unsynced forever
+ * while the cycle still reported success.
+ *
+ * The MongoDB driver decorates the error with:
+ *   - `code: 11000`
+ *   - `keyPattern: { <indexedField>: 1 }`  (which index conflicted)
+ *   - `keyValue`: { <indexedField>: <colliding value> }
+ * Constrain to the `syncId` case by checking `keyPattern.syncId` —
+ * a key in the pattern means the violation involved that index.
+ * Without a keyPattern (some driver versions surface a bare code on
+ * older error shapes), err on the side of NOT swallowing so the
+ * cycle still surfaces the conflict.
+ */
+export function isDuplicateKeyError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  const e = err as { code?: number; keyPattern?: Record<string, unknown> };
+  if (e.code !== 11000) return false;
+  if (!e.keyPattern || typeof e.keyPattern !== "object") return false;
+  return Object.prototype.hasOwnProperty.call(e.keyPattern, "syncId");
+}
+
+/**
  * Extract the database name from a MongoDB connection URI.
  *
  * The DB name is the path segment after the authority:
@@ -98,6 +128,17 @@ interface SyncResult {
  * printer.amsSlots[].spoolId, printhistory.usage[].spoolId — clears that
  * id during cross-side remap. Per-filament gram totals still reconcile;
  * per-spool attribution is dropped pending a spool-syncId migration.
+ *
+ * GH #438: the SAME caveat applies to OTHER subdoc `_id`s — every
+ * `calibrations[]._id` on a Filament and every `amsSlots[]._id` on a
+ * Printer is freshly minted by `insertOne`/`$set` on each cross-side
+ * write because the subdocs don't carry a stable `syncId`. Today nothing
+ * in the codebase references these subdoc ids across sync (URL deep-
+ * links, ledger entries, etc. all key by parent doc + offset), so this
+ * is documented as a constraint on future features rather than fixed
+ * by adding subdoc syncIds. If you add a feature that needs stable
+ * cross-side subdoc identity, the fix is to mint a `syncId` on the
+ * subdoc and preserve it through `stripForTransfer`.
  */
 export class SyncService extends EventEmitter {
   private localUri: string;
@@ -588,17 +629,39 @@ export class SyncService extends EventEmitter {
       const remoteDoc = remoteBySyncId.get(syncId);
 
       if (localDoc && !remoteDoc) {
-        // Local-only: push to remote
+        // Local-only: push to remote.
+        //
+        // GH #439: catch E11000 on `syncId` and treat as a no-op. Two
+        // processes pointed at the same Atlas (desktop client + Docker
+        // instance, two desktops sharing an Atlas) can both pass this
+        // "local-only" branch concurrently when their first sync
+        // cycles overlap. The `syncId` unique index is the right place
+        // to serialize them; the loser of the race just observes the
+        // doc already exists. Without this branch the second insert
+        // bubbled up as a collection-level failure in `trySync` and
+        // the whole sync cycle reported "partial".
         const doc = this.stripForTransfer(localDoc);
         const transformed = transformDoc ? transformDoc(doc, "toRemote") : doc;
-        await remoteCol.insertOne({ ...transformed, _id: new ObjectId() });
-        result.pushed++;
+        try {
+          await remoteCol.insertOne({ ...transformed, _id: new ObjectId() });
+          result.pushed++;
+        } catch (err: unknown) {
+          if (!isDuplicateKeyError(err)) throw err;
+          // Other process won the race — the doc is already there,
+          // future cycles will see it via the existing-on-both branch.
+        }
       } else if (!localDoc && remoteDoc) {
-        // Remote-only: pull to local
+        // Remote-only: pull to local. Same E11000 guard symmetry — a
+        // concurrent sync from another instance could have already
+        // pulled the same doc to a shared local store.
         const doc = this.stripForTransfer(remoteDoc);
         const transformed = transformDoc ? transformDoc(doc, "toLocal") : doc;
-        await localCol.insertOne({ ...transformed, _id: new ObjectId() });
-        result.pulled++;
+        try {
+          await localCol.insertOne({ ...transformed, _id: new ObjectId() });
+          result.pulled++;
+        } catch (err: unknown) {
+          if (!isDuplicateKeyError(err)) throw err;
+        }
       } else if (localDoc && remoteDoc) {
         // Both exist: handle conflicts
         const localDeleted = localDoc._deletedAt != null;

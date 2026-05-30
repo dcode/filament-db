@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { getDbNameFromUri, wrapSyncErrorMessage } from "../electron/sync-service";
+import {
+  getDbNameFromUri,
+  isDuplicateKeyError,
+  wrapSyncErrorMessage,
+} from "../electron/sync-service";
 
 describe("getDbNameFromUri", () => {
   it("extracts db name from a basic mongodb URI with explicit path", () => {
@@ -96,5 +100,59 @@ describe("wrapSyncErrorMessage", () => {
     const wrapped = wrapSyncErrorMessage(err, "filament-db");
     // No rewrite — message passes through (with URI redaction, n/a here)
     expect(wrapped).toBe("network reset while updating filament cache");
+  });
+});
+
+describe("isDuplicateKeyError (GH #439, scoped to syncId per Codex on #464)", () => {
+  // The recogniser MUST be scoped to the `syncId` index — every synced
+  // collection also has unique indexes on `name` / `instanceId` /
+  // etc., and silently swallowing those would leave real conflicts
+  // unsynced while the cycle reported success.
+
+  it("returns true for an E11000 on the syncId index", () => {
+    const err = Object.assign(new Error("E11000 duplicate key"), {
+      code: 11000,
+      keyPattern: { syncId: 1 },
+      keyValue: { syncId: "abc-123" },
+    });
+    expect(isDuplicateKeyError(err)).toBe(true);
+  });
+
+  it("returns FALSE for an E11000 on a name index (real conflict to surface)", () => {
+    const err = Object.assign(new Error("E11000 duplicate key"), {
+      code: 11000,
+      keyPattern: { name: 1 },
+      keyValue: { name: "0.4 Brass" },
+    });
+    expect(isDuplicateKeyError(err)).toBe(false);
+  });
+
+  it("returns FALSE for an E11000 on instanceId", () => {
+    const err = Object.assign(new Error("E11000 duplicate key"), {
+      code: 11000,
+      keyPattern: { instanceId: 1 },
+      keyValue: { instanceId: "abc-123" },
+    });
+    expect(isDuplicateKeyError(err)).toBe(false);
+  });
+
+  it("returns FALSE for a different error code", () => {
+    expect(isDuplicateKeyError({ code: 121, keyPattern: { syncId: 1 } })).toBe(false);
+  });
+
+  it("returns FALSE for a bare Error with no code", () => {
+    expect(isDuplicateKeyError(new Error("generic failure"))).toBe(false);
+  });
+
+  it("returns FALSE for an E11000 with no keyPattern (ambiguous — surface it)", () => {
+    expect(isDuplicateKeyError({ code: 11000 })).toBe(false);
+    expect(isDuplicateKeyError(Object.assign(new Error("dup"), { code: 11000 }))).toBe(false);
+  });
+
+  it("returns FALSE for non-error inputs", () => {
+    expect(isDuplicateKeyError(null)).toBe(false);
+    expect(isDuplicateKeyError(undefined)).toBe(false);
+    expect(isDuplicateKeyError("E11000 string")).toBe(false);
+    expect(isDuplicateKeyError(11000)).toBe(false);
   });
 });
