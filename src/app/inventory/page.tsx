@@ -168,20 +168,43 @@ export default function InventoryPage() {
   // Client-side search filter — runs over the already-server-filtered
   // groups so the filament/type/vendor server filters compose with a
   // free-text local match against filament name / spool label / lot.
+  //
+  // Codex P2 on PR #391 round 2: recompute `count` and `totalGrams`
+  // from the FILTERED spools — previously the cloned group kept the
+  // server-side counts, so a one-result search on a 20-spool shelf
+  // still rendered "20 spools · 18000g" in the header.
+  //
+  // Codex P2 on PR #400 round 4: when summing the search-filtered
+  // total, mirror the server's 0g-tare fallback for legacy spools
+  // (totalWeight set, no own/parent spoolWeight). `remainingGrams()`
+  // returns null in that shape — correct for the per-row "?" display,
+  // but wrong for the group total. Inline the math here so an
+  // unsearched group's total and the same group's searched total
+  // (matching all rows) agree.
   const filteredGroups = useMemo(() => {
     if (!data) return [];
     const q = search.trim().toLowerCase();
     if (!q) return data.groups;
     return data.groups
-      .map((g) => ({
-        ...g,
-        spools: g.spools.filter(
+      .map((g) => {
+        const matching = g.spools.filter(
           (s) =>
             s.filamentName.toLowerCase().includes(q) ||
             (s.label || "").toLowerCase().includes(q) ||
             (s.lotNumber || "").toLowerCase().includes(q),
-        ),
-      }))
+        );
+        const totalGrams = matching.reduce((sum, s) => {
+          if (s.totalWeight == null) return sum;
+          const { tare } = effectiveWeights(s);
+          return sum + Math.max(0, s.totalWeight - (tare ?? 0));
+        }, 0);
+        return {
+          ...g,
+          spools: matching,
+          count: matching.length,
+          totalGrams,
+        };
+      })
       .filter((g) => g.spools.length > 0);
   }, [data, search]);
 
