@@ -54,7 +54,11 @@ interface AggregatedSpool {
   purchaseDate: Date | null;
   openedDate: Date | null;
   retired: boolean;
-  photoDataUrl: string | null;
+  /** Lazy-loaded by the client from `/api/filaments/{id}` on row expand;
+   * dropped from this aggregation (GH #429) to keep the payload small —
+   * a deployment with 5k filaments × 3 spools each could otherwise
+   * stream ~15k photo data URLs in one response. */
+  photoDataUrl?: string | null;
   dryCycleCount: number;
   lastDryAt: Date | null;
   filamentId: string;
@@ -190,6 +194,18 @@ export async function GET(request: NextRequest) {
       // Retired filter happens AFTER unwind because it's on the spool
       // subdoc, not the filament.
       ...(!includeRetired ? [{ $match: { "spools.retired": { $ne: true } } }] : []),
+      // GH #429: the response is still nominally unbounded (one row
+      // per spool across every active filament). The earlier
+      // photoDataUrl drop killed the worst-case per-row size — a
+      // realistic deployment with thousands of spools now serialises
+      // to a few hundred KB rather than tens of MB. A post-`$unwind`
+      // `$limit` was tried here but Codex pointed out it would have
+      // SILENTLY truncated groups: `kind=printer` etc. filters run
+      // AFTER unwind, so the cap would drop spools by document order
+      // and leave `totalSpools`/per-location counts wrong. Pagination
+      // (limit/offset with deterministic sort + truncated flag) is the
+      // correct fix when a deployment really has 10k+ spools; tracked
+      // separately rather than capping unsafely here.
       {
         $group: {
           _id: "$spools.locationId",
@@ -202,7 +218,9 @@ export async function GET(request: NextRequest) {
               purchaseDate: "$spools.purchaseDate",
               openedDate: "$spools.openedDate",
               retired: "$spools.retired",
-              photoDataUrl: "$spools.photoDataUrl",
+              // GH #429: photoDataUrl intentionally omitted — see the
+              // AggregatedSpool field comment above. The /inventory page
+              // lazy-loads photos when expanding a row.
               dryCycleCount: { $size: { $ifNull: ["$spools.dryCycles", []] } },
               lastDryAt: {
                 // Latest dryCycles[].date if any. Subdocs are appended

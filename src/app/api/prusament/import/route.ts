@@ -1,8 +1,10 @@
+import mongoose from "mongoose";
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
 import Filament from "@/models/Filament";
 import type { PrusamentScrapeResult } from "../route";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
+import { isValidIsoDateString } from "@/lib/validateSpoolBody";
 
 /**
  * GH #307: validate a renderer-supplied Prusament spool payload before
@@ -100,14 +102,50 @@ export async function POST(request: NextRequest) {
   const spoolLabel = `${spool.spoolId} (${spool.manufactureDate.split(" ")[0]})`;
 
   if (action === "add-spool" && filamentId) {
-    // Add spool to existing filament
+    // GH #430: validate the filament id up front so a malformed id
+    // surfaces as 400, not a downstream CastError → bare 500.
+    if (!mongoose.isValidObjectId(filamentId)) {
+      return NextResponse.json({ error: "Invalid filament id" }, { status: 400 });
+    }
+
+    const MAX_SPOOLS_PER_FILAMENT = 500;
+
+    // GH #430: carry the Prusament-specific traceability fields onto
+    // the spool subdoc. Pre-fix the $push only carried label +
+    // totalWeight, silently dropping the lot number and manufacture
+    // date that are the whole point of a Prusament import.
+    // `manufactureDate` is "YYYY-MM-DD HH:MM" — split off the time
+    // and validate before persisting.
+    const purchaseDateStr = spool.manufactureDate.split(" ")[0];
+    const purchaseDate = isValidIsoDateString(purchaseDateStr)
+      ? new Date(purchaseDateStr)
+      : null;
+
+    // GH #430 (Codex round 4 follow-up): cap per-filament spool count
+    // ATOMICALLY using `$expr: { $lt: [{ $size: spools }, 500] }`.
+    // The previous "fetch → check length → $push" sequence was a
+    // race: several concurrent add-spool requests against the same
+    // filament could each see length<500, then all $push, blowing
+    // past the cap. The atomic conditional update fixes the race
+    // — only one writer can satisfy the size check at a time.
     const filament = await Filament.findOneAndUpdate(
-      { _id: filamentId, _deletedAt: null },
+      {
+        _id: filamentId,
+        _deletedAt: null,
+        $expr: {
+          $lt: [
+            { $size: { $ifNull: ["$spools", []] } },
+            MAX_SPOOLS_PER_FILAMENT,
+          ],
+        },
+      },
       {
         $push: {
           spools: {
             label: spoolLabel,
             totalWeight: spool.totalWeight,
+            lotNumber: spool.spoolId,
+            ...(purchaseDate ? { purchaseDate } : {}),
           },
         },
       },
@@ -115,6 +153,21 @@ export async function POST(request: NextRequest) {
     ).lean();
 
     if (!filament) {
+      // The conditional didn't match — either the filament doesn't
+      // exist, or it's already at cap. Probe to differentiate so the
+      // caller gets a clear error rather than a generic 404.
+      const probe = await Filament.findOne(
+        { _id: filamentId, _deletedAt: null },
+        { spools: 1 },
+      ).lean();
+      if (probe && (probe.spools?.length ?? 0) >= MAX_SPOOLS_PER_FILAMENT) {
+        return NextResponse.json(
+          {
+            error: `This filament already has ${MAX_SPOOLS_PER_FILAMENT} spools (the per-filament limit)`,
+          },
+          { status: 400 },
+        );
+      }
       return NextResponse.json({ error: "Filament not found" }, { status: 404 });
     }
 
@@ -128,26 +181,70 @@ export async function POST(request: NextRequest) {
   // action === "create" — create a new filament
   const name = `Prusament ${spool.material} ${spool.colorName}`;
 
-  // Atomically check for existing filament with same name and add spool if found
-  const existingUpdated = await Filament.findOneAndUpdate(
-    { name, _deletedAt: null },
+  // GH #430 (Codex follow-up on #463): the create flow ALSO has to
+  // carry the Prusament traceability fields onto every spool subdoc
+  // it writes. Pre-fix the create branch + the existing-name $push
+  // fallback both wrote `{ label, totalWeight }` only, silently
+  // dropping the spool id and manufacture date that are the whole
+  // point of a Prusament import — even though the add-spool branch
+  // higher up already did the right thing.
+  const purchaseDateForCreate = isValidIsoDateString(
+    spool.manufactureDate.split(" ")[0],
+  )
+    ? new Date(spool.manufactureDate.split(" ")[0])
+    : null;
+  const prusamentSpoolFields = {
+    label: spoolLabel,
+    totalWeight: spool.totalWeight,
+    lotNumber: spool.spoolId,
+    ...(purchaseDateForCreate ? { purchaseDate: purchaseDateForCreate } : {}),
+  };
+
+  // GH #430 (Codex follow-up r3): cap per-filament spool count on
+  // the existing-name $push fallback too — the cap previously only
+  // applied to the dedicated add-spool branch above, so a hostile
+  // client routed through the default `action=create` flow could
+  // push past the limit by re-importing against an existing name.
+  const PRUSAMENT_MAX_SPOOLS_PER_FILAMENT = 500;
+  const conditionalUpdate = await Filament.findOneAndUpdate(
     {
-      $push: {
-        spools: {
-          label: spoolLabel,
-          totalWeight: spool.totalWeight,
-        },
+      name,
+      _deletedAt: null,
+      $expr: {
+        $lt: [
+          { $size: { $ifNull: ["$spools", []] } },
+          PRUSAMENT_MAX_SPOOLS_PER_FILAMENT,
+        ],
       },
     },
+    { $push: { spools: prusamentSpoolFields } },
     { returnDocument: "after" },
   ).lean();
 
-  if (existingUpdated) {
+  if (conditionalUpdate) {
     return NextResponse.json({
       action: "add-spool",
-      filament: existingUpdated,
+      filament: conditionalUpdate,
       message: `Filament "${name}" already exists. Added spool ${spool.spoolId}.`,
     });
+  }
+
+  // No conditional match — either the name doesn't exist (continue
+  // to create) OR the name exists but is over cap. Check which.
+  const blocked = await Filament.findOne(
+    { name, _deletedAt: null },
+    { spools: 1 },
+  ).lean();
+  if (
+    blocked &&
+    (blocked.spools?.length ?? 0) >= PRUSAMENT_MAX_SPOOLS_PER_FILAMENT
+  ) {
+    return NextResponse.json(
+      {
+        error: `Filament "${name}" already has ${PRUSAMENT_MAX_SPOOLS_PER_FILAMENT} spools (the per-filament limit)`,
+      },
+      { status: 400 },
+    );
   }
 
   // Use the max nozzle temp as the default (Prusament typically recommends a range)
@@ -167,12 +264,7 @@ export async function POST(request: NextRequest) {
     },
     spoolWeight: spool.spoolWeight,
     netFilamentWeight: spool.netWeight,
-    spools: [
-      {
-        label: spoolLabel,
-        totalWeight: spool.totalWeight,
-      },
-    ],
+    spools: [prusamentSpoolFields],
     tdsUrl: spool.pageUrl,
     settings: {
       prusament_spool_id: spool.spoolId,
