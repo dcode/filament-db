@@ -45,7 +45,7 @@ interface CompareFilament {
 
 export default function ComparePage() {
   return (
-    <Suspense fallback={<main className="p-8"><p className="text-gray-500">Loading…</p></main>}>
+    <Suspense fallback={<main id="main-content" className="p-8"><p className="text-gray-500">Loading…</p></main>}>
       <ComparePageInner />
     </Suspense>
   );
@@ -214,7 +214,7 @@ function ComparePageInner() {
   ];
 
   return (
-    <main className="w-full px-4 py-8">
+    <main id="main-content" className="w-full px-4 py-8">
       <h1 className="text-3xl font-bold mb-2">{t("compare.title")}</h1>
       <p className="text-sm text-gray-500 mb-6">{t("compare.subtitle")}</p>
 
@@ -263,7 +263,7 @@ function ComparePageInner() {
           <table className="w-full text-sm border-collapse">
             <thead>
               <tr className="border-b border-gray-300 dark:border-gray-700">
-                <th className="text-left py-2 px-2 font-medium text-gray-500 sticky left-0 bg-white dark:bg-gray-950 z-10">
+                <th scope="col" className="text-left py-2 px-2 font-medium text-gray-500 sticky left-0 bg-white dark:bg-gray-950 z-10">
                   {t("compare.col.property")}
                 </th>
                 {comparison.map((f) => (

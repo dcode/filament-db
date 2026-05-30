@@ -260,7 +260,7 @@ export default function InventoryPage() {
   );
 
   return (
-    <main className="w-full max-w-7xl mx-auto px-4 py-8">
+    <main id="main-content" className="w-full max-w-7xl mx-auto px-4 py-8">
       <div className="flex items-start justify-between mb-6 gap-4">
         <div>
           <h1 className="text-3xl font-bold">{t("inventory.title")}</h1>
@@ -408,12 +408,12 @@ export default function InventoryPage() {
                     <table className="w-full text-sm">
                       <thead className="border-b border-gray-200 dark:border-gray-800 text-xs text-gray-500">
                         <tr>
-                          <th className="text-left py-2 px-3">{t("inventory.col.filament")}</th>
-                          <th className="text-left py-2 px-3">{t("inventory.col.spool")}</th>
-                          <th className="text-right py-2 px-3">{t("inventory.col.weight")}</th>
-                          <th className="text-right py-2 px-3">{t("inventory.col.remaining")}</th>
-                          <th className="text-left py-2 px-3">{t("inventory.col.lastDry")}</th>
-                          <th className="text-right py-2 px-3">{t("inventory.col.actions")}</th>
+                          <th scope="col" className="text-left py-2 px-3">{t("inventory.col.filament")}</th>
+                          <th scope="col" className="text-left py-2 px-3">{t("inventory.col.spool")}</th>
+                          <th scope="col" className="text-right py-2 px-3">{t("inventory.col.weight")}</th>
+                          <th scope="col" className="text-right py-2 px-3">{t("inventory.col.remaining")}</th>
+                          <th scope="col" className="text-left py-2 px-3">{t("inventory.col.lastDry")}</th>
+                          <th scope="col" className="text-right py-2 px-3">{t("inventory.col.actions")}</th>
                         </tr>
                       </thead>
                       <tbody>
