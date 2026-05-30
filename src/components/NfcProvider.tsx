@@ -41,6 +41,13 @@ interface NfcContextValue {
   dialogOpen: boolean;
   /** Hide the dialog without clearing `tagReadResult`. */
   dismissTagRead: () => void;
+  /** GH #451 follow-up (Codex P2 on PR #475): re-show the dialog after
+   *  it was suppressed because the user was typing, or after they
+   *  manually dismissed it but want a second look. No-op when there's
+   *  no scan to show. The NFC status pill becomes a button while
+   *  `tagReadResult != null && !dialogOpen` so this path is reachable
+   *  from the global header. */
+  reopenTagRead: () => void;
   /**
    * Call this from the write button on the filament detail page after
    * `writeTag` resolves successfully. Updates the pill to reflect the
@@ -105,6 +112,7 @@ export function useNfcContext(): NfcContextValue {
       loadedTagName: null,
       dialogOpen: false,
       dismissTagRead: () => {},
+      reopenTagRead: () => {},
       notifyTagWritten: () => {},
       notifyTagErased: () => {},
     };
@@ -117,6 +125,40 @@ function pickLoadedName(result: NfcTagReadResult): string | null {
   // "what's loaded"), then fall back to the tag's declared material
   // name for unmatched-but-decoded tags.
   return result.match?.name ?? result.data?.materialName ?? null;
+}
+
+/**
+ * GH #451: returns true when the currently-focused element is a
+ * text-entry surface (input, textarea, or contenteditable). Used to
+ * suppress the NFC auto-open dialog mid-typing so we don't steal focus
+ * from a user filling out a form when a teammate scans a tag.
+ *
+ * Duck-typed (`tagName` + attribute reads) rather than `instanceof
+ * HTMLInputElement` so it stays unit-testable without a DOM env — the
+ * project's vitest config doesn't carry jsdom. Safe to call with `null`
+ * (returns false).
+ */
+export function isTypingTarget(
+  el: { tagName?: string; getAttribute?: (name: string) => string | null } | null,
+): boolean {
+  if (!el) return false;
+  const tag = (el.tagName || "").toUpperCase();
+  if (tag === "INPUT") {
+    // type="button"/"checkbox"/"radio" etc. are not typing surfaces;
+    // only the text-entry input types should suppress the auto-open.
+    const t = (el.getAttribute?.("type") ?? "text").toLowerCase();
+    const typingTypes = new Set([
+      "text", "search", "url", "tel", "email", "password",
+      "number", "date", "datetime-local", "month", "week", "time",
+    ]);
+    return typingTypes.has(t);
+  }
+  if (tag === "TEXTAREA") return true;
+  const editable = el.getAttribute?.("contenteditable");
+  if (editable != null && editable !== "false" && editable !== "inherit") {
+    return true;
+  }
+  return false;
 }
 
 export default function NfcProvider({ children }: { children: ReactNode }) {
@@ -156,7 +198,16 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
       onResult: (result) => {
         setTagReadResult(result);
         setLoadedTagName(pickLoadedName(result));
-        setDialogOpen(true);
+        // GH #451: never steal focus from a user actively typing.
+        // Auto-opening this modal mid-keystroke is jarring on shared
+        // workshop machines where another user might be filling a form
+        // while a teammate scans a tag at the reader. The pill update
+        // (loadedTagName above) still happens; the user can open the
+        // dialog manually from the NFC status if they want to act on
+        // the scan.
+        if (!isTypingTarget(document.activeElement)) {
+          setDialogOpen(true);
+        }
       },
       onPublish: publishScan,
     });
@@ -165,6 +216,15 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
   }, [isElectron]);
 
   const dismissTagRead = useCallback(() => setDialogOpen(false), []);
+  // GH #451 follow-up (Codex P2 on PR #475): a typing-suppressed scan
+  // still updates tagReadResult, but `dialogOpen` stays false. Expose a
+  // reopen path so the user can pull the dialog back up — wired to the
+  // NFC pill in the header which becomes clickable while a scan is
+  // dismissable.
+  const reopenTagRead = useCallback(() => {
+    setDialogOpen((prev) => prev); // no-op write — guards against React staleness
+    if (tagReadResult != null) setDialogOpen(true);
+  }, [tagReadResult]);
 
   // Called by the filament detail page after a successful Write NFC.
   // Synthesises a `tagReadResult` that mirrors what a fresh read would
@@ -199,6 +259,7 @@ export default function NfcProvider({ children }: { children: ReactNode }) {
         loadedTagName,
         dialogOpen,
         dismissTagRead,
+        reopenTagRead,
         notifyTagWritten,
         notifyTagErased,
       }}
