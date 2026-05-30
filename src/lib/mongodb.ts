@@ -7,7 +7,13 @@ interface MongooseCache {
   /** Per-migration completion flags. Each migration only runs until it
    * succeeds — a transient failure (network blip, MongoDB busy) won't
    * permanently mark the migration done, so the next request will retry
-   * instead of leaving the install stuck on stale data/index state. */
+   * instead of leaving the install stuck on stale data/index state.
+   *
+   * GH #457 — the `instanceIds` backfill that used to run here was
+   * retired in v1.32.x: it predates v1.0 and any production install
+   * has been backfilled long ago. The flag was removed from this
+   * cache shape; if you ever see legacy callsites referencing
+   * `cached.migrations.instanceIds`, they're safe to drop. */
   migrations: {
     instanceIds: boolean;
     sharedCatalogIndexes: boolean;
@@ -91,10 +97,18 @@ export default async function dbConnect() {
     cached.conn = await cached.promise;
   }
 
-  // One-time migrations on first connect after process start. Each
-  // migration tracks its own success flag — a transient failure on one
-  // doesn't poison the cache for the rest, and the next request retries
-  // any that didn't complete instead of skipping the whole block.
+  // GH #457 — RESTORED (Codex P1 on PR #467): the per-startup
+  // `backfillInstanceIds` pass cannot be retired safely. The
+  // `coreModelIndexes` migration below calls `Filament.syncIndexes()`,
+  // and the Filament schema declares a unique partial index on
+  // `instanceId`. MongoDB treats missing single-field values in a
+  // unique index as `null`, so a DB with >1 active filament missing
+  // `instanceId` would E11000 the index build, and the migration
+  // would retry forever instead of converging.
+  //
+  // The backfill is cheap on fresh / already-migrated installs
+  // (count === 0, flag flips immediately) and the retry tracking
+  // ensures a transient blip is recoverable on the next request.
   if (!cached.migrations.instanceIds) {
     try {
       const { backfillInstanceIds } = await import("@/models/Filament");
@@ -108,6 +122,10 @@ export default async function dbConnect() {
     }
   }
 
+  // One-time migrations on first connect after process start. Each
+  // migration tracks its own success flag — a transient failure on one
+  // doesn't poison the cache for the rest, and the next request retries
+  // any that didn't complete instead of skipping the whole block.
   // SharedCatalog's slug index changed from a plain unique index to
   // a partial-unique-on-_deletedAt-null index when soft-delete landed.
   // MongoDB won't mutate existing index options in-place, so on

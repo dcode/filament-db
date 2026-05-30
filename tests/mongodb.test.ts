@@ -43,7 +43,7 @@ describe("dbConnect", () => {
       conn: null,
       promise: connectPromise,
       uri: process.env.MONGODB_URI,
-      migrations: { instanceIds: false, sharedCatalogIndexes: false },
+      migrations: { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false, coreModelIndexes: false },
     };
 
     const result = await dbConnect();
@@ -56,11 +56,12 @@ describe("dbConnect", () => {
     expect((global as Record<string, unknown>).mongoose).toBeDefined();
   });
 
+  // GH #457 RESTORED: the backfill stays in the startup path because
+  // the `coreModelIndexes` migration depends on every Filament having
+  // an `instanceId` before it can build the partial-unique index.
+  // See the matching docblock in src/lib/mongodb.ts.
   it("logs when migration backfills instanceIds", async () => {
-    // Connect first to get access to the collection
     await dbConnect();
-
-    // Insert a filament without instanceId directly via collection
     const Filament = mongoose.models.Filament || (await import("@/models/Filament")).default;
     await Filament.collection.insertOne({
       name: "MigrationTest",
@@ -70,23 +71,18 @@ describe("dbConnect", () => {
       diameter: 1.75,
       _deletedAt: null,
     });
-
-    // Reset cache to force migration to run again
     const cached = (global as Record<string, unknown>).mongoose as Record<string, unknown>;
-    cached.migrations = { instanceIds: false, sharedCatalogIndexes: false };
+    cached.migrations = { instanceIds: false, sharedCatalogIndexes: false, nozzlePhysicalInstances: false, coreModelIndexes: false };
     cached.conn = null;
     cached.promise = null;
-
-    // Spy on console.log to verify migration message
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
     try {
       await dbConnect();
       expect(logSpy).toHaveBeenCalledWith(
-        expect.stringContaining("[migration] Backfilled instanceId")
+        expect.stringContaining("[migration] Backfilled instanceId"),
       );
     } finally {
       logSpy.mockRestore();
-      // Clean up
       await Filament.deleteMany({ name: "MigrationTest" });
     }
   });
@@ -111,9 +107,8 @@ describe("dbConnect", () => {
     const result = await dbConnect();
     expect(result).toBeDefined();
     const cached = (global as Record<string, unknown>).mongoose as {
-      migrations: { instanceIds: boolean; sharedCatalogIndexes: boolean };
+      migrations: { sharedCatalogIndexes: boolean };
     };
-    expect(cached.migrations.instanceIds).toBe(true);
     expect(cached.migrations.sharedCatalogIndexes).toBe(true);
   });
 
@@ -122,9 +117,8 @@ describe("dbConnect", () => {
     await dbConnect();
 
     const cached = (global as Record<string, unknown>).mongoose as {
-      migrations: { instanceIds: boolean; sharedCatalogIndexes: boolean };
+      migrations: { sharedCatalogIndexes: boolean };
     };
-    expect(cached.migrations.instanceIds).toBe(true);
     expect(cached.migrations.sharedCatalogIndexes).toBe(true);
 
     const result = await dbConnect();
@@ -148,10 +142,9 @@ describe("dbConnect", () => {
     try {
       await dbConnect();
       const cached = (global as Record<string, unknown>).mongoose as {
-        migrations: { instanceIds: boolean; sharedCatalogIndexes: boolean };
+        migrations: { sharedCatalogIndexes: boolean };
       };
-      // The instanceIds backfill succeeded; the sharedCatalog migration didn't.
-      expect(cached.migrations.instanceIds).toBe(true);
+      // The sharedCatalog migration didn't succeed yet.
       expect(cached.migrations.sharedCatalogIndexes).toBe(false);
 
       // Next call should retry the failed one — and now succeed.
