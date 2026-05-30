@@ -7,6 +7,7 @@ import BedType from "@/models/BedType";
 import PrintHistory from "@/models/PrintHistory";
 import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
 import { resolveFilament } from "@/lib/resolveFilament";
+import { displayColor } from "@/lib/filamentColors";
 
 /**
  * GET /api/dashboard — aggregate summary for the dashboard page.
@@ -95,7 +96,13 @@ export async function GET() {
           _id: String(f._id),
           name: f.name,
           vendor: f.vendor,
-          color: f.color,
+          // GH #477 (Codex P2 on PR #482): primary `color` is nullable
+          // per OpenPrintTag spec. For coextruded / rainbow filaments
+          // the primary IS null and the user's intended representative
+          // color lives in `secondaryColors[0]`. Use `displayColor()`
+          // so the dashboard swatch shows secondaryColors[0] in that
+          // case instead of a misleading gray dot.
+          color: displayColor(f),
           remainingGrams: remaining,
           threshold: f.lowStockThreshold,
         });

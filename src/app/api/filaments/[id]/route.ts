@@ -80,7 +80,7 @@ export async function GET(
     if (filament.parentId) {
       if (raw) {
         parentSummary = (await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
-          .select("_id name vendor type color cost density diameter")
+          .select("_id name vendor type color secondaryColors cost density diameter")
           .lean()) as typeof parentSummary;
       } else {
         const parentDoc = (await Filament.findOne({ _id: filament.parentId, _deletedAt: null })
@@ -111,13 +111,27 @@ export async function GET(
     // detail page shows it (that path goes through resolveFilament).
     // Codex round-1 P2 on PR #353.
     const rawVariants = await Filament.find({ parentId: id, _deletedAt: null })
-      .select("name color cost optTags")
+      // GH #477: secondaryColors so the parent's color-variants chips can
+      // render multi-color swatches without a follow-up fetch per variant.
+      .select("name color secondaryColors cost optTags")
       .sort({ name: 1 })
       .lean();
+    // GH #477 (Codex P2 on PR #482 r2): apply the same array-fallback
+    // resolution to `secondaryColors` that we apply to `optTags` —
+    // otherwise a variant that inherits its parent's multi-color slots
+    // (empty own array) renders single-color on the parent's variant
+    // chips while the same variant resolves correctly everywhere else.
+    // Mirrors resolveFilament's secondaryColors block + the list
+    // aggregation's $project ternary.
     const parentOptTags = (filament.optTags ?? []) as number[];
+    const parentSecondaryColors = (filament.secondaryColors ?? []) as string[];
     const variants = rawVariants.map((v) => ({
       ...v,
       optTags: v.optTags && v.optTags.length > 0 ? v.optTags : parentOptTags,
+      secondaryColors:
+        v.secondaryColors && v.secondaryColors.length > 0
+          ? v.secondaryColors
+          : parentSecondaryColors,
     }));
 
     if (parentSummary) {

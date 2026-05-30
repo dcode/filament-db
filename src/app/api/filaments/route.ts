@@ -52,7 +52,13 @@ export async function GET(request: NextRequest) {
           localField: "parentId",
           foreignField: "_id",
           as: "_parent",
-          pipeline: [{ $project: { calibrations: 1, optTags: 1 } }],
+          // GH #477: include `secondaryColors` so the effective projection
+          // below can merge a variant's empty array with the parent's full
+          // array — same array-fallback inheritance pattern resolveFilament
+          // uses at read time. Without this the list drops inherited
+          // multi-color data and the list-row swatch can't render it.
+          // (Codex P2 on PR #482.)
+          pipeline: [{ $project: { calibrations: 1, optTags: 1, secondaryColors: 1 } }],
         },
       },
       // Look up whether any non-deleted filament references this row as
@@ -89,6 +95,23 @@ export async function GET(request: NextRequest) {
           vendor: 1,
           type: 1,
           color: 1,
+          // GH #477: secondaryColors rides the list so a multi-color
+          // filament renders its full swatch in the list view without a
+          // follow-up fetch. Same effective-array merge as `optTags`
+          // below — variants with an empty secondaryColors inherit the
+          // parent's array per resolveFilament's array-fallback rule.
+          // Without this merge, a variant whose parent is a tri-color
+          // coextruded but whose own secondaryColors is `[]` would
+          // render single-color on the list / parent's color-variant
+          // chips despite the detail page showing the full set.
+          // (Codex P2 on PR #482.)
+          secondaryColors: {
+            $cond: [
+              { $gt: [{ $size: { $ifNull: ["$secondaryColors", []] } }, 0] },
+              "$secondaryColors",
+              { $ifNull: [{ $arrayElemAt: ["$_parent.secondaryColors", 0] }, []] },
+            ],
+          },
           cost: 1,
           density: 1,
           parentId: 1,
