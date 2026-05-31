@@ -99,6 +99,15 @@ export async function POST(request: NextRequest) {
           conditionalDefaults.density = payload.density;
         if (payload.color && payload.color !== "#808080")
           conditionalDefaults.color = payload.color;
+        // GH #477: OpenPrintTag spec keys 20–24. Apply only when the
+        // existing row has none — mirrors the "only set if currently
+        // null/sentinel" rule the other conditional defaults use.
+        if (
+          Array.isArray(payload.secondaryColors) &&
+          payload.secondaryColors.length > 0
+        ) {
+          conditionalDefaults.secondaryColors = payload.secondaryColors;
+        }
         if (payload.transmissionDistance != null)
           conditionalDefaults.transmissionDistance = payload.transmissionDistance;
         if (payload.dryingTemperature != null)
@@ -122,6 +131,29 @@ export async function POST(request: NextRequest) {
             conditionalSet.density = conditionalDefaults.density;
           if (conditionalDefaults.color && existing.color === "#808080")
             conditionalSet.color = conditionalDefaults.color;
+          // GH #477: only adopt the OPT db's secondaryColors when the
+          // existing row has none. Don't overwrite user-set arrays.
+          if (
+            conditionalDefaults.secondaryColors &&
+            (!existing.secondaryColors || existing.secondaryColors.length === 0)
+          ) {
+            conditionalSet.secondaryColors = conditionalDefaults.secondaryColors;
+            // GH #477 (Codex P2 on PR #484 r3): when the OPT material
+            // is coextruded (payload.color === null, secondaryColors
+            // populated) AND the existing row still has the gray
+            // sentinel "#808080", clear it to null so we don't end up
+            // with the gray+secondaries state the spec doesn't permit
+            // for coextruded materials. mapToFilamentPayload already
+            // emits null for this case so payload.color is null here,
+            // but the conditionalDefaults.color branch above only
+            // fires when payload.color is truthy — leaving the
+            // sentinel in place. This explicit clear closes the gap.
+            // Matches the create branch which gets null directly via
+            // mapToFilamentPayload.
+            if (payload.color === null && existing.color === "#808080") {
+              conditionalSet.color = null;
+            }
+          }
           if (conditionalDefaults.transmissionDistance != null && existing.transmissionDistance == null)
             conditionalSet.transmissionDistance = conditionalDefaults.transmissionDistance;
           if (conditionalDefaults.dryingTemperature != null && existing.dryingTemperature == null)
