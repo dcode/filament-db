@@ -24,6 +24,23 @@
 type FilamentDoc = Record<string, any>;
 
 /**
+ * The single hex string a slicer preset should carry for a multi-color
+ * filament. Differs from `displayColor()` in one important way: when
+ * neither a primary nor a secondary exists, this returns `null` so the
+ * `set()` helper skips the key entirely and the slicer falls back to its
+ * own default — rather than emitting a forced `#808080` gray the user
+ * never picked (Codex P2 on PR #485).
+ */
+function slicerExportColor(filament: FilamentDoc): string | null {
+  if (filament.color != null && filament.color !== "") return filament.color;
+  if (Array.isArray(filament.secondaryColors) && filament.secondaryColors.length > 0) {
+    const first = filament.secondaryColors[0];
+    if (first != null && first !== "") return first;
+  }
+  return null;
+}
+
+/**
  * Map a resolved Filament DB document to PrusaSlicer INI key-value pairs.
  * Structured DB fields are mapped to their PrusaSlicer equivalents.
  * The `settings` bag is merged underneath (DB fields win on conflict).
@@ -53,7 +70,15 @@ export function filamentToSlicerKeys(
   // Core identification
   set("filament_type", filament.type);
   set("filament_vendor", filament.vendor);
-  set("filament_colour", filament.color);
+  // Slicer presets are single-color — coextruded / multi-color filaments
+  // surface their primary, falling back to the first secondary when the
+  // primary is null (the spec-aligned "coextruded" shape). When NEITHER
+  // a primary nor a secondary exists `slicerExportColor` returns null so
+  // `set` is a no-op and the slicer uses its own default — we never
+  // invent a gray the user did not pick. Secondary colors beyond the
+  // primary are intentionally dropped; the detail page's slicer-export
+  // menu warns the user about this trade-off.
+  set("filament_colour", slicerExportColor(filament));
   set("filament_diameter", filament.diameter);
   set("filament_density", filament.density);
   set("filament_cost", filament.cost);
