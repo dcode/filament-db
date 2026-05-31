@@ -6,13 +6,17 @@ import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/ConfirmDialog";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import { formatDate, formatTime } from "@/lib/dateFormat";
+import FilamentSwatch from "@/components/FilamentSwatch";
+import { deriveArrangement } from "@/lib/filamentColors";
 
 interface TrashedFilament {
   _id: string;
   name: string;
   vendor: string;
   type: string;
-  color: string;
+  color: string | null;
+  secondaryColors?: string[];
+  optTags?: number[];
   cost: number | null;
   parentId: string | null;
   _deletedAt: string;
@@ -240,10 +244,11 @@ export default function TrashPage() {
                 key={item._id}
                 className="px-3 py-2 flex items-center gap-3 text-sm"
               >
-                <span
-                  className="inline-block w-5 h-5 rounded-full border border-gray-300 flex-shrink-0"
-                  style={{ backgroundColor: item.color }}
-                  aria-hidden="true"
+                <FilamentSwatch
+                  color={item.color}
+                  secondaryColors={item.secondaryColors}
+                  arrangement={deriveArrangement(item.optTags)}
+                  size={20}
                 />
                 <div className="flex-1 min-w-0">
                   <p className="font-medium truncate">{item.name}</p>
