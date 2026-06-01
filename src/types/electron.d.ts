@@ -70,6 +70,33 @@ interface ElectronAPI {
   updateInstall: (strings?: UpdateInstallStrings) => Promise<{ ok: boolean; error?: string }>;
   updateOpenReleasePage: () => Promise<{ ok: boolean }>;
   onUpdateStatus: (callback: (status: UpdateStatus) => void) => () => void;
+
+  // Brother PT-P710BT label printer (transport only — encoding lives
+  // in src/lib/labelEncoder.ts so the renderer and the CLI spike
+  // share one source of truth). The Uint8Array byte stream the
+  // renderer builds rides through IPC as a plain number[].
+  labelPrinterListDevices: () => Promise<LabelPrinterDevice[]>;
+  labelPrinterGetDevicePath: () => Promise<string | null>;
+  labelPrinterSetDevicePath: (devicePath: string | null) => Promise<{ ok: boolean }>;
+  labelPrinterPrint: (bytes: number[]) => Promise<{ ok: boolean }>;
+  /** Public base URL for URL-mode label QRs. Required for URL mode in
+   *  packaged Electron because window.location.origin is localhost.
+   *  null means "not configured"; the dialog then disables URL mode
+   *  when in Electron (web users fall back to window.location.origin). */
+  labelPrinterGetPublicUrl: () => Promise<string | null>;
+  /** Throws on validation errors (bad URL shape, non-http(s) scheme,
+   *  loopback host). Pass null/empty to clear. */
+  labelPrinterSetPublicUrl: (url: string | null) => Promise<{ ok: boolean }>;
+}
+
+export interface LabelPrinterDevice {
+  /** OS-assigned device path to pass to `labelPrinterSetDevicePath`. */
+  path: string;
+  /** Human-readable name for the picker dropdown. */
+  friendlyName: string;
+  /** True when the path/manufacturer/friendly name matches a PT-series
+   *  printer — the picker pre-selects the obvious choice. */
+  looksLikePrinter: boolean;
 }
 
 export interface UpdateStatus {

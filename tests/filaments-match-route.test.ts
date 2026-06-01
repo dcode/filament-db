@@ -84,6 +84,180 @@ describe("/api/filaments/match", () => {
     expect(body.candidates).toEqual([]);
   });
 
+  it("GH PR #487: returns a confident match on exact instanceId", async () => {
+    // The label-printer dialog's instance-ID QR mode encodes the bare
+    // 5-byte hex. Without this branch the QR resolves to nothing because
+    // /api/filaments/match originally only knew about name/vendor/type.
+    await Filament.create({
+      name: "Comgrow PLA Red",
+      vendor: "Comgrow",
+      type: "PLA",
+      instanceId: "bbf3c4352f",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "bbf3c4352f" }));
+    const body = await res.json();
+    expect(body.match?.name).toBe("Comgrow PLA Red");
+    expect(body.candidates).toEqual([]);
+  });
+
+  it("PR #487: instanceId match is case-insensitive", async () => {
+    await Filament.create({
+      name: "ABS+",
+      vendor: "eSun",
+      type: "ABS+",
+      instanceId: "deadbeef42",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "DEADBEEF42" }));
+    const body = await res.json();
+    expect(body.match?.name).toBe("ABS+");
+  });
+
+  it("PR #487 r15: case-insensitivity works in BOTH directions (uppercase stored / lowercase queried)", async () => {
+    // The schema generates lowercase hex going forward, but legacy /
+    // re-imported filaments may carry uppercase or mixed-case values.
+    // Both directions must match — the comparison can't normalise just
+    // one side. (Codex P2 round 14 on PR #487.)
+    await Filament.create({
+      name: "Legacy uppercase",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "DEADBEEF42",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "deadbeef42" }));
+    const body = await res.json();
+    expect(body.match?.name).toBe("Legacy uppercase");
+  });
+
+  it("PR #487: instanceId no-match falls through to name/vendor/type", async () => {
+    // A label-printer QR for a filament that no longer exists shouldn't
+    // 404 — fall through so the scanner UI can still offer suggestions
+    // from whatever else the caller provided.
+    await Filament.create({
+      name: "Bambu PC Black",
+      vendor: "Bambu Lab",
+      type: "PC",
+    });
+    const res = await matchFilaments(
+      matchReq({
+        instanceId: "0000000000",
+        name: "Bambu PC Black",
+      }),
+    );
+    const body = await res.json();
+    // No instanceId hit, but the name fallback fires.
+    expect(body.match?.name).toBe("Bambu PC Black");
+  });
+
+  it("PR #487: non-hex instance IDs (legacy imports) still match", async () => {
+    // The schema doesn't enforce hex — importFilaments.ts assigns
+    // row.instanceId verbatim, and existing rows may carry strings
+    // like "custom-id-123". The match endpoint must resolve them.
+    // (Codex P2 round 15 on PR #487.)
+    await Filament.create({
+      name: "Imported custom ID",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "custom-id-123",
+    });
+    const res = await matchFilaments(
+      matchReq({ instanceId: "custom-id-123" }),
+    );
+    const body = await res.json();
+    expect(body.match?.name).toBe("Imported custom ID");
+  });
+
+  it("PR #487: regex-special characters in stored instanceId are matched literally", async () => {
+    // escapeRegex protects against accidental regex semantics — a
+    // stored value `a.b*c` must match the literal string, not "a"
+    // followed by any char, etc.
+    await Filament.create({
+      name: "Has regex chars",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "a.b*c",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "a.b*c" }));
+    const body = await res.json();
+    expect(body.match?.name).toBe("Has regex chars");
+  });
+
+  it("PR #487: regex-special queries don't match unrelated stored IDs", async () => {
+    // The opposite direction: a malformed query like ".*" must NOT
+    // match every filament. escapeRegex makes the query literal.
+    await Filament.create({
+      name: "Unrelated",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "deadbeef42",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: ".*" }));
+    const body = await res.json();
+    expect(body.match).toBeNull();
+  });
+
+  it("PR #487 r17: case-only collision picks the exact-case row deterministically", async () => {
+    // Legacy data can hold both "ABC" and "abc" because the partial
+    // unique index on instanceId is case-sensitive. A query for one
+    // of them must return THAT one, not the other — the exact-case
+    // match runs before the case-insensitive fallback. (Codex P2
+    // round 16 on PR #487.)
+    await Filament.create({
+      name: "Upper case",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "ABC123",
+    });
+    await Filament.create({
+      name: "Lower case",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "abc123",
+    });
+    const upper = await matchFilaments(matchReq({ instanceId: "ABC123" }));
+    expect((await upper.json()).match?.name).toBe("Upper case");
+    const lower = await matchFilaments(matchReq({ instanceId: "abc123" }));
+    expect((await lower.json()).match?.name).toBe("Lower case");
+  });
+
+  it("PR #487 r17: case-only collision with no exact hit returns candidates (no arbitrary pick)", async () => {
+    // If the query case matches NEITHER stored row but does match
+    // both case-insensitively, we'd be picking arbitrarily — refuse
+    // and surface both as candidates instead.
+    await Filament.create({
+      name: "Upper case",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "ABC123",
+    });
+    await Filament.create({
+      name: "Lower case",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "abc123",
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "AbC123" }));
+    const body = await res.json();
+    expect(body.match).toBeNull();
+    expect(body.candidates).toHaveLength(2);
+    expect(body.candidates.map((c: { name: string }) => c.name).sort()).toEqual([
+      "Lower case",
+      "Upper case",
+    ]);
+  });
+
+  it("PR #487: instanceId excludes soft-deleted filaments", async () => {
+    await Filament.create({
+      name: "Trashed",
+      vendor: "Test",
+      type: "PLA",
+      instanceId: "deadbeefab",
+      _deletedAt: new Date(),
+    });
+    const res = await matchFilaments(matchReq({ instanceId: "deadbeefab" }));
+    const body = await res.json();
+    expect(body.match).toBeNull();
+  });
+
   it("excludes soft-deleted filaments from matches and candidates", async () => {
     await Filament.create({
       name: "Bambu PC Black",

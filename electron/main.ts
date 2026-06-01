@@ -5,6 +5,8 @@ import { execFile } from "child_process";
 import Store from "electron-store";
 import http from "http";
 import { NfcService } from "./nfc-service";
+import { listLabelPrinters, printLabel as printLabelToDevice } from "./label-printer";
+import { isLoopbackHostname } from "../src/lib/loopbackHost";
 import { startLocalMongo, stopLocalMongo } from "./local-mongo";
 import { SyncService, SyncStatus, getDbNameFromUri } from "./sync-service";
 import { initAutoUpdater } from "./auto-updater";
@@ -562,11 +564,11 @@ const MAX_NFC_PAYLOAD_BYTES = 4096;
  * operations should report progress through their own status channel
  * instead.
  */
-function withIpcTimeout<T>(fn: () => Promise<T>, label: string): Promise<T> {
+function withIpcTimeout<T>(fn: () => Promise<T>, label: string, timeoutMs: number = IPC_TIMEOUT_MS): Promise<T> {
   return Promise.race([
     fn(),
     new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`IPC timeout: ${label} took longer than ${IPC_TIMEOUT_MS}ms`)), IPC_TIMEOUT_MS)
+      setTimeout(() => reject(new Error(`IPC timeout: ${label} took longer than ${timeoutMs}ms`)), timeoutMs)
     ),
   ]);
 }
@@ -974,6 +976,134 @@ ipcMain.handle("nfc-format-tag", async (event) => {
   if (!nfcService) throw new Error("NFC not initialized");
   await withIpcTimeout(() => nfcService!.formatTag(), "nfc-format-tag");
   return { success: true };
+});
+
+// ── Label printer (Brother PT-P710BT) ──
+// Transport-only; the byte stream is built in the renderer via
+// src/lib/labelEncoder.ts + labelBitmap.ts. Main owns serialport
+// because the renderer can't open native handles.
+
+ipcMain.handle("label-printer-list-devices", async (event) => {
+  assertTrustedSender(event, "label-printer-list-devices");
+  return await withIpcTimeout(
+    () => listLabelPrinters(),
+    "label-printer-list-devices",
+  );
+});
+
+ipcMain.handle("label-printer-get-device-path", (event) => {
+  assertTrustedSender(event, "label-printer-get-device-path");
+  // The picker's chosen device path lives in the same electron-store
+  // the rest of the app uses — see the get-config handler above. Kept
+  // as a separate handler so the renderer doesn't have to read the
+  // whole config object just to render the Print Label dialog.
+  return (store as Store<Record<string, unknown>>).get("labelPrinterDevicePath", null);
+});
+
+ipcMain.handle("label-printer-set-device-path", (event, devicePath: string | null) => {
+  assertTrustedSender(event, "label-printer-set-device-path");
+  if (devicePath != null && typeof devicePath !== "string") {
+    throw new Error("devicePath must be a string or null");
+  }
+  if (devicePath == null) {
+    (store as Store<Record<string, unknown>>).delete("labelPrinterDevicePath");
+  } else {
+    (store as Store<Record<string, unknown>>).set("labelPrinterDevicePath", devicePath);
+  }
+  return { ok: true };
+});
+
+// Public base URL used for URL-mode label QR payloads (e.g.
+// "https://filament-db.lan" or "https://my-instance.example.com").
+// Required for URL mode in packaged Electron because the renderer's
+// window.location.origin is `http://localhost:<port>` — labels encoded
+// with that URL are unscannable from any other device. Web users
+// (renderer running in a regular browser) usually have a real origin
+// already and don't need this setting; the dialog uses it as an
+// override when set, falling back to `window.location.origin`
+// otherwise. (Codex P2 on PR #487.)
+ipcMain.handle("label-printer-get-public-url", (event) => {
+  assertTrustedSender(event, "label-printer-get-public-url");
+  return (store as Store<Record<string, unknown>>).get("labelPrinterPublicUrl", null);
+});
+
+ipcMain.handle("label-printer-set-public-url", (event, url: string | null) => {
+  assertTrustedSender(event, "label-printer-set-public-url");
+  if (url != null && typeof url !== "string") {
+    throw new Error("url must be a string or null");
+  }
+  if (url == null || url.trim() === "") {
+    (store as Store<Record<string, unknown>>).delete("labelPrinterPublicUrl");
+    return { ok: true };
+  }
+  // Validate shape: must parse + must be http(s) + must not be the
+  // loopback host (which defeats the whole point of this setting).
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Not a valid URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("URL must use http or https");
+  }
+  if (isLoopbackHostname(parsed.hostname)) {
+    throw new Error(
+      "URL points to localhost — labels encoded with this URL would be unscannable from other devices.",
+    );
+  }
+  // (Query + fragment rejection moved below to the raw-input check
+  // which also catches bare `?` / `#` delimiters that URL parses as
+  // empty search/hash — Codex P2 round 9 on PR #487.)
+  // Reject bare delimiters too: `https://example.com?` parses with
+  // `parsed.search === ""` (falsy), so the structured check above lets
+  // it through and the original raw string gets stored. Concatenating
+  // `/filaments/<id>` onto that produces `...?/filaments/<id>` which
+  // routes the scan to the wrong place. URL-path `?` and `#` characters
+  // are always delimiters per RFC 3986 — literal versions must be
+  // percent-encoded as `%3F` / `%23` — so checking the raw input is
+  // valid. (Codex P2 round 9 on PR #487.)
+  if (url.includes("?")) {
+    throw new Error("URL must not contain a query string (?...)");
+  }
+  if (url.includes("#")) {
+    throw new Error("URL must not contain a fragment (#...)");
+  }
+  // Strip trailing slash so callers can safely concat `${url}/filaments/...`
+  // without producing double slashes.
+  const normalized = url.replace(/\/+$/, "");
+  (store as Store<Record<string, unknown>>).set("labelPrinterPublicUrl", normalized);
+  return { ok: true };
+});
+
+ipcMain.handle("label-printer-print", async (event, bytes: number[]) => {
+  assertTrustedSender(event, "label-printer-print");
+  // Validate the payload from the renderer up front — bad inputs here
+  // would otherwise hang inside SerialPort.write.
+  if (!Array.isArray(bytes) || bytes.length === 0) {
+    throw new Error("bytes must be a non-empty array");
+  }
+  if (bytes.length > 5_000_000) {
+    // Safety cap. A maxed-out 24mm × 200mm label is ~270 KB, so 5 MB
+    // is well past any legitimate single-label print and ensures a
+    // misbehaving renderer can't lock the printer indefinitely.
+    throw new Error(`bytes array too large (${bytes.length} bytes)`);
+  }
+  const devicePath = (store as Store<Record<string, unknown>>).get(
+    "labelPrinterDevicePath",
+    null,
+  ) as string | null;
+  if (!devicePath) {
+    throw new Error(
+      "No label printer device path configured. Open Settings → Label Printer.",
+    );
+  }
+  await withIpcTimeout(
+    () => printLabelToDevice(devicePath, new Uint8Array(bytes)),
+    "label-printer-print",
+    30_000, // give long labels + slow Bluetooth a generous window
+  );
+  return { ok: true };
 });
 
 // ── App lifecycle ──
