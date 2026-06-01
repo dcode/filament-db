@@ -619,7 +619,7 @@ Manual job entries don't show up twice: entries tagged `source: "job"` or `"slic
 
 The **Share** page at `/share` lets you publish a static snapshot of selected filaments under a short slug. Use case: you want a friend to install the exact same PLA+PETG loadout you're running.
 
-1. Select the filaments you want to share (multi-select)
+1. Select the filaments you want to share (multi-select). Since v1.34.1 the picker has search-as-you-type (matches name, vendor, type, or color), material-type filter chips, and a "show selected only" toggle so finding the right rows on a large catalog stays manageable. The chrome only appears once you have ≥12 filaments — small catalogs get the bare list.
 2. Give the catalog a title + optional description, and optional expiry date
 3. Click **Publish** — the server collects every nozzle / printer / bed-type referenced by those filaments and denormalises everything into the payload, so the recipient gets a complete, consistent set
 
@@ -631,7 +631,7 @@ The **Share** page at `/share` lets you publish a static snapshot of selected fi
 
 ## Filament Comparison *(v1.11)*
 
-The **Compare** page at `/compare` takes up to N filaments (pass via query string, or add from the filament list) and renders a side-by-side table of temperatures, cost, density, diameter, calibrations, and current remaining weight. Useful when deciding which of several similar filaments to use for a job.
+The **Compare** page at `/compare` takes up to 8 filaments (pass via query string, or add from the filament list) and renders a side-by-side table of temperatures, cost, density, diameter, calibrations, and current remaining weight. Useful when deciding which of several similar filaments to use for a job. Since v1.34.1 the picker has the same search-as-you-type, material-type filter chips, and "show selected only" toggle as `/share` (only appearing at ≥12 filaments) so picking 4–8 rows out of a large catalog stays quick.
 
 ## Spool Inventory *(v1.32)*
 

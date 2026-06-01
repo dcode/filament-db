@@ -636,7 +636,7 @@ Manuelle Auftragseinträge werden nicht doppelt gezählt: Einträge mit `source:
 
 Die **Share**-Seite unter `/share` lässt dich einen statischen Snapshot ausgewählter Filamente unter einem Kurz-Slug veröffentlichen. Anwendungsfall: Du willst einem Freund die exakte PLA+PETG-Aufstellung installieren lassen, die du nutzt.
 
-1. Wähle die zu teilenden Filamente (Multi-Select)
+1. Wähle die zu teilenden Filamente (Multi-Select). Seit v1.34.1 hat die Auswahl eine Sofortsuche (gleicht Name, Hersteller, Typ oder Farbe ab), Materialtyp-Filterchips sowie einen "Nur Ausgewählte anzeigen"-Schalter, damit das Finden der richtigen Zeilen in einem großen Katalog handhabbar bleibt. Die Bedienelemente erscheinen erst ab ≥12 Filamenten — kleine Kataloge bleiben bei der schlichten Liste.
 2. Gib dem Katalog einen Titel + optionale Beschreibung und optionales Ablaufdatum
 3. Klicke auf **Veröffentlichen** — der Server sammelt jede von diesen Filamenten referenzierte Düse / Drucker / Druckbett-Typ und denormalisiert alles in die Payload, sodass der Empfänger ein vollständiges, konsistentes Set erhält
 
@@ -648,7 +648,7 @@ Die **Share**-Seite unter `/share` lässt dich einen statischen Snapshot ausgew�
 
 ## Filamentvergleich *(v1.11)*
 
-Die **Compare**-Seite unter `/compare` nimmt bis zu N Filamente (per Query-String übergeben oder aus der Filamentliste hinzufügen) und rendert eine Side-by-Side-Tabelle mit Temperaturen, Kosten, Dichte, Durchmesser, Kalibrierungen und aktuellem Restgewicht. Nützlich, wenn du dich zwischen mehreren ähnlichen Filamenten für einen Job entscheiden musst.
+Die **Compare**-Seite unter `/compare` nimmt bis zu 8 Filamente (per Query-String übergeben oder aus der Filamentliste hinzufügen) und rendert eine Side-by-Side-Tabelle mit Temperaturen, Kosten, Dichte, Durchmesser, Kalibrierungen und aktuellem Restgewicht. Nützlich, wenn du dich zwischen mehreren ähnlichen Filamenten für einen Job entscheiden musst. Seit v1.34.1 hat die Auswahl dieselbe Sofortsuche, Materialtyp-Filterchips und den "Nur Ausgewählte anzeigen"-Schalter wie `/share` (erst ab ≥12 Filamenten sichtbar), damit das Herausgreifen von 4–8 Zeilen aus einem großen Katalog schnell bleibt.
 
 ## System-Theme *(v1.11)*
 

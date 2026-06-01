@@ -75,7 +75,7 @@ npm run electron:dev
 
 Das startet den Next.js-Dev-Server auf Port 3456 und Electron gleichzeitig. Die App lädt `http://localhost:3456`.
 
-> **Hinweis:** Im Dev-Modus verbindet sich Electron mit dem `next dev`-Server auf Port 3456. Verbindungsmodus-Änderungen (offline/hybrid/atlas) im Einrichtungs-Assistenten speichern den Konfigurationsspeicher und rekonfigurieren den Electron-Hauptprozess (lokale MongoDB, Sync-Service), aber das Next.js-Backend verwendet weiterhin die `MONGODB_URI` aus deiner `.env.local`. Um Verbindungsmodi vollständig zu testen, nutze einen Produktions-Build (`npm run electron:build`).
+> **Hinweis:** Im Dev-Modus verbindet sich Electron mit dem `next dev`-Server auf Port 3456. Verbindungsmodus-Änderungen (offline/hybrid/atlas) im Einrichtungs-Assistenten speichern den Konfigurationsspeicher und rekonfigurieren den Electron-Hauptprozess (lokale MongoDB, Sync-Service), aber das Next.js-Backend verwendet weiterhin die `MONGODB_URI` aus deiner `.env.local`. Um Verbindungsmodi vollständig zu testen, nutze einen Produktions-Build (`npm run electron:build`). Seit v1.34.1 zeigt die Desktop-App im Dev-Modus zusätzlich ein ausblendbares gelbes Banner am oberen Rand des Renderers an, damit dieser Sonderfall deutlich sichtbar ist, bevor du etwas Veränderndes anklickst.
 
 ### Produktions-Build
 

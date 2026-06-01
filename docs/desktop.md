@@ -73,7 +73,7 @@ npm run electron:dev
 
 This starts the Next.js dev server on port 3456 and Electron concurrently. The app loads `http://localhost:3456`.
 
-> **Note:** In dev mode, Electron connects to the `next dev` server on port 3456. Connection-mode changes (offline/hybrid/atlas) made through the setup wizard will save to the config store and reconfigure the Electron main process (local MongoDB, sync service), but the Next.js backend still uses whatever `MONGODB_URI` is in your `.env.local`. To fully test connection modes, use a production build (`npm run electron:build`).
+> **Note:** In dev mode, Electron connects to the `next dev` server on port 3456. Connection-mode changes (offline/hybrid/atlas) made through the setup wizard will save to the config store and reconfigure the Electron main process (local MongoDB, sync service), but the Next.js backend still uses whatever `MONGODB_URI` is in your `.env.local`. To fully test connection modes, use a production build (`npm run electron:build`). Since v1.34.1 the desktop app also surfaces this in dev mode via a dismissable amber banner at the top of the renderer so the gap is obvious before you click anything destructive.
 
 ### Production Build
 
