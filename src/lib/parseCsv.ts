@@ -48,6 +48,52 @@ export function parseCsv(
   // turning `maxRows: N` into an `N-1` data-row ceiling in header mode.
   const rawRowCap = opts.header ? maxRows + 1 : maxRows;
   const rows: string[][] = [];
+  // A blank row from a spreadsheet export can carry delimiters — `,\n`
+  // parses to `["", ""]`, not `[""]` — so "blank" means every field is
+  // empty after trimming (matches the header-mode output skip below).
+  const isBlankRow = (r: string[]): boolean =>
+    r.length === 0 || r.every((v) => v.trim() === "");
+
+  // Codex P2 round 3 on PR #536: the cap must bound BUFFERED memory, not
+  // just the emitted-row count. In header mode, blank rows are filtered
+  // out of the output (the `trimmed[r].every` skip below), so:
+  //   - GH #512: they must NOT count toward maxRows (an Excel paste with
+  //     trailing newlines / section-separator blanks shouldn't throw
+  //     when the emitted row count is under the cap), AND
+  //   - they must NOT be buffered at all — otherwise a flood of blank /
+  //     comma-only lines accumulates `rows` unbounded and the DoS guard
+  //     is bypassed by rows it's "exempting". So in header mode we
+  //     simply discard blank rows during parsing.
+  // In non-header mode every parsed row is RETURNED verbatim
+  // (`if (!opts.header) return trimmed`), so every row — blank or not —
+  // is both buffered AND counted.
+  //
+  // `rows.length` is therefore the count of rows that will actually be
+  // returned (header mode: header + non-blank data; non-header: all),
+  // so the emitted-row cap check is just `rows.length > rawRowCap`.
+  //
+  // Codex P2 round 4 on PR #536: keep a SEPARATE physical-row cap too.
+  // Because header-mode blank rows are discarded before the emitted cap,
+  // a blank / comma-only-line flood ("3 data rows + 10M blank lines")
+  // would otherwise make the parser scan the entire input even though
+  // those lines never count toward maxRows — tying up the import route
+  // (`/api/spools/import` calls parseCsv with no separate body cap).
+  // The physical cap counts EVERY parsed line (blanks + header) and is
+  // set generously — one full `maxRows` worth of blank lines beyond the
+  // data cap — so legitimate trailing / section-separator blanks pass
+  // while an abusive flood trips it.
+  const physicalRowCap = rawRowCap + maxRows;
+  let physicalRowCount = 0;
+  const commitRow = (r: string[]): void => {
+    physicalRowCount++;
+    if (physicalRowCount > physicalRowCap) {
+      throw new CsvRowLimitExceededError(maxRows);
+    }
+    if (opts.header && isBlankRow(r)) return; // discard — never buffered
+    rows.push(r);
+    if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
+  };
+
   let row: string[] = [];
   let field = "";
   let i = 0;
@@ -88,21 +134,19 @@ export function parseCsv(
     if (ch === "\r") {
       // Handle CRLF by skipping the LF; bare CR also treated as a line end.
       row.push(field);
-      rows.push(row);
       field = "";
-      row = [];
       i++;
       if (input[i] === "\n") i++;
-      if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
+      commitRow(row);
+      row = [];
       continue;
     }
     if (ch === "\n") {
       row.push(field);
-      rows.push(row);
       field = "";
-      row = [];
       i++;
-      if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
+      commitRow(row);
+      row = [];
       continue;
     }
     field += ch;
@@ -112,8 +156,7 @@ export function parseCsv(
   // Flush any trailing field/row that didn't end with a newline
   if (field.length > 0 || row.length > 0) {
     row.push(field);
-    rows.push(row);
-    if (rows.length > rawRowCap) throw new CsvRowLimitExceededError(maxRows);
+    commitRow(row);
   }
 
   // Strip outer whitespace from unquoted strings — we keep quoted values

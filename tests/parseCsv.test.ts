@@ -107,6 +107,81 @@ describe("parseCsv", () => {
       ).toThrow(CsvRowLimitExceededError);
     });
 
+    // GH #512: blank lines (Excel paste with trailing newlines,
+    // section-separator blanks) used to count toward the cap, so a
+    // maxRows-rows file with even one trailing blank would throw
+    // CsvRowLimitExceededError despite emitting <=maxRows rows.
+    it("ignores blank rows when enforcing maxRows (header: true)", () => {
+      // 2 data rows + 1 trailing blank — emits 2, cap of 2 must accept.
+      expect(
+        parseCsv("h\nd1\nd2\n\n", { header: true, maxRows: 2 }),
+      ).toHaveLength(2);
+      // Section-separator blank between data rows also doesn't count.
+      expect(
+        parseCsv("h\nd1\n\nd2\nd3", { header: true, maxRows: 3 }),
+      ).toHaveLength(3);
+    });
+
+    it("ignores COMMA-ONLY blank rows when enforcing maxRows (Codex P2 PR #536)", () => {
+      // A spreadsheet export's blank separator row carries delimiters:
+      // `,\n` → ["", ""], not [""]. Must still count as blank for the
+      // cap (it's skipped as fully-empty in header mode anyway).
+      expect(
+        parseCsv("h1,h2\nd1,d2\n,\n", { header: true, maxRows: 1 }),
+      ).toHaveLength(1);
+      // Whitespace-only fields in a separator row count as blank too.
+      expect(
+        parseCsv("h1,h2\na,b\n , \nc,d", { header: true, maxRows: 2 }),
+      ).toHaveLength(2);
+    });
+
+    it("COUNTS blank rows toward maxRows in header:false mode (Codex P2 round 2 PR #536)", () => {
+      // In header:false mode every parsed row is RETURNED verbatim, so
+      // every row — blank or not — is emitted and MUST count toward the
+      // cap. Exempting blanks here would let a file of maxRows+ blank /
+      // newline-only rows bypass the DoS guard while still buffering and
+      // returning all of them.
+      // 4 non-blank rows + 1 trailing blank = 5 emitted rows > cap of 4.
+      expect(() =>
+        parseCsv("a\nb\nc\nd\n\n", { header: false, maxRows: 4 }),
+      ).toThrow(CsvRowLimitExceededError);
+      // A file of pure blank/newline rows must also trip the guard —
+      // they're all emitted in raw mode.
+      expect(() =>
+        parseCsv("\n\n\n\n\n", { header: false, maxRows: 3 }),
+      ).toThrow(CsvRowLimitExceededError);
+      // Exactly maxRows rows (no blanks) still accepted.
+      expect(
+        parseCsv("a\nb\nc\nd", { header: false, maxRows: 4 }),
+      ).toHaveLength(4);
+    });
+
+    it("does not buffer blank rows in header mode (Codex P2 round 3 PR #536)", () => {
+      // Header-mode blank rows are discarded during parsing, so a modest
+      // run of trailing/section-separator blanks under the physical cap
+      // parses fine and never inflates the buffered/emitted row count.
+      // maxRows 2 → physical cap = (2+1) + 2 = 5: header + 2 data + 2
+      // blank lines = 5 physical, accepted; emits 2 data rows.
+      expect(
+        parseCsv("h1,h2\nd1,d2\nd3,d4\n\n\n", { header: true, maxRows: 2 }),
+      ).toHaveLength(2);
+    });
+
+    it("bounds PHYSICAL rows so a blank-line flood can't tie up parsing (Codex P2 round 4 PR #536)", () => {
+      // Even though blank rows don't count toward the DATA cap, a flood
+      // of them is bounded by the separate physical-row cap
+      // (rawRowCap + maxRows) so the parser can't scan an unbounded input.
+      const flood = "\n".repeat(10_000);
+      expect(() =>
+        parseCsv(`h1,h2\nd1,d2\n${flood}`, { header: true, maxRows: 2 }),
+      ).toThrow(CsvRowLimitExceededError);
+      // Comma-only separator flood is bounded the same way.
+      const commaFlood = ",\n".repeat(10_000);
+      expect(() =>
+        parseCsv(`h1,h2\nd1,d2\n${commaFlood}`, { header: true, maxRows: 2 }),
+      ).toThrow(CsvRowLimitExceededError);
+    });
+
     it("pins the default 10,000-row cap", () => {
       const atLimit = parseCsv(rows(10_000), { header: false }) as string[][];
       expect(atLimit).toHaveLength(10_000);
