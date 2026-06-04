@@ -348,8 +348,103 @@ function FilamentDetail() {
     }
   };
 
+  // GH #583: probe the tag before any write entry point clobbers it. Shared
+  // by the explicit "Write NFC" button and the "Update NFC" weight path so a
+  // Bambu (read-only) tag is refused consistently — Codex P2 on PR #584.
+  //  • Bambu Lab tag → read-only, refuse with a friendly toast (writing would
+  //    otherwise fail with a raw MIFARE error)
+  //  • non-blank tag + confirmOverwrite → confirm before clobbering existing data
+  //  • genuinely blank/unformatted tag (read throws a known blank signal) →
+  //    allow, write straight through
+  //  • unknown read error (transient PC/SC, decode failure on a non-blank tag)
+  //    → fail CLOSED: don't silently overwrite a tag we couldn't read
+  //    (Codex P2 on PR #584). Mirrors the blank-tag signals raised in
+  //    electron/ndef.ts + the auto-read classifier in electron/main.ts.
+  // Returns true if the caller should proceed with the write.
+  const ensureTagWritable = useCallback(
+    async ({ confirmOverwrite = false }: { confirmOverwrite?: boolean } = {}): Promise<boolean> => {
+      type ProbedTag = { tagSource?: string; materialName?: string; brandName?: string; spoolUid?: string };
+      let existing: ProbedTag | null | undefined;
+      // The tag carries a valid NDEF message but no OpenPrintTag record (e.g.
+      // a URL/text/contact tag) — it's NOT blank, just not ours.
+      let foreignNdef = false;
+
+      try {
+        existing = (await window.electronAPI?.nfcReadTag?.()) as ProbedTag | null | undefined;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Only a GENUINELY blank/erased tag (no NDEF data at all) bypasses the
+        // overwrite prompt. "No NDEF record" is NOT blank — it's also thrown by
+        // electron/ndef.ts for a valid NDEF message that simply isn't an
+        // OpenPrintTag, so it must NOT fail open (Codex P2 round 4 on PR #584).
+        if (msg.includes("Blank or unformatted") || msg.includes("No NDEF TLV")) {
+          return true;
+        }
+        if (msg.includes("No NDEF record")) {
+          foreignNdef = true;
+        } else {
+          // Transient PC/SC / decode error on an unreadable tag → fail closed
+          // so we don't clobber it. The user can reseat and retry.
+          toast(t("detail.nfc.probeFailed"), "error");
+          return false;
+        }
+      }
+
+      // Bambu Lab tags are read-only — refuse on every write path.
+      if (existing?.tagSource === "bambu") {
+        toast(t("detail.nfc.bambuReadOnly"), "error");
+        return false;
+      }
+
+      // The tag already holds data (our OpenPrintTag, or a foreign NDEF tag).
+      if (existing || foreignNdef) {
+        // Does this decoded OpenPrintTag belong to the CURRENT filament? Match
+        // on instance id (most precise) or name+vendor. Only the weight-update
+        // path (confirmOverwrite=false) trusts this to skip the prompt.
+        const norm = (s?: string | null) => (s ?? "").trim().toLowerCase();
+        const tagInstance = norm(existing?.spoolUid);
+        const sameInstance = tagInstance !== "" && tagInstance === norm(filament?.instanceId);
+        const sameNameVendor =
+          norm(existing?.materialName) !== "" &&
+          norm(existing?.materialName) === norm(filament?.name) &&
+          norm(existing?.brandName) === norm(filament?.vendor);
+        const isOwnTag = !foreignNdef && !!existing && (sameInstance || sameNameVendor);
+
+        // Weight-update path silently re-writes THIS filament's own tag (the
+        // common case). Any OTHER tag must not be clobbered silently (Codex P2
+        // round 5 on PR #584): a foreign NDEF tag fails closed; a different
+        // filament's OpenPrintTag falls through to the confirm below.
+        if (!confirmOverwrite && isOwnTag) {
+          return true;
+        }
+        if (foreignNdef && !confirmOverwrite) {
+          toast(t("detail.nfc.probeFailed"), "error");
+          return false;
+        }
+
+        // Confirm before clobbering. A foreign NDEF tag has no name to show, so
+        // fall back to the generic label.
+        const name = existing?.materialName || existing?.brandName || t("detail.nfc.overwriteUnknown");
+        return confirm({
+          title: t("detail.nfc.overwriteTitle"),
+          message: t("detail.nfc.overwriteConfirm", { name }),
+          confirmLabel: t("detail.nfc.overwriteConfirmBtn"),
+          destructive: true,
+        });
+      }
+
+      // Blank/unformatted tag → write straight through.
+      return true;
+    },
+    [toast, t, confirm, filament],
+  );
+
   const handleNfcWrite = async () => {
     if (!filament) return;
+
+    // Explicit Write button → confirm before overwriting a tag that holds data.
+    if (!(await ensureTagWritable({ confirmOverwrite: true }))) return;
+
     setNfcWriteSuccess(null);
     try {
       // Compute actual remaining weight from the most recent scale reading
@@ -411,6 +506,10 @@ function FilamentDetail() {
 
   const handleNfcWeightUpdate = useCallback(async (scaleWeight: number) => {
     if (!filament || filament.spoolWeight == null) return;
+    // Bambu (read-only) tags can't be written — refuse with the friendly
+    // message here too (no overwrite confirm: a weight update is a deliberate
+    // re-write of this filament's own tag). Codex P2 on PR #584.
+    if (!(await ensureTagWritable())) return;
     const actualRemaining = Math.max(0, scaleWeight - filament.spoolWeight);
     setNfcWriteSuccess(null);
     try {
@@ -465,7 +564,7 @@ function FilamentDetail() {
       if (nfcWriteTimerRef.current) clearTimeout(nfcWriteTimerRef.current);
       nfcWriteTimerRef.current = setTimeout(() => setNfcWriteSuccess(null), 5000);
     }
-  }, [filament, writeTag, notifyTagWritten, toast, t]);
+  }, [filament, writeTag, notifyTagWritten, toast, t, ensureTagWritable]);
 
   const handleWeightUpdate = async () => {
     if (!filament) return;
