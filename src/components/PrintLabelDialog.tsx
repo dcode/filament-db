@@ -12,6 +12,7 @@ import { encodeLabel, packGrayscaleBitmap } from "@/lib/labelEncoder";
 import { isLoopbackUrl } from "@/lib/loopbackHost";
 import { useLabelFormat } from "@/hooks/useLabelFormat";
 import { composeLabelLines, type LabelFilament } from "@/lib/labelFormat";
+import { buildFilamentDeepLink } from "@/lib/labelDeepLink";
 
 /**
  * Print-label dialog for the filament detail page.
@@ -53,6 +54,9 @@ export interface PrintLabelDialogProps {
     vendor?: string | null;
     type?: string | null;
     colorName?: string | null;
+    // GH #595: the filament's spools, so a multi-spool filament can deep-link
+    // the URL-mode QR to a specific spool.
+    spools?: Array<{ _id: string; label?: string | null }>;
   };
 }
 
@@ -76,6 +80,20 @@ export default function PrintLabelDialog({
     }),
     [filament.name, filament.vendor, filament.type, filament.colorName],
   );
+
+  // GH #595: which spool the URL-mode QR deep-links to. `spoolChoice` is the
+  // *raw* control state: null = no explicit choice yet (fall back to the first
+  // spool), "" = the user explicitly picked "filament only", otherwise a spool
+  // id. Deriving the default from the live `spools` (rather than a once-run
+  // initializer) keeps the single-spool case linked even when the spool is
+  // added after the dialog mounts, and self-heals a stale/removed id — Codex P2.
+  const spools = useMemo(() => filament.spools ?? [], [filament.spools]);
+  const [spoolChoice, setSpoolChoice] = useState<string | null>(null);
+  const effectiveSpoolId = useMemo(() => {
+    if (spoolChoice === "") return null; // explicit "filament only"
+    if (spoolChoice && spools.some((s) => s._id === spoolChoice)) return spoolChoice;
+    return spools[0]?._id ?? null; // default to the first spool (or none if there are none)
+  }, [spoolChoice, spools]);
 
   const dialogRef = useRef<HTMLDivElement>(null);
 
@@ -162,7 +180,7 @@ export default function PrintLabelDialog({
     }
     if (publicUrl) {
       return {
-        deepLinkUrl: `${publicUrl}/filaments/${filament._id}`,
+        deepLinkUrl: buildFilamentDeepLink(publicUrl, filament._id, effectiveSpoolId),
         deepLinkAvailable: true,
       };
     }
@@ -176,12 +194,12 @@ export default function PrintLabelDialog({
     const origin = window.location.origin;
     if (!isLoopbackUrl(origin)) {
       return {
-        deepLinkUrl: `${origin}/filaments/${filament._id}`,
+        deepLinkUrl: buildFilamentDeepLink(origin, filament._id, effectiveSpoolId),
         deepLinkAvailable: true,
       };
     }
     return { deepLinkUrl: "", deepLinkAvailable: false };
-  }, [publicUrl, filament._id]);
+  }, [publicUrl, filament._id, effectiveSpoolId]);
 
   // Effective mode considers BOTH "instanceId exists" and "URL is
   // reachable" — if URL mode is selected but no reachable URL exists,
@@ -447,6 +465,36 @@ export default function PrintLabelDialog({
               </label>
             </div>
           </fieldset>
+
+          {/* GH #595: spool picker for multi-spool filaments — chooses which
+              spool the URL-mode deep-link QR targets. (The instance-ID mode is
+              filament-level and can't distinguish spools.) */}
+          {spools.length > 1 && (
+            <div>
+              <label
+                htmlFor="label-spool"
+                className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1"
+              >
+                {t("printLabel.spool")}
+              </label>
+              <select
+                id="label-spool"
+                value={effectiveSpoolId ?? ""}
+                onChange={(e) => setSpoolChoice(e.target.value)}
+                className="w-full px-3 py-1.5 text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 rounded focus:outline-none focus:ring-2 focus:ring-blue-500"
+              >
+                <option value="">{t("printLabel.spool.none")}</option>
+                {spools.map((s, i) => (
+                  <option key={s._id} value={s._id}>
+                    {(s.label && s.label.trim()) || t("printLabel.spool.fallback", { n: i + 1 })}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                {t("printLabel.spool.help")}
+              </p>
+            </div>
+          )}
 
           {/* Preview */}
           <div>
