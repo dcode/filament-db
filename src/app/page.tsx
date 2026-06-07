@@ -797,7 +797,12 @@ export default function Home() {
               </button>
               <FilamentSwatch
                 color={f.color}
+                secondaryColors={f.secondaryColors}
                 isParent
+                variantColors={group.variants.flatMap((v) => [
+                  v.color,
+                  ...(v.secondaryColors ?? []),
+                ])}
                 size={24}
                 title={f.color ?? undefined}
               />
