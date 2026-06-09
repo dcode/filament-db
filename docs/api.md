@@ -28,6 +28,8 @@
 | `POST` | `/api/filaments/parse-ini` | Parse an INI file and return filament profiles without saving |
 | `POST` | `/api/filaments/import-atlas` | Connect to a remote MongoDB Atlas database and import filaments |
 | `GET` | `/api/filaments/:id/openprinttag` | Download OpenPrintTag binary for a filament |
+| `GET` | `/api/filaments/:id/openprinttag/check` | Diff a linked filament against the current OpenPrintTag material |
+| `POST` | `/api/filaments/:id/openprinttag/sync` | Apply selected OpenPrintTag updates to a linked filament |
 | `GET` | `/api/filaments/:id/calibration` | Get calibration data for a filament and nozzle diameter |
 | `GET` | `/api/filaments/:id/spool-check` | Check if a spool has enough filament for a print job |
 | `POST` | `/api/filaments/:id` | Sync a filament preset back from PrusaSlicer |
@@ -335,6 +337,32 @@ Returns 400 if `weight` is missing or invalid. Returns 404 if the filament is no
 ### GET /api/filaments/:id/openprinttag
 
 Downloads the filament as an OpenPrintTag CBOR binary (`.bin` file). The binary can be written to an NFC-V (ISO 15693) tag or used with other OpenPrintTag-compatible tools.
+
+### GET /api/filaments/:id/openprinttag/check
+
+Compares a filament that was imported from the OpenPrintTag community database against the **current** upstream material and returns a field-level changelist. Read-only — nothing is mutated. The link is the `settings.openprinttag_slug` stamped at import time.
+
+Responses:
+- `{ "linked": false }` — the filament has no OpenPrintTag slug.
+- `{ "linked": true, "found": false, "slug": "…" }` — the slug is no longer in the OpenPrintTag database (renamed/removed upstream).
+- `{ "linked": true, "found": true, "slug": "…", "materialName": "…", "changes": [...] }` — an empty `changes` array means the row is already up to date.
+
+Each `changes[]` entry is `{ field, labelKey, current, incoming, kind }`. `kind` is `"adopt"` (the field was unset, still held the gray `#808080` sentinel, or matched the value OpenPrintTag last wrote — safe to take) or `"conflict"` (the local value diverges from what OpenPrintTag last wrote, i.e. you edited it — surfaced but not auto-applied). Only the managed fields are compared (color, secondary colors, density, the OPT-carried temperatures, drying temp/time, Shore D, transmission distance, tags); identity fields (name/vendor/type) and diameter are never re-synced.
+
+### POST /api/filaments/:id/openprinttag/sync
+
+Applies the user-accepted subset of OpenPrintTag updates to a linked filament. Same-origin guarded. Send a JSON body:
+
+```json
+{ "fields": ["density", "temperatures.nozzle"] }
+```
+
+Only field keys from the managed set are accepted — an unknown key returns 400 rather than being silently dropped. The provenance snapshot (`openprinttagSnapshot`) is refreshed to the full current OpenPrintTag offer on every sync, regardless of which fields were applied, so a later check can still tell "OpenPrintTag changed it" from "you changed it" for the fields you declined.
+
+Responses:
+- `{ "applied": ["density", "temperatures.nozzle"], "filament": { … } }` — the fields written + the fresh document.
+- `400` — malformed body, an unknown field, a field OpenPrintTag isn't currently offering (re-run the check), or the filament is not OpenPrintTag-linked.
+- `404` — the slug is no longer in the OpenPrintTag database.
 
 ### POST /api/filaments/:id/spools
 
