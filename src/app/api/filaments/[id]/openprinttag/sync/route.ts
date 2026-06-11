@@ -11,6 +11,7 @@ import {
   diffOptFields,
   OPT_MANAGED_FIELD_KEYS,
 } from "@/lib/optResync";
+import { resolveEffectiveFilament } from "@/lib/resolveEffectiveFilament";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 
 /**
@@ -110,9 +111,18 @@ export async function POST(
     // offers nothing there. `diffOptFields` intentionally skips that case
     // (sparse OPT data must never clear good local data), so only fields
     // that actually appear in the changelist may be applied.
+    // GH #607 follow-up: validate against the SAME effective (variant→parent)
+    // view the check route diffs, passing the same `parentEffective` — so
+    // check and sync agree exactly on what's offered (including suppressing an
+    // array clear that can't take on a variant; see diffOptFields). Without
+    // the shared resolution + parent values, an inherited field could be
+    // offered by one route and rejected by the other.
     const snapshotForDiff = filament.openprinttagSnapshot as Record<string, unknown> | undefined;
+    const { effective, parentEffective } = await resolveEffectiveFilament(
+      filament as unknown as Record<string, unknown>,
+    );
     const offered = new Set(
-      diffOptFields(filament as unknown as Record<string, unknown>, payload, snapshotForDiff).map(
+      diffOptFields(effective, payload, snapshotForDiff, parentEffective).map(
         (c) => c.field,
       ),
     );

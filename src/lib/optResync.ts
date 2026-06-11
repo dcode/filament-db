@@ -95,6 +95,20 @@ const OPT_CLEARABLE_FIELDS: ReadonlySet<string> = new Set([
   "optTags",
 ]);
 
+/**
+ * GH #607 (Codex P2): the ARRAY clearables. A variant can't clear an
+ * inherited array — `resolveFilament` treats an empty array as "inherit", so
+ * `$set`-ing `[]` onto the variant just re-inherits the parent's array. The
+ * effective value never reaches empty, so offering the clear would report a
+ * no-op "success" and re-surface on every check. `diffOptFields(isVariant)`
+ * suppresses these clears for variants. `color` is NOT here — it's a scalar
+ * and variant-only (never inherited), so clearing it to null works fine.
+ */
+const OPT_CLEARABLE_ARRAY_FIELDS: ReadonlySet<string> = new Set([
+  "secondaryColors",
+  "optTags",
+]);
+
 /** Snapshot keys can't contain dots (Mongo nesting). `temperatures.nozzle`
  *  → `temperatures_nozzle`. The snapshot is always written as one whole
  *  object so this sanitisation only matters for lookups. */
@@ -189,11 +203,22 @@ function classify(
  * through `mapToFilamentPayload`). Returns one entry per field that differs
  * AND that OPT actually offers a value for. Fields OPT doesn't carry, and
  * fields already equal to the upstream value, are omitted.
+ *
+ * `parentEffective` — the resolved values of the filament's PARENT, or null
+ * for a root filament (GH #607, Codex P2). Used to suppress an UNAPPLYABLE
+ * array clear: clearing a variant's `secondaryColors`/`optTags` writes `[]`,
+ * which resolves back to the parent's array, so the clear only reaches empty
+ * when the parent's array is ALSO empty. When the parent's array is non-empty
+ * the clear can never take (it would re-offer every check), so it's dropped —
+ * but a variant that OWNS a non-empty array over an EMPTY parent keeps the
+ * (genuinely applyable) clear. Pass the EFFECTIVE (resolved) filament for the
+ * values regardless.
  */
 export function diffOptFields(
   filament: Record<string, unknown>,
   payload: Record<string, unknown>,
   snapshot: Record<string, unknown> | null | undefined,
+  parentEffective?: Record<string, unknown> | null,
 ): OptFieldChange[] {
   const changes: OptFieldChange[] = [];
   for (const { field, labelKey, isColor } of OPT_MANAGED_FIELDS) {
@@ -207,6 +232,21 @@ export function diffOptFields(
     // fall through and let valuesEqual decide whether it's a real change
     // (GH #607, Codex P2 — explicit upstream clears must surface).
     if (!hasIncoming(incoming) && !OPT_CLEARABLE_FIELDS.has(field)) continue;
+    // GH #607 (Codex P2): suppress an array clear that can't actually take.
+    // Clearing a variant's array writes `[]`, which resolves to the parent's
+    // array — so the clear only reaches empty when the parent's array is also
+    // empty. Drop the change when the parent's array is non-empty (covers an
+    // inherited array AND a variant-owned array over a non-empty parent); keep
+    // it when the parent is empty (a variant-owned array can really be cleared)
+    // and for roots (parentEffective is null).
+    if (
+      !hasIncoming(incoming) &&
+      OPT_CLEARABLE_ARRAY_FIELDS.has(field) &&
+      parentEffective &&
+      hasIncoming(getPath(parentEffective, field))
+    ) {
+      continue;
+    }
     const current = getPath(filament, field);
     if (valuesEqual(current, incoming)) continue;
     const snapKey = optSnapshotKey(field);
