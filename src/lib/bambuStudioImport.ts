@@ -365,6 +365,13 @@ export function parseBambuStudioProfile(raw: unknown): BambuParseResult {
   for (const [key, value] of Object.entries(json)) {
     if (STRUCTURED_KEYS.has(key)) continue;
     if (CALIBRATION_KEYS.has(key)) continue;
+    // NOTE (#678, deferred): unwrap() collapses a multi-element array to its
+    // first element, so a multi-printer `compatible_printers` loses the rest on
+    // a Bambu/Orca round-trip. A faithful fix can't just store the array here —
+    // the `settings` bag is shared by the PrusaSlicer exporter (which would
+    // comma-join an array into one invalid INI line) and the edit form (which
+    // String-casts + `.replace()`s several keys). Round-tripping multi-valued
+    // keys needs arch-aware serialization in each exporter; tracked on #678.
     const s = unwrap(value);
     if (s == null) continue;
     filament.settings[key] = s;
