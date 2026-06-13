@@ -340,7 +340,27 @@ export async function POST(request: NextRequest) {
       body.overrides && typeof body.overrides === "object" && !Array.isArray(body.overrides)
         ? body.overrides
         : {};
-    body = { ...decodedTagToFilamentPayload(body.tagData), ...overrides };
+    const mapped = decodedTagToFilamentPayload(body.tagData);
+    // Spool-on-create: a scanner owns the roll it just scanned, so it sends the
+    // remaining grams (defaulting to the tag's nominal net weight) and the
+    // server creates ONE spool from it. We convert remaining → the gross
+    // `totalWeight` the auto-spool logic below consumes by adding the tag tare
+    // (the mapped spoolWeight) — the phone never does this math (design rule #1).
+    // Omitting `spoolRemainingGrams` (e.g. a catalog-only or API caller) creates
+    // no spool, so the field is the opt-in the scanner defaults on.
+    const spoolRemaining =
+      typeof body.spoolRemainingGrams === "number" && body.spoolRemainingGrams >= 0
+        ? body.spoolRemainingGrams
+        : null;
+    body = { ...mapped, ...overrides };
+    if (spoolRemaining != null) {
+      // Use the FINAL stored tare (after overrides, which may correct it), and
+      // persist a 0 fallback when the tag carried none (e.g. a Bambu tag) so the
+      // spool's gross weight and the filament's spoolWeight agree — otherwise
+      // `remaining = totalWeight - storedTare` wouldn't equal the entered grams.
+      if (typeof body.spoolWeight !== "number") body.spoolWeight = 0;
+      body.totalWeight = spoolRemaining + body.spoolWeight;
+    }
   }
 
   delete body._id;

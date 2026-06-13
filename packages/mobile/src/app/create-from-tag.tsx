@@ -70,6 +70,20 @@ export default function CreateFromTagScreen() {
   const [name, setName] = useState(() => deriveName(tag));
   const [vendor, setVendor] = useState(() => (tag?.brandName ?? '').trim());
   const [type, setType] = useState(() => (tag?.materialType ?? '').trim());
+  // Spool-on-create: a scanned roll is one you own, so default to adding a spool
+  // prefilled with the tag's remaining weight. Prefer the ACTUAL remaining
+  // weight (OpenPrintTag key 17) over the nominal full-roll weight so a partial
+  // roll doesn't overstate inventory; clearing the field catalogs the filament
+  // without a spool.
+  const [spoolRemaining, setSpoolRemaining] = useState(() => {
+    const w =
+      typeof tag?.actualWeightGrams === 'number'
+        ? tag.actualWeightGrams
+        : typeof tag?.weightGrams === 'number'
+          ? tag.weightGrams
+          : null;
+    return w != null ? String(w) : '';
+  });
   const [saving, setSaving] = useState(false);
 
   if (!tag) {
@@ -102,10 +116,19 @@ export default function CreateFromTagScreen() {
       Alert.alert('Missing fields', 'Name, vendor, and type are required.');
       return;
     }
+    const remStr = spoolRemaining.trim();
+    let rem: number | null = null;
+    if (remStr !== '') {
+      rem = Number(remStr);
+      if (!Number.isFinite(rem) || rem < 0) {
+        Alert.alert('Invalid weight', 'Enter the grams remaining (0 or more), or clear it to add no spool.');
+        return;
+      }
+    }
     setSaving(true);
     try {
       const api = createApi({ baseUrl, apiKey });
-      const created = await api.createFromTag(tag, { name: n, vendor: v, type: t });
+      const created = await api.createFromTag(tag, { name: n, vendor: v, type: t }, rem);
       // Consume the hand-off now that the filament exists (explicit clear, not
       // during render). Replace so Back doesn't return to this confirm screen.
       clearPendingScan();
@@ -208,13 +231,31 @@ export default function CreateFromTagScreen() {
           autoCapitalize="characters"
         />
 
+        <Text style={[styles.label, styles.spaced, { color: c.text }]}>Remaining filament (g)</Text>
+        <TextInput
+          style={inputStyle}
+          value={spoolRemaining}
+          onChangeText={setSpoolRemaining}
+          placeholder="grams (clear to add no spool)"
+          placeholderTextColor={c.muted}
+          keyboardType="numeric"
+          inputMode="numeric"
+        />
+        <Text style={[styles.hint, { color: c.muted }]}>
+          Adds a spool you own, prefilled from the tag. Clear it to catalog the filament without a spool.
+        </Text>
+
         <Pressable
           style={[styles.button, { backgroundColor: c.tint }, !canCreate && styles.disabled]}
           onPress={create}
           disabled={!canCreate}
         >
           <Text style={[styles.buttonText, { color: c.onTint }]}>
-            {saving ? 'Creating…' : 'Create filament'}
+            {saving
+              ? 'Creating…'
+              : spoolRemaining.trim() !== ''
+                ? 'Create filament + spool'
+                : 'Create filament'}
           </Text>
         </Pressable>
       </ScrollView>
