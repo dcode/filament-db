@@ -26,10 +26,25 @@ export async function GET(
       resolved = resolveFilament(filament, parent);
     }
 
-    // Compute actual remaining weight from scale reading if available
+    // Compute actual remaining weight. Prefer the live (non-retired) spool's
+    // gross — the create flow (and the backfill script) move the initial weight
+    // onto a spool and null the legacy top-level totalWeight, so reading
+    // totalWeight alone would fall back to nominal for every spool-based
+    // filament. If spools exist but ALL are retired there's no current roll, so
+    // report no actual weight rather than a retired spool's historical weight.
+    // Only fall back to the legacy field when there are NO spools (pre-spool
+    // rows). Codex P1/P2 on PR #707.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const spools: any[] = resolved.spools ?? [];
+    const activeSpool = spools.find((s) => !s.retired);
+    const grossWeight = activeSpool
+      ? activeSpool.totalWeight
+      : spools.length === 0
+        ? resolved.totalWeight
+        : null;
     let actualWeightGrams: number | null = null;
-    if (resolved.totalWeight != null && resolved.spoolWeight != null) {
-      actualWeightGrams = Math.max(0, resolved.totalWeight - resolved.spoolWeight);
+    if (grossWeight != null && resolved.spoolWeight != null) {
+      actualWeightGrams = Math.max(0, grossWeight - resolved.spoolWeight);
     }
 
     const binary = generateOpenPrintTagBinary({
