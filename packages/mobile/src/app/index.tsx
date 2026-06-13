@@ -6,6 +6,7 @@ import { SafeAreaView } from 'react-native-safe-area-context';
 import { ApiError, createApi } from '@/lib/api';
 import { NFC_ENABLED } from '@/lib/features';
 import { readOpenPrintTag } from '@/lib/nfc';
+import { setPendingScan } from '@/lib/pendingScan';
 import { useServerConfig } from '@/lib/serverConfig';
 import { useColors } from '@/lib/theme';
 
@@ -46,18 +47,23 @@ export default function ScanScreen() {
     try {
       const scan = await readOpenPrintTag();
       const res = await api.decodeNfc(scan);
-      if (res.match?._id) {
+
+      // Only an instanceId match is confident enough to open directly — the tag
+      // is one Filament DB wrote for this filament (its spool_uid is the
+      // filament's instanceId). For everything else — a weak heuristic match
+      // (could be a sibling color), several candidates, or no match — hand the
+      // decoded tag AND any matched filaments to the create screen, which lets
+      // the user open an existing one or create from the scan. This avoids
+      // steering a multi-candidate scan into a duplicate and dodges Alert's
+      // cross-platform button caps.
+      if (res.match?._id && res.matchedBy === 'instanceId') {
         router.push({ pathname: '/filament/[id]', params: { id: res.match._id } });
         return;
       }
-      const name = `${res.decoded.brandName ?? ''} ${res.decoded.materialName ?? ''}`.trim();
-      Alert.alert(
-        'Tag decoded',
-        (name || 'Unknown filament') +
-          (res.candidates.length
-            ? `\n\n${res.candidates.length} possible match(es) in your database.`
-            : '\n\nNot in your database yet.'),
-      );
+      // matchFilament returns EITHER a single match OR candidates, never both.
+      const matches = res.match ? [res.match] : res.candidates;
+      setPendingScan({ decoded: res.decoded, matches });
+      router.push('/create-from-tag');
     } catch (e) {
       Alert.alert('Scan failed', e instanceof ApiError ? e.message : (e as Error).message);
     } finally {
