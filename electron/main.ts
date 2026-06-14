@@ -7,6 +7,7 @@ import http from "http";
 import { NfcService } from "./nfc-service";
 import { listLabelPrinters, printLabel as printLabelToDevice } from "./label-printer";
 import { isLoopbackHostname } from "../src/lib/loopbackHost";
+import { listLanIpv4 } from "../src/lib/getLanIp";
 import { startLocalMongo, stopLocalMongo } from "./local-mongo";
 import { SyncService, SyncStatus, getDbNameFromUri } from "./sync-service";
 import { initAutoUpdater } from "./auto-updater";
@@ -70,6 +71,10 @@ const store = new Store({
     aiApiKey: "",
     aiProvider: "gemini",
     locale: "en",
+    // GH #711-follow-up: when true, the embedded server binds to 0.0.0.0 so
+    // other devices on the LAN (e.g. the mobile scanner app) can reach it.
+    // Default false → loopback-only, the prior behaviour.
+    exposeToLan: false,
   },
 });
 
@@ -449,7 +454,10 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
     const env: Record<string, string> = {
       ...process.env as Record<string, string>,
       PORT: String(PORT),
-      HOSTNAME: "localhost",
+      // Bind loopback-only by default; "Share on local network" (Settings)
+      // flips this to 0.0.0.0 so LAN devices (the mobile scanner) can reach
+      // the embedded server. Toggling it restarts the server (see save-config).
+      HOSTNAME: store.get("exposeToLan") ? "0.0.0.0" : "localhost",
       NODE_ENV: "production",
     };
 
@@ -591,11 +599,32 @@ function withIpcTimeout<T>(fn: () => Promise<T>, label: string, timeoutMs: numbe
   ]);
 }
 
-function stopServer() {
-  if (serverProcess) {
-    serverProcess.kill();
-    serverProcess = null;
-  }
+/**
+ * Stop the embedded server and resolve only once it has actually exited, so a
+ * follow-up startProductionServer() doesn't probe a port the dying process
+ * still owns — otherwise waitForServer() can be answered by the OLD server and
+ * report "ready" before the replacement has bound, and the new child then
+ * fails with EADDRINUSE (Codex P2 on PR #718). serverProcess is nulled FIRST
+ * so the GH #315 crash-restart guard (thisProc !== serverProcess) suppresses a
+ * respawn of the process we're intentionally killing.
+ */
+function stopServer(): Promise<void> {
+  const proc = serverProcess;
+  if (!proc) return Promise.resolve();
+  serverProcess = null;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    proc.once("exit", finish);
+    proc.kill();
+    // Safety net: never hang the caller if "exit" doesn't fire (already-dead
+    // handle, etc.). In practice the utility process exits within a few ms.
+    setTimeout(finish, 5000);
+  });
 }
 
 /**
@@ -738,7 +767,16 @@ ipcMain.handle("get-config", (event) => {
     customCurrencies: store.get("customCurrencies") as string,
     locale: store.get("locale") as string,
     labelFormat: store.get("labelFormat") as string,
+    exposeToLan: store.get("exposeToLan") as boolean,
   };
+});
+
+// "Share on local network" needs to tell the user which URL to point a phone
+// at. Returns the machine's LAN IPv4 candidates (private ranges first) + the
+// server port. Empty `ips` → no usable LAN interface (e.g. Wi-Fi is off).
+ipcMain.handle("get-lan-ip", (event) => {
+  assertTrustedSender(event, "get-lan-ip");
+  return { ips: listLanIpv4(), port: PORT };
 });
 
 // (#489) Expose whether Electron is running packaged or in dev mode.
@@ -765,6 +803,7 @@ ipcMain.handle("save-config", async (event, config: {
   customCurrencies?: string;
   locale?: string;
   labelFormat?: string;
+  exposeToLan?: boolean;
 }) => {
   assertTrustedSender(event, "save-config");
 
@@ -808,6 +847,17 @@ ipcMain.handle("save-config", async (event, config: {
     store.set("labelFormat", config.labelFormat);
   }
 
+  // "Share on local network": flips the embedded server's bind address
+  // (localhost ⇄ 0.0.0.0). Only a real change needs a server respawn; record
+  // it before writing so we can decide below.
+  let exposeToLanChanged = false;
+  if (config.exposeToLan !== undefined) {
+    if ((store.get("exposeToLan") as boolean) !== config.exposeToLan) {
+      exposeToLanChanged = true;
+    }
+    store.set("exposeToLan", config.exposeToLan);
+  }
+
   // Legacy: if only mongodbUri is sent (old atlas-only flow)
   if (config.mongodbUri && !config.connectionMode) {
     store.set("mongodbUri", config.mongodbUri);
@@ -834,7 +884,7 @@ ipcMain.handle("save-config", async (event, config: {
 
     if (!isDev) {
       // Restart the production server with the new URI
-      stopServer();
+      await stopServer();
       try {
         await startProductionServer(uri || undefined);
       } catch (err) {
@@ -859,6 +909,36 @@ ipcMain.handle("save-config", async (event, config: {
       })();
       const isSetupCompletion = currentPath === "/setup";
       mainWindow.loadURL(getAppURL(isSetupCompletion ? "/" : "/settings"));
+    }
+  } else if (exposeToLanChanged && !isDev) {
+    // LAN-share toggled with no connection change: respawn the embedded
+    // server so it rebinds to the new HOSTNAME, reusing the already-resolved
+    // active URI (store.mongodbUri — the same source the crash-restart path
+    // uses). No URI re-resolution (so sync / local-mongo aren't
+    // re-initialised) and no window reload (the renderer talks to localhost
+    // either way). The await means this resolves only once the server is back
+    // up, so the renderer's "applying…" state reflects real readiness.
+    await stopServer();
+    try {
+      await startProductionServer((store.get("mongodbUri") as string) || undefined);
+    } catch (err) {
+      console.error("Failed to restart server after LAN-share toggle:", err);
+      // The new bind failed and stopServer() already tore the old server
+      // down, so the app currently has NO embedded server. Revert the
+      // persisted flag (keep the store consistent with the actual bind) and
+      // try to bring the server back on the previous binding so the user
+      // isn't left with a dead window. Either way return failure so the
+      // renderer's error path fires and the toggle doesn't show as applied.
+      store.set("exposeToLan", !config.exposeToLan);
+      // Clear any half-spawned/failed process before the recovery start so it
+      // doesn't collide with the retry.
+      await stopServer();
+      try {
+        await startProductionServer((store.get("mongodbUri") as string) || undefined);
+      } catch (recoveryErr) {
+        console.error("Failed to restore server after LAN-share toggle failure:", recoveryErr);
+      }
+      return { success: false };
     }
   }
 
@@ -1553,7 +1633,7 @@ app.whenReady().then(async () => {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {
-    stopServer();
+    void stopServer();
     app.quit();
   }
 });
@@ -1562,7 +1642,7 @@ app.on("before-quit", (event) => {
   if (isQuitting) return;
   isQuitting = true;
   event.preventDefault();
-  stopServer();
+  void stopServer();
   if (syncService) syncService.destroy();
   if (nfcService) nfcService.destroy();
 
