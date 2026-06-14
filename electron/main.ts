@@ -8,6 +8,7 @@ import { NfcService } from "./nfc-service";
 import { listLabelPrinters, printLabel as printLabelToDevice } from "./label-printer";
 import { isLoopbackHostname } from "../src/lib/loopbackHost";
 import { listLanIpv4 } from "../src/lib/getLanIp";
+import { startMdnsAdvertisement, stopMdnsAdvertisement } from "./mdns-service";
 import { startLocalMongo, stopLocalMongo } from "./local-mongo";
 import { SyncService, SyncStatus, getDbNameFromUri } from "./sync-service";
 import { initAutoUpdater } from "./auto-updater";
@@ -530,6 +531,13 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
       if (isQuitting || thisProc !== serverProcess) return;
       if (code === 0 || code === null) return; // clean exit, not a crash
 
+      // The current server crashed unexpectedly. Stop advertising it over mDNS
+      // for the entire down/restart window so a mobile scan can't discover and
+      // save a dead URL — it's re-published only after a healthy restart below
+      // (Codex #723). Covers both the backoff window and a failed restart;
+      // the retry-cap branch inherits this too.
+      stopMdnsAdvertisement();
+
       if (serverRestartCount >= MAX_SERVER_RESTARTS) {
         diag(`server crash-restart cap reached (${MAX_SERVER_RESTARTS})`);
         dialog.showErrorBox(
@@ -558,6 +566,8 @@ async function startProductionServer(mongoUri?: string): Promise<void> {
         startProductionServer((store.get("mongodbUri") as string) || undefined)
           .then(() => {
             diag("server restarted successfully after crash");
+            // Server healthy again — re-publish mDNS (no-op if exposeToLan off).
+            syncMdnsAdvertisement();
             mainWindow?.reload();
           })
           .catch((restartErr) => {
@@ -625,6 +635,21 @@ function stopServer(): Promise<void> {
     // handle, etc.). In practice the utility process exits within a few ms.
     setTimeout(finish, 5000);
   });
+}
+
+/**
+ * Advertise (or stop advertising) the embedded server over mDNS so the mobile
+ * app can auto-discover it on the LAN. Only when packaged AND "Share on local
+ * network" is enabled — in dev the renderer is served by a separate `next dev`,
+ * and when exposeToLan is off the server is loopback-only (nothing to reach).
+ * Idempotent; call it after the server's bind state settles.
+ */
+function syncMdnsAdvertisement(): void {
+  if (!isDev && store.get("exposeToLan")) {
+    startMdnsAdvertisement(PORT, app.getVersion());
+  } else {
+    stopMdnsAdvertisement();
+  }
 }
 
 /**
@@ -885,11 +910,18 @@ ipcMain.handle("save-config", async (event, config: {
     if (!isDev) {
       // Restart the production server with the new URI
       await stopServer();
+      let serverRestarted = false;
       try {
         await startProductionServer(uri || undefined);
+        serverRestarted = true;
       } catch (err) {
         console.error("Failed to start server after config save:", err);
       }
+      // Refresh LAN auto-discovery so a stale advert doesn't point at a server
+      // that just restarted (or failed to). syncMdnsAdvertisement() no-ops when
+      // exposeToLan is off; stop outright if the restart failed.
+      if (serverRestarted) syncMdnsAdvertisement();
+      else stopMdnsAdvertisement();
     }
 
     // Reload the window on a connection change so the renderer picks up
@@ -938,10 +970,18 @@ ipcMain.handle("save-config", async (event, config: {
       } catch (recoveryErr) {
         console.error("Failed to restore server after LAN-share toggle failure:", recoveryErr);
       }
+      // Reflect the reverted bind state in the mDNS advertisement too.
+      syncMdnsAdvertisement();
       return { success: false };
     }
   }
 
+  // Start/stop LAN auto-discovery to match the new "Share on local network"
+  // state once the server's bind has settled. Only for the exposeToLan-ONLY
+  // path: when connectionChanged ran it already synced/stopped mDNS based on
+  // its own restart outcome, so re-syncing here would re-advertise a dead
+  // server if that restart failed while turning LAN sharing on (Codex #723).
+  if (exposeToLanChanged && !connectionChanged) syncMdnsAdvertisement();
   return { success: true };
 });
 
@@ -1600,8 +1640,10 @@ app.whenReady().then(async () => {
     // Always start the server — even without mongoUri, the setup page needs it.
     // Crash-restart is handled inside startProductionServer (GH #315), so
     // every spawned process — including restarts — gets the handler.
+    let serverStarted = false;
     try {
       await startProductionServer(mongoUri || undefined);
+      serverStarted = true;
     } catch (err) {
       console.error("Failed to start server:", err);
       dialog.showErrorBox(
@@ -1609,6 +1651,12 @@ app.whenReady().then(async () => {
         `The embedded web server failed to start. The app may not work correctly.\n\n${err instanceof Error ? err.message : String(err)}`,
       );
     }
+    // Advertise over mDNS (if "Share on local network" is on) only when the
+    // server actually came up — otherwise the phone would discover a server it
+    // can't reach. The catch above SWALLOWS the error, so a plain post-try call
+    // would advertise regardless; the flag is load-bearing.
+    if (serverStarted) syncMdnsAdvertisement();
+    else stopMdnsAdvertisement();
   }
 
   // Create the window. NFC init is deferred to the window's "show" event
@@ -1643,6 +1691,7 @@ app.on("before-quit", (event) => {
   isQuitting = true;
   event.preventDefault();
   void stopServer();
+  stopMdnsAdvertisement();
   if (syncService) syncService.destroy();
   if (nfcService) nfcService.destroy();
 
