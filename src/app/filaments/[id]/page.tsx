@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { useNfcContext } from "@/components/NfcProvider";
 import { generateOpenPrintTagBinary } from "@/lib/openprinttag";
+import { selectSpoolForWrite } from "@/lib/selectSpoolForWrite";
 import { safeHttpUrl } from "@/lib/safeRenderUrl";
 import { useToast } from "@/components/Toast";
 import { useConfirm } from "@/components/ConfirmDialog";
@@ -402,7 +403,7 @@ function FilamentDetail() {
   //    electron/ndef.ts + the auto-read classifier in electron/main.ts.
   // Returns true if the caller should proceed with the write.
   const ensureTagWritable = useCallback(
-    async ({ confirmOverwrite = false }: { confirmOverwrite?: boolean } = {}): Promise<boolean> => {
+    async ({ confirmOverwrite = false, targetInstanceId }: { confirmOverwrite?: boolean; targetInstanceId?: string } = {}): Promise<boolean> => {
       type ProbedTag = { tagSource?: string; materialName?: string; brandName?: string; spoolUid?: string; readOnly?: boolean };
       let existing: ProbedTag | null | undefined;
       // The tag carries a valid NDEF message but no OpenPrintTag record (e.g.
@@ -451,8 +452,27 @@ function FilamentDetail() {
         // path (confirmOverwrite=false) trusts this to skip the prompt.
         const norm = (s?: string | null) => (s ?? "").trim().toLowerCase();
         const tagInstance = norm(existing?.spoolUid);
-        const sameInstance = tagInstance !== "" && tagInstance === norm(filament?.instanceId);
+        // #732 (Codex P2 r2/r3): the SILENT (weight-update) re-write may only
+        // accept a tag that positively identifies as THIS write's target spool
+        // — its spool_uid equals the target spool's instanceId. The
+        // filament-level id is NOT a blanket pass: backfillSpoolInstanceIds
+        // carries the filament id onto the FIRST spool, so accepting any tag
+        // bearing the filament id would let spool[0]'s tag be silently
+        // rewritten while updating a sibling. When the target IS spool[0] (or a
+        // spool-less filament), its own id equals the filament id, so the
+        // exact-target check still accepts it; a sibling falls through to the
+        // overwrite prompt.
+        const targetId = norm(targetInstanceId);
+        const sameInstance = tagInstance !== "" && targetId !== "" && tagInstance === targetId;
+        // A tag with NO spool id but matching name+vendor is a legacy
+        // (pre-spool-id) tag of this filament — safe to upgrade silently ONLY
+        // when the filament has at most one spool. With multiple spools it's
+        // ambiguous which roll the unscoped tag is, so it could clobber a
+        // sibling → fall through to the prompt.
+        const singleSpool = (filament?.spools?.length ?? 0) <= 1;
         const sameNameVendor =
+          tagInstance === "" &&
+          singleSpool &&
           norm(existing?.materialName) !== "" &&
           norm(existing?.materialName) === norm(filament?.name) &&
           norm(existing?.brandName) === norm(filament?.vendor);
@@ -495,19 +515,21 @@ function FilamentDetail() {
 
     setNfcWriteSuccess(null);
     try {
-      // Compute actual remaining weight. Prefer the live (non-retired) spool's
-      // gross — the create flow (and the backfill script) move the initial
-      // weight onto a spool and null the legacy top-level totalWeight, so
-      // reading totalWeight alone falls back to nominal for spool-based
-      // filaments. If spools exist but ALL are retired there's no current roll,
-      // so report no actual weight rather than a retired spool's historical
-      // weight. Only fall back to the legacy field when there are NO spools
-      // (pre-spool rows). Codex P1/P2 on PR #707.
+      // #732: encode the SELECTED spool's instanceId (default = first
+      // non-retired spool; filament-level id only for a spool-less filament),
+      // and read the remaining weight from that SAME spool so the tag's id and
+      // weight agree (Codex P2 — an all-retired filament selects a retired spool
+      // for the id, and its weight must come from that spool too, not be
+      // dropped). Filament-level fallback uses the legacy top-level weight.
+      const writeSel = selectSpoolForWrite(filament);
       const spools = filament.spools ?? [];
-      const activeSpool = spools.find((s) => !s.retired);
-      const grossWeight = activeSpool
-        ? activeSpool.totalWeight
-        : spools.length === 0
+      const selectedSpool =
+        writeSel.ok && writeSel.source === "spool" && writeSel.spoolId
+          ? spools.find((s) => String(s._id) === writeSel.spoolId)
+          : null;
+      const grossWeight = selectedSpool
+        ? selectedSpool.totalWeight
+        : writeSel.ok && writeSel.source === "filament"
           ? filament.totalWeight
           : null;
       let actualWeightGrams: number | null = null;
@@ -535,7 +557,7 @@ function FilamentDetail() {
         weightGrams: filament.netFilamentWeight ?? null,
         actualWeightGrams,
         emptySpoolWeight: filament.spoolWeight ?? null,
-        spoolUid: filament.instanceId ?? null,
+        spoolUid: writeSel.ok ? writeSel.instanceId : null,
         dryingTemperature: filament.dryingTemperature,
         dryingTime: filament.dryingTime,
         transmissionDistance: filament.transmissionDistance,
@@ -566,13 +588,20 @@ function FilamentDetail() {
     }
   };
 
-  const handleNfcWeightUpdate = useCallback(async (scaleWeight: number) => {
+  const handleNfcWeightUpdate = useCallback(async (scaleWeight: number, spoolId?: string) => {
     if (!filament || filament.spoolWeight == null) return;
-    // Bambu (read-only) tags can't be written — refuse with the friendly
-    // message here too (no overwrite confirm: a weight update is a deliberate
-    // re-write of this filament's own tag). Codex P2 on PR #584.
-    if (!(await ensureTagWritable())) return;
     const actualRemaining = Math.max(0, scaleWeight - filament.spoolWeight);
+    // #732: write the id of the SPOOL being updated — a spool card passes its
+    // own id (so updating spool B's weight writes spool B's id, not the default
+    // spool A's); the filament-level NFC-tools button passes none → the
+    // active-roll default. Falls back to the filament id for a spool-less row.
+    const writeSel = selectSpoolForWrite(filament, spoolId);
+    // Bambu (read-only) tags can't be written — refuse with the friendly
+    // message here too. #732 (Codex P2): pass the TARGET spool id so the silent
+    // re-write only accepts a tag for THIS spool (or a legacy filament-level
+    // tag); a sibling spool's tag falls through to the overwrite prompt instead
+    // of being silently relabeled. Codex P2 on PR #584.
+    if (!(await ensureTagWritable({ targetInstanceId: writeSel.ok ? writeSel.instanceId : undefined }))) return;
     setNfcWriteSuccess(null);
     try {
       const payload = generateOpenPrintTagBinary({
@@ -596,7 +625,7 @@ function FilamentDetail() {
         weightGrams: filament.netFilamentWeight ?? null,
         actualWeightGrams: actualRemaining,
         emptySpoolWeight: filament.spoolWeight ?? null,
-        spoolUid: filament.instanceId ?? null,
+        spoolUid: writeSel.ok ? writeSel.instanceId : null,
         dryingTemperature: filament.dryingTemperature,
         dryingTime: filament.dryingTime,
         transmissionDistance: filament.transmissionDistance,
@@ -1456,7 +1485,7 @@ function FilamentDetail() {
                     onLogUsage={(entry) => handleLogUsage(spool._id, entry)}
                     onUpdateMeta={(patch) => handleUpdateSpool(spool._id, patch)}
                     onRemove={() => handleRemoveSpool(spool._id)}
-                    onNfcWeightUpdate={(scaleWeight) => handleNfcWeightUpdate(scaleWeight)}
+                    onNfcWeightUpdate={(scaleWeight) => handleNfcWeightUpdate(scaleWeight, String(spool._id))}
                     nfcAvailable={isElectron && nfcStatus.tagPresent}
                     nfcWriting={nfcWriting}
                     highlight={highlightSpoolId === String(spool._id)}
@@ -1925,9 +1954,13 @@ function FilamentDetail() {
           type: filament.type ?? null,
           colorName: filament.colorName ?? null,
           // GH #595: pass spools so the URL-mode QR can deep-link to one.
+          // #732: include instanceId so the instance-ID QR can encode the
+          // selected spool's id.
           spools: (filament.spools ?? []).map((s) => ({
             _id: String(s._id),
             label: s.label ?? null,
+            instanceId: s.instanceId ?? null,
+            retired: s.retired ?? false,
           })),
         }}
       />
@@ -2126,8 +2159,19 @@ function SpoolCard({
               className="text-sm font-medium hover:text-blue-600 transition-colors"
               title={t("detail.spool.clickToRename")}
             >
-              {spool.label || t("detail.spool.unnamed")}
+              {/* #732: a spool's display name defaults to its hex id. */}
+              {spool.label || spool.instanceId || t("detail.spool.unnamed")}
             </button>
+          )}
+          {/* #732: surface the durable per-spool id (when a label is also set,
+              so the id stays visible/copyable). */}
+          {spool.label && spool.instanceId && (
+            <code
+              className="text-[11px] text-gray-400 dark:text-gray-500 font-mono"
+              title={spool.instanceId}
+            >
+              {spool.instanceId}
+            </code>
           )}
         </div>
         <button

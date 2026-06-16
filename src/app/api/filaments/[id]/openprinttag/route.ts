@@ -4,9 +4,10 @@ import Filament from "@/models/Filament";
 import "@/models/Nozzle";
 import { generateOpenPrintTagBinary } from "@/lib/openprinttag";
 import { resolveFilament } from "@/lib/resolveFilament";
+import { selectSpoolForWrite } from "@/lib/selectSpoolForWrite";
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
@@ -18,6 +19,25 @@ export async function GET(
       return NextResponse.json({ error: "Not found" }, { status: 404 });
     }
 
+    // #732 Phase 3: encode the SELECTED spool's instanceId (falling back to the
+    // filament-level id only for a spool-less filament). `?spool=<id>` targets a
+    // specific spool; an unknown id is a 400 (don't silently write the wrong
+    // spool). Spools are the filament's own (not inherited), so select off the
+    // raw doc rather than the variant-resolved view.
+    const requestedSpool = request.nextUrl.searchParams.get("spool");
+    const selection = selectSpoolForWrite(filament, requestedSpool);
+    if (!selection.ok) {
+      return NextResponse.json(
+        {
+          error:
+            selection.reason === "spool-not-found"
+              ? "Spool not found on this filament"
+              : "No instance ID available to encode",
+        },
+        { status: selection.reason === "spool-not-found" ? 400 : 422 },
+      );
+    }
+
     // Resolve inherited values if this is a variant
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let resolved: any = filament;
@@ -26,20 +46,22 @@ export async function GET(
       resolved = resolveFilament(filament, parent);
     }
 
-    // Compute actual remaining weight. Prefer the live (non-retired) spool's
-    // gross — the create flow (and the backfill script) move the initial weight
-    // onto a spool and null the legacy top-level totalWeight, so reading
-    // totalWeight alone would fall back to nominal for every spool-based
-    // filament. If spools exist but ALL are retired there's no current roll, so
-    // report no actual weight rather than a retired spool's historical weight.
-    // Only fall back to the legacy field when there are NO spools (pre-spool
-    // rows). Codex P1/P2 on PR #707.
+    // Compute actual remaining weight from the SAME spool whose id we encode
+    // (#732, Codex P2): the tag must not identify one spool but carry another
+    // spool's remaining weight. `selection` already picked the target spool
+    // (the requested one, or the first non-retired by default). For the
+    // filament-level fallback (a spool-less filament) use the legacy top-level
+    // weight — which the create flow nulls once a spool exists, so spool-based
+    // filaments read their gross off the spool. Codex P1/P2 on PR #707.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const spools: any[] = resolved.spools ?? [];
-    const activeSpool = spools.find((s) => !s.retired);
-    const grossWeight = activeSpool
-      ? activeSpool.totalWeight
-      : spools.length === 0
+    const selectedSpool =
+      selection.source === "spool" && selection.spoolId
+        ? spools.find((s) => String(s._id) === selection.spoolId)
+        : null;
+    const grossWeight = selectedSpool
+      ? selectedSpool.totalWeight
+      : selection.source === "filament"
         ? resolved.totalWeight
         : null;
     let actualWeightGrams: number | null = null;
@@ -73,7 +95,7 @@ export async function GET(
       weightGrams: resolved.netFilamentWeight ?? null,
       actualWeightGrams,
       emptySpoolWeight: resolved.spoolWeight ?? null,
-      spoolUid: filament.instanceId ?? null,
+      spoolUid: selection.instanceId,
       dryingTemperature: resolved.dryingTemperature ?? null,
       dryingTime: resolved.dryingTime ?? null,
       transmissionDistance: resolved.transmissionDistance ?? null,
