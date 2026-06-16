@@ -674,4 +674,51 @@ export async function backfillSpoolInstanceIds(): Promise<number> {
   return res.modifiedCount ?? 0;
 }
 
+/**
+ * #732 Phase 4: is `instanceId` already taken — by another spool OR by another
+ * filament's top-level id? Used by the spool create/edit routes to keep a
+ * user-entered id unique so `matchFilament` resolves it unambiguously.
+ *
+ * Both halves matter because `matchFilament` resolves spool ids BEFORE the
+ * filament-level fallback: a spool id equal to ANOTHER filament's `instanceId`
+ * would shadow that filament's existing labels/tags (Codex P2). So we reject
+ * collisions with both `spools.instanceId` and the top-level `instanceId`.
+ *
+ * Exclusions: `excludeSpoolId` lets a spool keep its own id on edit;
+ * `ownFilamentId` permits the legitimate Phase-1 carry-over where a spool's id
+ * equals ITS OWN filament's top-level id. Scoped to `_deletedAt: null` (mirrors
+ * the filament-level partial-unique index — a trashed filament's id may be
+ * reused). `$elemMatch` ensures the SAME spool element both carries the id and
+ * isn't the excluded one (a dot-path query would match across two elements).
+ */
+export async function isSpoolInstanceIdTaken(
+  instanceId: string,
+  excludeSpoolId?: string,
+  ownFilamentId?: string,
+): Promise<boolean> {
+  // 1. Collision with another spool's id.
+  const spoolQuery = excludeSpoolId
+    ? {
+        _deletedAt: null,
+        spools: {
+          $elemMatch: {
+            instanceId,
+            _id: { $ne: new mongoose.Types.ObjectId(excludeSpoolId) },
+          },
+        },
+      }
+    : { _deletedAt: null, "spools.instanceId": instanceId };
+  if (await Filament.findOne(spoolQuery, { _id: 1 }).lean()) return true;
+
+  // 2. Collision with another filament's top-level id (excluding the spool's
+  //    own filament, where carry-over legitimately makes them equal).
+  const filamentQuery: Record<string, unknown> = { _deletedAt: null, instanceId };
+  if (ownFilamentId) {
+    filamentQuery._id = { $ne: new mongoose.Types.ObjectId(ownFilamentId) };
+  }
+  if (await Filament.findOne(filamentQuery, { _id: 1 }).lean()) return true;
+
+  return false;
+}
+
 export default Filament;

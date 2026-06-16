@@ -1,7 +1,7 @@
 import mongoose from "mongoose";
 import { NextRequest, NextResponse } from "next/server";
 import dbConnect from "@/lib/mongodb";
-import Filament, { generateInstanceId } from "@/models/Filament";
+import Filament, { generateInstanceId, isSpoolInstanceIdTaken } from "@/models/Filament";
 import { validateSpoolBody } from "@/lib/validateSpoolBody";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { errorResponse, errorResponseFromCaught } from "@/lib/apiErrorHandler";
@@ -57,13 +57,16 @@ export async function POST(
     "locationId",
     "photoDataUrl",
     "retired",
+    // #732 Phase 4: an id-only create (e.g. registering a Prusa roll id) is
+    // meaningful — don't trip the empty-body phantom-spool guard.
+    "instanceId",
   ];
   const supplied = meaningfulKeys.some((k) => rawBody[k] !== undefined);
   if (!supplied) {
     return NextResponse.json(
       {
         error:
-          "At least one of label, totalWeight, lotNumber, purchaseDate, openedDate, locationId, photoDataUrl, or retired is required",
+          "At least one of label, totalWeight, lotNumber, purchaseDate, openedDate, locationId, photoDataUrl, retired, or instanceId is required",
       },
       { status: 400 },
     );
@@ -85,12 +88,26 @@ export async function POST(
     // photoDataUrl / retired even when the client supplied them — a
     // separate latent bug paired with the empty-body phantom (GH #203).
     const newSpool: Record<string, unknown> = {};
-    // #732: stamp the spool id explicitly. Mongoose does apply the
-    // spools[].instanceId schema default when casting a $push payload, so
-    // this is belt-and-suspenders — but it makes the #732 "every spool has
-    // an id" invariant guaranteed and obvious at the create site rather than
-    // dependent on a subtle ODM behaviour.
-    newSpool.instanceId = generateInstanceId();
+    // #732: stamp the spool id explicitly ($push doesn't reliably apply the
+    // schema default). Phase 4: a client may register an EXPLICIT id (e.g. a
+    // Prusa roll id — charset/length already validated); it's uniqueness-checked
+    // vs other spools so the match path stays unambiguous. Otherwise
+    // auto-generate.
+    if (validation.instanceId !== undefined) {
+      // Best-effort uniqueness: a read-then-write check, not a DB unique
+      // constraint (the spools.instanceId index is non-unique multikey). A
+      // concurrent identical manual entry could slip a duplicate through; the
+      // matcher tolerates that by returning ambiguous candidates rather than an
+      // arbitrary pick, and auto-generated ids never collide — acceptable for a
+      // single-user/self-host app (a DB-level guard is deferred to a Phase-5
+      // spool-syncId migration).
+      if (await isSpoolInstanceIdTaken(validation.instanceId, undefined, id)) {
+        return errorResponse("That spool ID is already used by another spool", 409);
+      }
+      newSpool.instanceId = validation.instanceId;
+    } else {
+      newSpool.instanceId = generateInstanceId();
+    }
     if (validation.label !== undefined) newSpool.label = validation.label;
     if (validation.totalWeight !== undefined) newSpool.totalWeight = validation.totalWeight;
     if (validation.lotNumber !== undefined) newSpool.lotNumber = validation.lotNumber;
