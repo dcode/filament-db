@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { MongoClient } from "mongodb";
 import dbConnect from "@/lib/mongodb";
-import Filament from "@/models/Filament";
+import Filament, { generateInstanceId } from "@/models/Filament";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { assertSafeMongoUri } from "@/lib/mongoUriGuard";
 import { validateSpoolPhotoDataUrl } from "@/lib/validateSpoolBody";
@@ -140,6 +140,14 @@ export async function POST(request: NextRequest) {
             if (s && typeof s === "object") {
               const spool = s as Record<string, unknown>;
               spool.locationId = null;
+              // GH #732: the top-level `instanceId` is already excluded from
+              // IMPORTABLE_FILAMENT_FIELDS so a remote can't spoof a filament
+              // identity. The spool `instanceId` rides inside the allow-listed
+              // `spools` array, so regenerate it locally — otherwise an
+              // attacker-controlled / unrelated Atlas DB could persist duplicate
+              // or spoofed spool identities that Phase 2 will match labels/NFC
+              // against.
+              spool.instanceId = generateInstanceId();
               // GH #626: the remote document is attacker-controllable, and
               // spool photos here bypassed the MIME allow-list + 5MB cap
               // that the dedicated spool routes enforce via
@@ -154,9 +162,31 @@ export async function POST(request: NextRequest) {
           }
         }
 
+        // GH #732: on an UPDATE the whole spools array is replaced, so reuse
+        // the EXISTING LOCAL spool instanceId by position rather than the
+        // freshly-minted one — otherwise a routine re-import from Atlas would
+        // rotate the durable spool identity every time and orphan any
+        // label/NFC/match that stored the prior id. New positions (beyond the
+        // local count) keep their minted id; the remote's id is never trusted
+        // (anti-spoofing, GH #732 round 2). Matching is positional because
+        // spool subdocs have no stable cross-side id (the deferred spool-syncId
+        // migration — same limitation as amsSlots[].spoolId).
+        const preserveLocalSpoolIds = (
+          localSpools: Array<{ instanceId?: string }> | undefined,
+        ) => {
+          if (!Array.isArray(filamentData.spools) || !Array.isArray(localSpools)) return;
+          for (let i = 0; i < filamentData.spools.length; i++) {
+            const localId = localSpools[i]?.instanceId;
+            if (localId) {
+              (filamentData.spools[i] as Record<string, unknown>).instanceId = localId;
+            }
+          }
+        };
+
         const importName = String(filamentData.name ?? "");
         const existing = await Filament.findOne({ name: importName, _deletedAt: null });
         if (existing) {
+          preserveLocalSpoolIds(existing.spools);
           // GH #255: runValidators so schema constraints (cost.min, etc.)
           // are enforced on the update path, not just on create.
           await Filament.updateOne(
@@ -185,6 +215,7 @@ export async function POST(request: NextRequest) {
             _purged: { $ne: true },
           });
           if (softDeleted) {
+            preserveLocalSpoolIds(softDeleted.spools);
             await Filament.updateOne(
               { _id: softDeleted._id },
               { ...filamentData, _deletedAt: null },

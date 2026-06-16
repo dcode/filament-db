@@ -1,9 +1,11 @@
 import crypto from "crypto";
-import mongoose, { Schema, Document, Model } from "mongoose";
+import mongoose, { Schema, Document, Model, AnyBulkWriteOperation } from "mongoose";
 import { isEncodableOptTag } from "@/lib/openprinttag";
 
-/** Generate a random 5-byte hex instance ID (10 hex chars), matching Prusament's format. */
-function generateInstanceId(): string {
+/** Generate a random 5-byte hex instance ID (10 hex chars), matching Prusament's format.
+ * Exported (#732) so the spool-create routes that write via `$push` — which
+ * bypasses Mongoose schema defaults — can stamp a spool `instanceId` explicitly. */
+export function generateInstanceId(): string {
   return crypto.randomBytes(5).toString("hex");
 }
 
@@ -93,6 +95,23 @@ export interface IUsageEntry {
 
 export interface ISpool {
   _id: mongoose.Types.ObjectId;
+  /** #732: per-spool 5-byte hex id (10 hex chars), auto-generated; a
+   * Prusa-assigned spool id can be entered manually. This is the spool-level
+   * identity used by labels / NFC / match — it supersedes the filament-level
+   * instanceId (which is removed in a later phase once nothing reads it).
+   *
+   * PHASE-2 CONTRACT (must hold before the match path moves to spool ids):
+   * the writers still encode the FILAMENT-level instanceId during the
+   * transition — `PrintLabelDialog` uses `filament.instanceId` for the
+   * instance-ID QR mode, and `POST /api/filaments/[id]/openprinttag` writes
+   * `spoolUid: filament.instanceId`. Labels/tags created in the Phase-1 window
+   * therefore carry the filament id, while a freshly-created spool gets its own
+   * id. So the Phase-2 matcher MUST resolve `spools[].instanceId` first and
+   * then FALL BACK to the filament-level `instanceId` (which `GET
+   * /api/filaments/match` already does today), and Phase 3 moves the writers to
+   * the selected spool's id. Dropping that fallback before Phase 3 would orphan
+   * every transition-era label/tag. */
+  instanceId: string;
   label: string;
   totalWeight: number | null;
   lotNumber: string | null;
@@ -366,6 +385,8 @@ const FilamentSchema = new Schema<IFilament>(
     ],
     spools: [
       {
+        // #732: each spool gets its own 5-byte hex id (default-generated).
+        instanceId: { type: String, default: generateInstanceId },
         label: { type: String, default: "" },
         totalWeight: { type: Number, default: null, min: 0 },
         lotNumber: { type: String, default: null },
@@ -575,6 +596,73 @@ export async function backfillInstanceIds(): Promise<number> {
 
   const result = await Filament.bulkWrite(ops);
   return result.modifiedCount;
+}
+
+/**
+ * #732: backfill a per-spool `instanceId` onto every spool that lacks one.
+ * Safe to call repeatedly — only fills missing ids (idempotent).
+ *
+ * Carry-over rule (preserves identity that's already on printed labels /
+ * written NFC tags): the FIRST spool of a filament that is missing an id
+ * adopts the filament's own `instanceId`, the rest get fresh ids. Skipped when
+ * the filament's id is already held by one of its spools (avoid a duplicate).
+ * For the common single-spool filament this means its spool simply inherits
+ * the filament id, so existing labels/tags keep resolving once the match path
+ * (Phase 2) looks at spools.
+ *
+ * Returns the number of spools assigned an id. Uses positional arrayFilters so
+ * a spool's other fields and concurrent edits aren't clobbered.
+ */
+export async function backfillSpoolInstanceIds(): Promise<number> {
+  const docs = await Filament.find(
+    {
+      $or: [
+        { spools: { $elemMatch: { instanceId: { $exists: false } } } },
+        { spools: { $elemMatch: { instanceId: { $in: [null, ""] } } } },
+      ],
+    },
+    { instanceId: 1, "spools._id": 1, "spools.instanceId": 1 },
+  ).lean();
+
+  if (docs.length === 0) return 0;
+
+  const ops: AnyBulkWriteOperation<IFilament>[] = [];
+  for (const doc of docs) {
+    const spools = doc.spools ?? [];
+    // If a spool already carries the filament's id, don't reuse it.
+    const filamentIdTaken = spools.some(
+      (s) => s.instanceId && s.instanceId === doc.instanceId,
+    );
+    let carriedOver = false;
+    for (const s of spools) {
+      if (s.instanceId) continue; // already has one — idempotent skip
+      let newId: string;
+      if (!carriedOver && !filamentIdTaken && doc.instanceId) {
+        newId = doc.instanceId; // first missing spool adopts the filament id
+        carriedOver = true;
+      } else {
+        newId = generateInstanceId();
+      }
+      ops.push({
+        updateOne: {
+          filter: { _id: doc._id },
+          // The array filter also requires the spool to STILL lack an id, so a
+          // concurrent migration (two cold-start requests / two app instances)
+          // or an in-process retry can't overwrite an instanceId another run
+          // already assigned — once a spool is filled this write is a no-op
+          // (query semantics: `$in: [null, ""]` matches missing, null, and "").
+          update: { $set: { "spools.$[s].instanceId": newId } },
+          arrayFilters: [{ "s._id": s._id, "s.instanceId": { $in: [null, ""] } }],
+        },
+      });
+    }
+  }
+
+  if (ops.length === 0) return 0;
+  // Report spools actually filled (modifiedCount), not ops submitted, so the
+  // count is accurate when the array-filter guard skips already-filled spools.
+  const res = await Filament.bulkWrite(ops);
+  return res.modifiedCount ?? 0;
 }
 
 export default Filament;
