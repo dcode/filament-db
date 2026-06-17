@@ -631,4 +631,357 @@ describe("/api/spools/import", () => {
       expect(fresh.spools).toHaveLength(0);
     });
   });
+
+  // #732 Phase 5: the spool CSV exporter now emits each spool's OWN
+  // `instanceId`. The importer must honour that column so a per-spool id
+  // round-trips, while still guarding uniqueness (vs other spools, other
+  // filaments' top-level ids, and other rows in the same CSV).
+  describe("#732 Phase 5: instanceId column", () => {
+    it("stamps a user-supplied instanceId on a newly created spool", async () => {
+      const f = await Filament.create({ name: "Prusa Roll", vendor: "Prusa", type: "PLA" });
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Prusa Roll,950,1086170252\n`; // numeric Prusament roll id
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(1);
+      expect(body.failed).toBe(0);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1);
+      expect(fresh.spools[0].instanceId).toBe("1086170252");
+    });
+
+    it("auto-generates an instanceId when the column is absent", async () => {
+      const f = await Filament.create({ name: "Auto Id", vendor: "Test", type: "PLA" });
+      const res = await importSpools(csvRequest("filament,totalWeight\nAuto Id,800\n"));
+      expect((await res.json()).imported).toBe(1);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools[0].instanceId).toMatch(/^[0-9a-f]{10}$/);
+    });
+
+    it("auto-generates when the instanceId cell is present but empty", async () => {
+      const f = await Filament.create({ name: "Empty Id", vendor: "Test", type: "PLA" });
+      const res = await importSpools(
+        csvRequest("filament,totalWeight,instanceId\nEmpty Id,800,\n"),
+      );
+      expect((await res.json()).imported).toBe(1);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools[0].instanceId).toMatch(/^[0-9a-f]{10}$/);
+    });
+
+    it("round-trips: re-importing an export keeps each spool's own id (no self-collision)", async () => {
+      const f = await Filament.create({
+        name: "Round Trip Id",
+        vendor: "Test",
+        type: "PLA",
+        spools: [{ label: "S", totalWeight: 1000 }],
+      });
+      const spoolId = String(f.spools[0]._id);
+      const instanceId = f.spools[0].instanceId as string;
+
+      // The exact row the exporter now emits — spoolId + the spool's own id.
+      const csv =
+        "filament,totalWeight,spoolId,instanceId\n" +
+        `Round Trip Id,950,${spoolId},${instanceId}\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(1);
+      expect(body.updated).toBe(1);
+      expect(body.failed).toBe(0);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1); // NOT doubled
+      expect(fresh.spools[0].instanceId).toBe(instanceId); // unchanged
+      expect(fresh.spools[0].totalWeight).toBe(950);
+    });
+
+    it("does NOT change an existing spool's id via the UPDATE path — the column is honored on create only", async () => {
+      // Contract: instanceId is informational on update. Even a deliberate,
+      // distinct id in the cell leaves the spool's id alone (per-spool id
+      // edits go through the detail-page editor, not bulk CSV). The row's
+      // other fields still update.
+      const f = await Filament.create({
+        name: "No CSV Rewrite",
+        vendor: "Test",
+        type: "PLA",
+        spools: [{ label: "S", totalWeight: 1000 }],
+      });
+      const spoolId = String(f.spools[0]._id);
+      const original = f.spools[0].instanceId as string;
+
+      const csv =
+        "filament,totalWeight,spoolId,instanceId\n" +
+        `No CSV Rewrite,950,${spoolId},custom-id.7\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.updated).toBe(1);
+      expect(body.failed).toBe(0);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools[0].instanceId).toBe(original); // id untouched
+      expect(fresh.spools[0].totalWeight).toBe(950); // metadata still updated
+    });
+
+    it("leaves an existing spool's id untouched when the instanceId cell is empty", async () => {
+      const f = await Filament.create({
+        name: "Keep Id",
+        vendor: "Test",
+        type: "PLA",
+        spools: [{ label: "S", totalWeight: 1000 }],
+      });
+      const spoolId = String(f.spools[0]._id);
+      const original = f.spools[0].instanceId as string;
+
+      const csv =
+        "filament,totalWeight,spoolId,instanceId\n" +
+        `Keep Id,800,${spoolId},\n`;
+      const res = await importSpools(csvRequest(csv));
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools[0].instanceId).toBe(original); // unchanged
+      expect(fresh.spools[0].totalWeight).toBe(800); // weight still updated
+    });
+
+    it("rejects a malformed instanceId without persisting the spool or a Location", async () => {
+      await Filament.create({ name: "Bad Id", vendor: "Test", type: "PLA" });
+      const csv =
+        "filament,totalWeight,instanceId,location\n" +
+        `Bad Id,800,has spaces!,Phantom Shelf\n`; // space + ! are invalid
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(0);
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/instanceId/);
+
+      const fresh = await Filament.findOne({ name: "Bad Id" });
+      expect(fresh.spools).toHaveLength(0);
+      // Side-effect-free: the bad row must not have auto-created the Location.
+      expect(await Location.findOne({ name: "Phantom Shelf" })).toBeNull();
+    });
+
+    it("rejects an instanceId already used by another spool (409-style row error)", async () => {
+      await Filament.create({
+        name: "Owner",
+        vendor: "Test",
+        type: "PLA",
+        spools: [{ label: "S", totalWeight: 1000, instanceId: "shared0001" }],
+      });
+      const target = await Filament.create({ name: "Taker", vendor: "Test", type: "PLA" });
+
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Taker,800,shared0001\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(0);
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/already used/);
+
+      const fresh = await Filament.findById(target._id);
+      expect(fresh.spools).toHaveLength(0);
+    });
+
+    it("rejects an instanceId colliding with another filament's top-level id", async () => {
+      // matchFilament resolves spool ids BEFORE the filament-level fallback,
+      // so a spool id equal to another filament's top-level id would shadow
+      // that filament's labels/tags (Codex P2). isSpoolInstanceIdTaken guards
+      // both halves.
+      await Filament.create({
+        name: "Top Level",
+        vendor: "Test",
+        type: "PLA",
+        instanceId: "toplevel99",
+      });
+      const target = await Filament.create({ name: "Spool Owner", vendor: "Test", type: "PLA" });
+
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Spool Owner,800,toplevel99\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/already used/);
+
+      const fresh = await Filament.findById(target._id);
+      expect(fresh.spools).toHaveLength(0);
+    });
+
+    it("ignores a legacy filament-level id in the column (pre-Phase-5 export round-trip)", async () => {
+      // Codex P2 on PR #742: before this phase the exporter wrote the
+      // FILAMENT's top-level id into the instanceId column for EVERY spool
+      // row, alongside spoolId. Re-importing such a CSV must NOT (a) fail rows
+      // 2..N as within-batch dups or (b) rewrite either spool's own id to the
+      // filament id. Because the column is honored on CREATE only and these
+      // are UPDATE rows (spoolId matches), the id is left untouched — the old
+      // idempotent spoolId-keyed metadata update is preserved.
+      const f = await Filament.create({
+        name: "Legacy Export",
+        vendor: "Test",
+        type: "PLA",
+        spools: [
+          { label: "A", totalWeight: 1000 },
+          { label: "B", totalWeight: 900 },
+        ],
+      });
+      const filamentLevelId = f.instanceId as string;
+      const spoolIdA = String(f.spools[0]._id);
+      const spoolIdB = String(f.spools[1]._id);
+      const ownIdA = f.spools[0].instanceId as string;
+      const ownIdB = f.spools[1].instanceId as string;
+      // Fresh-created spools get their own distinct ids, none equal to the
+      // filament's top-level id — so this test exercises the real rewrite risk.
+      expect(ownIdA).not.toBe(filamentLevelId);
+      expect(ownIdB).not.toBe(filamentLevelId);
+
+      // The exact shape a pre-Phase-5 export produced: both rows carry the
+      // filament-level id in the instanceId column.
+      const csv =
+        "filament,totalWeight,spoolId,instanceId\n" +
+        `Legacy Export,950,${spoolIdA},${filamentLevelId}\n` +
+        `Legacy Export,880,${spoolIdB},${filamentLevelId}\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(2);
+      expect(body.updated).toBe(2);
+      expect(body.failed).toBe(0); // NOT a within-batch dup failure
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(2);
+      const a = fresh.spools.find((s: { label: string }) => s.label === "A");
+      const b = fresh.spools.find((s: { label: string }) => s.label === "B");
+      expect(a.instanceId).toBe(ownIdA); // own id untouched, NOT rewritten
+      expect(b.instanceId).toBe(ownIdB);
+      expect(a.totalWeight).toBe(950); // weight update still applied
+      expect(b.totalWeight).toBe(880);
+    });
+
+    it("honors a cell equal to the filament's top-level id on the CREATE path (carry-over preservation)", async () => {
+      // Codex P2 follow-up: the legacy guard is scoped to the UPDATE path. On
+      // CREATE, a real per-spool id that equals the filament's top-level id
+      // (e.g. a Phase-1 carry-over spool re-created from its printed label /
+      // NFC tag) must be HONORED, not silently regenerated. No existing spool
+      // holds the id here, so isSpoolInstanceIdTaken permits it.
+      const f = await Filament.create({ name: "Carryover Create", vendor: "Test", type: "PLA" });
+      const fid = f.instanceId as string;
+
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Carryover Create,800,${fid}\n`; // no spoolId → CREATE path
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(1);
+      expect(body.created).toBe(1);
+      expect(body.failed).toBe(0);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1);
+      expect(fresh.spools[0].instanceId).toBe(fid); // honored, NOT regenerated
+    });
+
+    it("rejects a CREATE row whose id equals an existing spool's id (incl. a carry-over spool)", async () => {
+      // Safety counterpart to the above: if a spool already carries the
+      // filament's top-level id (carry-over), creating ANOTHER spool with that
+      // same id is a genuine collision and must be refused — the create path
+      // doesn't blanket-ignore the value, it uniqueness-checks it.
+      const f = await Filament.create({ name: "Carryover Exists", vendor: "Test", type: "PLA" });
+      const fid = f.instanceId as string;
+      // Give an existing spool that exact id (simulating the carry-over).
+      f.spools.push({ label: "carry", totalWeight: 1000, instanceId: fid });
+      await f.save();
+
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Carryover Exists,800,${fid}\n`; // CREATE path, id already held
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.failed).toBe(1);
+      expect(body.results[0].error).toMatch(/already used/);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1); // no second spool created
+    });
+
+    it("legacy export into a FRESH db fails the duplicate rows loudly (known transitional edge)", async () => {
+      // Documents the one residual edge of the create-only contract: a
+      // pre-Phase-5 CSV (filament-level id repeated across every row) imported
+      // into a fresh DB hits the CREATE path for all rows, so a multi-spool
+      // filament's rows collide on the same id. The first row creates; the rest
+      // fail LOUDLY (surfaced per-row), NOT silently. Full backup restores use
+      // /api/snapshot/restore, not this path. Pinned so the loud behavior is
+      // intentional and a future change is a conscious decision.
+      const f = await Filament.create({ name: "Legacy Fresh", vendor: "Test", type: "PLA" });
+      const legacyId = "abcdef0123"; // the old filament-level id, repeated
+
+      const csv =
+        "filament,totalWeight,spoolId,instanceId\n" +
+        `Legacy Fresh,1000,${new mongoose.Types.ObjectId()},${legacyId}\n` +
+        `Legacy Fresh,900,${new mongoose.Types.ObjectId()},${legacyId}\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.created).toBe(1); // first row creates with the id
+      expect(body.failed).toBe(1); // second fails loudly, not silently
+      expect(body.results[1].ok).toBe(false);
+      expect(body.results[1].error).toMatch(/more than one row/);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1);
+    });
+
+    it("#546 dual-instance: two update rows for the same spool both apply (mutation lands on the bucket doc)", async () => {
+      // Two rows for the SAME filament resolve via different cache keys (one
+      // omits vendor, one supplies it) → separate Mongoose instances for one
+      // _id. Both UPDATE the SAME spool. The mutation must land on the bucket
+      // doc (the single saved instance), or the second row's weight update is
+      // silently dropped. The instanceId column is ignored on update, so the
+      // spool keeps its original id.
+      const f = await Filament.create({
+        name: "DualInst",
+        vendor: "VendG",
+        type: "PLA",
+        spools: [{ label: "S", totalWeight: 1000 }],
+      });
+      const spoolId = String(f.spools[0]._id);
+      const originalId = f.spools[0].instanceId as string;
+
+      const csv =
+        "filament,vendor,totalWeight,spoolId,instanceId\n" +
+        `DualInst,,800,${spoolId},gnew000001\n` + // no vendor → instance A
+        `DualInst,VendG,900,${spoolId},gnew000001\n`; // vendor → instance B
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(2);
+      expect(body.failed).toBe(0);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1);
+      expect(fresh.spools[0].instanceId).toBe(originalId); // id untouched on update
+      expect(fresh.spools[0].totalWeight).toBe(900); // last write wins, not dropped
+    });
+
+    it("rejects the SECOND of two rows claiming the same instanceId within one CSV", async () => {
+      // Within-batch dedup: the first row's new id isn't persisted until the
+      // post-loop save(), so the DB check can't catch the collision — the
+      // in-loop Set must.
+      const f = await Filament.create({ name: "Batch Dup", vendor: "Test", type: "PLA" });
+      const csv =
+        "filament,totalWeight,instanceId\n" +
+        `Batch Dup,800,dupe123456\n` +
+        `Batch Dup,900,dupe123456\n`;
+      const res = await importSpools(csvRequest(csv));
+      const body = await res.json();
+      expect(body.imported).toBe(1);
+      expect(body.failed).toBe(1);
+      expect(body.results[0].ok).toBe(true);
+      expect(body.results[1].ok).toBe(false);
+      expect(body.results[1].error).toMatch(/more than one row/);
+
+      const fresh = await Filament.findById(f._id);
+      expect(fresh.spools).toHaveLength(1);
+      expect(fresh.spools[0].instanceId).toBe("dupe123456");
+    });
+  });
 });
