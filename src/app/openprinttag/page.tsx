@@ -401,12 +401,23 @@ export default function OpenPrintTagBrowser() {
     async (refresh = false) => {
       setLoading(true);
       setError(null);
+      // #743: a backstop against a truly-stuck request (the real "whole app
+      // hangs" cause — a synchronous parse blocking the event loop — is fixed
+      // server-side). This MUST exceed the server's worst-case window so it
+      // never pre-empts the legitimate slow paths: the server retries the
+      // GitHub fetch up to 3×60s + backoff (~183s) and then serves a stale
+      // cached DB (GH #225) — a cached user on a flaky network must still get
+      // that stale data, not a premature timeout (Codex P2). 240s clears the
+      // ~183s server window with margin; the single-flight means a retry after
+      // a timeout joins the in-progress load rather than duplicating it.
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 240_000);
       try {
         // GH #427: refresh moved from `GET ?refresh=true` to POST so
         // the cache-mutation isn't a GET-with-side-effect.
         const res = refresh
-          ? await fetch("/api/openprinttag", { method: "POST" })
-          : await fetch("/api/openprinttag");
+          ? await fetch("/api/openprinttag", { method: "POST", signal: controller.signal })
+          : await fetch("/api/openprinttag", { signal: controller.signal });
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           throw new Error(data.error || `HTTP ${res.status}`);
@@ -414,9 +425,14 @@ export default function OpenPrintTagBrowser() {
         const data: OPTDatabase = await res.json();
         setDb(data);
       } catch (err) {
-        setError(String(err));
-        toast(t("openprinttag.failedToLoad"), "error");
+        const timedOut = err instanceof DOMException && err.name === "AbortError";
+        setError(timedOut ? t("openprinttag.loadTimeout") : String(err));
+        toast(
+          timedOut ? t("openprinttag.loadTimeout") : t("openprinttag.failedToLoad"),
+          "error",
+        );
       } finally {
+        clearTimeout(timeout);
         setLoading(false);
       }
     },
