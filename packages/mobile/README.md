@@ -63,12 +63,11 @@ Local native build onto a connected device/simulator:
 npx expo run:ios       # or: npx expo run:android
 ```
 
-Or build a dev client with EAS and start the bundler:
-
-```bash
-npx eas build --profile development --platform ios   # one-time, per platform
-npx expo start --dev-client
-```
+`expo run:ios` builds a debug build with Metro attached — no extra packages
+needed. (For a cloud dev-client build instead, add `expo-dev-client`
+[`npx expo install expo-dev-client`] and a matching `development` profile to
+`eas.json`; it's omitted by default since the local `run:*` flow above covers
+development without the dependency.)
 
 ### Free Apple ID? Build QR-only (no NFC)
 
@@ -109,6 +108,59 @@ flaky shop network isn't lost. The queue persists across app restarts
 (AsyncStorage) and is safe to replay because only idempotent absolute-SET edits
 are queued. Usage / dry-cycle logging decrements/appends, so those require live
 connectivity and are never queued.
+
+## Distribution & CI builds (EAS)
+
+This app is built with **EAS Build**, not Xcode Cloud. It's a managed Expo
+(Continuous Native Generation) project — `ios/` and `android/` are produced by
+`expo prebuild` and are **not** committed (see `.gitignore`), so Xcode Cloud has
+no Xcode project to open and its builds fail. EAS generates the native project,
+installs Pods, and signs the app on Expo's servers. Profiles live in
+[`eas.json`](./eas.json):
+
+| Profile | Use |
+| --- | --- |
+| `preview` | internal release build for ad-hoc device testing |
+| `preview-qr` | same as `preview` but `EXPO_PUBLIC_ENABLE_NFC=0` — drops the NFC entitlement so the build can sign without the paid-account NFC capability |
+| `production` | App Store / TestFlight build (auto-incremented build number) |
+
+Only `packages/mobile` is uploaded to EAS — a root [`.easignore`](../../.easignore)
+scopes the build archive so it doesn't sweep in the web/Electron app (EAS
+archives the git root by default).
+
+One-time setup (needs your Expo + Apple accounts — can't be scripted here):
+
+```bash
+cd packages/mobile
+npx eas-cli login
+npx eas-cli init          # creates the EAS project, writes extra.eas.projectId into app.config.ts — commit it
+npx eas-cli build -p ios --profile production   # first build is interactive: EAS sets up the signing cert + provisioning profile
+```
+
+The App ID `com.filamentdb.scanner` needs the **NFC Tag Reading** capability for
+a full (non-QR-only) build, which requires a paid Apple Developer account; EAS
+enables that capability on the App ID automatically during the build.
+
+The first `production` build initializes the remote build number (because
+`appVersionSource` is `"remote"`); if the numbering ever needs correcting, use
+`eas build:version:set`.
+
+> **Free Apple ID?** The reliable free path is a **local** build —
+> `EXPO_PUBLIC_ENABLE_NFC=0 npx expo run:ios --device` (see above). A free
+> account can't reliably do EAS *cloud* internal-distribution builds: ad-hoc
+> signing needs each test device registered first (`eas device:create`) and
+> on-device install generally needs paid membership. Use `preview-qr` on EAS
+> only once you have a paid account but want a QR-only build.
+
+After the first interactive build sets up credentials, you can queue builds from
+GitHub via the **EAS Build (mobile)** workflow
+([`.github/workflows/eas-build-mobile.yml`](../../.github/workflows/eas-build-mobile.yml)) —
+Actions → run workflow, pick a platform + profile. It needs an `EXPO_TOKEN`
+repository secret (Expo → Account → Access tokens). It's manual-dispatch only,
+so it never spends EAS credits unless you run it.
+
+> **Turn off the old Xcode Cloud workflow** in App Store Connect (Xcode Cloud →
+> Manage Workflows) so it stops failing on every push.
 
 ## Project layout
 
