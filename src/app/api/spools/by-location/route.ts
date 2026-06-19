@@ -74,6 +74,10 @@ interface AggregatedSpool {
   netFilamentWeight: number | null;
   parentSpoolWeight: number | null;
   parentNetFilamentWeight: number | null;
+  /** GH #783: a synthetic row for a legacy single-spool filament (empty
+   * spools[] + a top-level totalWeight). Has no real spools[] subdoc, so the
+   * /inventory page renders it read-only — its inline edit routes would 404. */
+  legacySingleSpool: boolean;
 }
 
 interface InventoryGroup {
@@ -101,7 +105,29 @@ export async function GET(request: NextRequest) {
     // here is a well-formed stage object.
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const pipeline: any[] = [
-      { $match: { _deletedAt: null, spools: { $exists: true, $ne: [] } } },
+      // GH #777: keep legacy single-spool rows (empty `spools[]` but a
+      // top-level `totalWeight` — pre-migration data) in the pipeline so the
+      // /inventory count matches the home stat (`getSpoolCount` counts such a
+      // row as one physical roll). The `$set` below materializes their one
+      // synthetic spool.
+      //
+      // Codex P2 on PR #783: still prune catalog-only rows (no real spools AND
+      // no legacy totalWeight) UP FRONT — sending them through the parent
+      // `$lookup` + effective-type/vendor stages only to drop them at `$unwind`
+      // would turn this into a self-lookup over the whole active catalog. The
+      // `$or` keeps exactly the rows that can yield a spool (real or synthetic);
+      // a truly spool-less, weightless row is still dropped here as before.
+      // (`{ totalWeight: { $ne: null } }` matches present-and-non-null only —
+      // missing is treated as null in query matching.)
+      {
+        $match: {
+          _deletedAt: null,
+          $or: [
+            { spools: { $exists: true, $ne: [] } },
+            { totalWeight: { $ne: null } },
+          ],
+        },
+      },
       // Self-lookup for parent — needed for spoolWeight / netFilamentWeight
       // inheritance (see resolveFilament INHERITABLE_FIELDS) AND for the
       // type / vendor filters, which both fields inherit from. Done
@@ -193,6 +219,54 @@ export async function GET(request: NextRequest) {
       ...(vendorFilter
         ? [{ $match: { _effectiveVendor: vendorFilter } }]
         : []),
+      // GH #777: materialize a synthetic spool for a LEGACY single-spool row
+      // (empty `spools[]` + a non-null top-level `totalWeight`). The home stat
+      // (`getSpoolCount`, src/lib/inventoryStats.ts) treats such a row as one
+      // physical roll; the spools[]-only `$unwind` below would otherwise miss
+      // it and under-count by one per legacy filament. The synthetic spool
+      // carries `locationId: null` so it lands in the "no location" group
+      // (matching how the home page buckets legacy single-spools), `retired:
+      // false` (legacy rolls have no retired notion → always active, like
+      // `getSpoolCount`), and the filament-level `instanceId`. A row with a
+      // populated `spools[]` is left untouched; a spool-less + weightless row
+      // resolves to `[]` and is dropped by `$unwind`.
+      {
+        $set: {
+          spools: {
+            $cond: [
+              { $gt: [{ $size: { $ifNull: ["$spools", []] } }, 0] },
+              "$spools",
+              {
+                $cond: [
+                  { $ne: [{ $ifNull: ["$totalWeight", null] }, null] },
+                  [
+                    {
+                      _id: "$_id",
+                      instanceId: "$instanceId",
+                      label: "",
+                      totalWeight: "$totalWeight",
+                      lotNumber: null,
+                      purchaseDate: null,
+                      openedDate: null,
+                      retired: false,
+                      locationId: null,
+                      dryCycles: [],
+                      // GH #783 (Codex P2): this row has no real spools[] subdoc
+                      // (its _id is the filament id), so the /inventory inline
+                      // edit/move/retire routes (which match spools._id) would
+                      // 404. Flag it so the page renders it read-only with a
+                      // link to the filament, where the user can add a managed
+                      // spool (migrating the legacy roll).
+                      legacySingleSpool: true,
+                    },
+                  ],
+                  [],
+                ],
+              },
+            ],
+          },
+        },
+      },
       { $unwind: "$spools" },
       // Retired filter happens AFTER unwind because it's on the spool
       // subdoc, not the filament.
@@ -256,6 +330,10 @@ export async function GET(request: NextRequest) {
               parentNetFilamentWeight: {
                 $ifNull: [{ $arrayElemAt: ["$_parent.netFilamentWeight", 0] }, null],
               },
+              // GH #783: true only for the synthetic legacy single-spool row;
+              // real spools default to false. The /inventory page renders these
+              // read-only (their inline edit routes would 404).
+              legacySingleSpool: { $ifNull: ["$spools.legacySingleSpool", false] },
             },
           },
           count: { $sum: 1 },

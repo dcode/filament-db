@@ -421,4 +421,62 @@ describe("GET /api/spools/by-location", () => {
     expect(body.totalSpools).toBe(1);
     expect(body.groups[0].spools[0].filamentName).toBe("Active");
   });
+
+  it("counts a legacy single-spool row (empty spools[] + top-level totalWeight) — GH #777", async () => {
+    const shelf = await Location.create({ name: "Shelf A", kind: "shelf" });
+    // A normal filament with one real spool.
+    await Filament.create({
+      name: "Normal PLA",
+      vendor: "QA",
+      type: "PLA",
+      diameter: 1.75,
+      spoolWeight: 200,
+      spools: [{ label: "S1", totalWeight: 1100, locationId: shelf._id }],
+    });
+    // A LEGACY single-spool: empty spools[] but a top-level totalWeight
+    // (pre-migration shape). Home's getSpoolCount counts it as one roll; the
+    // spools[]-only aggregation missed it before #777.
+    await Filament.create({
+      name: "Legacy PETG",
+      vendor: "QA",
+      type: "PETG",
+      diameter: 1.75,
+      spoolWeight: 250,
+      spools: [],
+      totalWeight: 800,
+    });
+    // Codex P2 on #783: a catalog-only row (no spools[], no totalWeight) must
+    // still be pruned up front and contribute 0 (not a self-lookup over the
+    // whole catalog, and not a phantom spool).
+    await Filament.create({
+      name: "Catalog Only PLA",
+      vendor: "QA",
+      type: "PLA",
+      diameter: 1.75,
+      spools: [],
+    });
+
+    const { GET } = await import("@/app/api/spools/by-location/route");
+    const body = await (await GET(req())).json();
+    // 1 real spool + 1 legacy roll = 2 (the catalog-only row contributes 0).
+    expect(body.totalSpools).toBe(2);
+    // The legacy roll lands in the synthetic "no location" group.
+    const noLoc = body.groups.find(
+      (g: { locationId: string | null }) => g.locationId == null,
+    );
+    expect(noLoc).toBeTruthy();
+    expect(noLoc.count).toBe(1);
+    expect(noLoc.spools[0].filamentName).toBe("Legacy PETG");
+    // Remaining grams = gross − tare = 800 − 250 = 550.
+    expect(noLoc.totalGrams).toBe(550);
+    // GH #783: flagged so /inventory renders it read-only — its _id is the
+    // filament id (not a real spools[] subdoc), so inline edits would 404.
+    expect(noLoc.spools[0].legacySingleSpool).toBe(true);
+    expect(String(noLoc.spools[0]._id)).toBe(String(noLoc.spools[0].filamentId));
+    // A real spool is NOT flagged.
+    const realGroup = body.groups.find(
+      (g: { locationId: string | null }) => g.locationId != null,
+    );
+    expect(realGroup.spools[0].legacySingleSpool).toBe(false);
+  });
 });

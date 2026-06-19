@@ -45,6 +45,9 @@ export async function GET() {
           secondaryColors: 1,
           optTags: 1,
           spoolWeight: 1,
+          // GH #777: needed to count a legacy single-spool row (empty
+          // spools[] + a top-level totalWeight) the way the home stat does.
+          totalWeight: 1,
           lowStockThreshold: 1,
           dryingTemperature: 1,
           "spools._id": 1,
@@ -112,6 +115,16 @@ export async function GET() {
           remaining += Math.max(0, s.totalWeight - spoolMass);
         }
       }
+      // GH #777: a legacy single-spool row (no spools[] subdocs but a top-level
+      // totalWeight — pre-migration data) counts as one physical roll, matching
+      // the home stat (getSpoolCount). Without this the dashboard under-counts
+      // by one per legacy filament vs Home (65 on Home, 64 here). Mirrors the
+      // synthetic-spool the /inventory aggregation now materializes; only fires
+      // when spools[] is empty (a populated spools[] already counted above).
+      if ((f.spools?.length ?? 0) === 0 && typeof f.totalWeight === "number") {
+        spoolCount++;
+        remaining += Math.max(0, f.totalWeight - spoolMass);
+      }
       totalGrams += remaining;
       if (
         typeof f.lowStockThreshold === "number" &&
@@ -154,6 +167,15 @@ export async function GET() {
         ? resolveFilament(f, parentMap.get(f.parentId.toString()))
         : f;
       if (typeof resolved.dryingTemperature !== "number") continue;
+      // GH #783 (Codex P2): legacy single-spool rows (empty spools[] + a
+      // top-level totalWeight) are intentionally NOT added to dryDue, even
+      // though they count toward the spool total above. A dryDue entry needs a
+      // real spools[] subdoc — it carries a `spoolId` that drives the
+      // dashboard's per-spool dry-cycle actions, which would 404 on a synthetic
+      // legacy id (the same reason /inventory renders these read-only). A
+      // legacy roll also has no dryCycles history to evaluate. The user
+      // migrates it (Add Spool on the filament page) to get a real, dry-trackable
+      // spool — so the loop over `f.spools` correctly skips legacy rolls.
       for (const s of f.spools || []) {
         if (s.retired) continue;
         const cycles = s.dryCycles || [];
