@@ -280,6 +280,160 @@ async function listWindowsPrinters(): Promise<LabelPrinterDevice[]> {
     }));
 }
 
+/** Exit codes the unelevated launcher uses for elevation-level outcomes, kept
+ *  distinct from the elevated child's own 0/1/2/3/4 so they never collide.
+ *  10 = the user dismissed the UAC consent dialog (win32 1223 = ERROR_CANCELLED,
+ *  detected STRUCTURALLY via .NET Win32Exception.NativeErrorCode — never by
+ *  scraping the localized message; the app ships German). 11 = elevation could
+ *  not be obtained at all (policy-blocked / no consent path). Exported for the
+ *  unit test. */
+export const ELEVATION_CANCELLED_EXIT = 10;
+export const ELEVATION_UNAVAILABLE_EXIT = 11;
+
+/** Whole-round-trip timeout for the elevation. UAC waits on a human, so this is
+ *  deliberately long; the IPC handler must NOT additionally race it (a reject
+ *  there wouldn't cancel the work). Exported for the unit test. */
+export const DISABLE_BIDI_TIMEOUT_MS = 120_000;
+
+/** Wrap a string as a safe single-quoted PowerShell literal: surround with
+ *  single quotes and double any embedded single quote. */
+function psSingleQuote(s: string): string {
+  return "'" + s.replace(/'/g, "''") + "'";
+}
+
+/**
+ * Build the ELEVATED script that turns bidirectional support off on exactly one
+ * Win32_Printer queue, then RE-READS to confirm the write took (some drivers
+ * silently ignore it). The validated printer name is baked in as a single-quote-
+ * escaped literal — there are NO files and NO params: the script reaches the
+ * elevated PowerShell via -EncodedCommand (fixed on the command line at process
+ * creation), so a same-user process can't swap a temp script before the elevated
+ * read — the TOCTOU a -File approach would open (Codex P1). The outcome is the
+ * EXIT CODE, the only thing that reliably crosses the RunAs boundary:
+ *   0 = disabled + confirmed · 2 = not found · 3 = ambiguous (>1 match)
+ *   4 = write didn't take (still on) · 1 = unexpected error
+ * ASCII-only template. Exported for the unit test.
+ */
+export function buildDisableBidiScript(printerName: string): string {
+  return `$ErrorActionPreference = "Stop"
+$PrinterName = ${psSingleQuote(printerName)}
+$q = "Name='" + $PrinterName.Replace('\\', '\\\\').Replace("'", "\\'") + "'"
+try {
+  $p = @(Get-CimInstance Win32_Printer -Filter $q)
+  if ($p.Count -eq 0) { exit 2 }
+  if ($p.Count -gt 1) { exit 3 }
+  Set-CimInstance -InputObject $p[0] -Property @{ EnableBIDI = $false }
+  $after = @(Get-CimInstance Win32_Printer -Filter $q)
+  if ($after.Count -gt 0 -and $after[0].EnableBIDI) { exit 4 }
+  exit 0
+} catch {
+  exit 1
+}`;
+}
+
+/**
+ * Build the UNELEVATED launcher. It triggers the UAC prompt via Start-Process
+ * -Verb RunAs, handing the elevated payload over as a single -EncodedCommand
+ * token. Base64 has no spaces, so Start-Process's space-joining of -ArgumentList
+ * can't split it, and no file path (with or without spaces) is involved (Codex
+ * P2). User-cancel and elevation-unavailable map to the dedicated exit codes
+ * above; otherwise the elevated child's own exit code is relayed. The launcher
+ * is itself passed to powershell via -Command (also no file) and runs unelevated
+ * — not a privilege boundary. `psExe` is the absolute powershell path (GH #623),
+ * single-quote-escaped; `encoded` is base64. Exported for the unit test.
+ */
+export function buildDisableBidiLauncher(psExe: string, encoded: string): string {
+  return `$ErrorActionPreference = "Stop"
+try {
+  $proc = Start-Process -FilePath ${psSingleQuote(psExe)} -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', '${encoded}')
+  exit $proc.ExitCode
+} catch {
+  $ex = $_.Exception
+  $code = $null
+  if ($ex -is [System.ComponentModel.Win32Exception]) { $code = $ex.NativeErrorCode }
+  elseif ($ex.InnerException -is [System.ComponentModel.Win32Exception]) { $code = $ex.InnerException.NativeErrorCode }
+  if ($code -eq 1223) { exit ${ELEVATION_CANCELLED_EXIT} } else { exit ${ELEVATION_UNAVAILABLE_EXIT} }
+}`;
+}
+
+/** Outcome of {@link disableBidi}. `{ ok: true }` on a confirmed disable;
+ *  `{ ok: false, reason }` for cancel + known-failure cases (the renderer maps
+ *  `reason` to a localized toast — main-process strings can't cross the bundle
+ *  boundary into the Next.js renderer). Unexpected internal errors reject. */
+export type DisableBidiResult =
+  | { ok: true }
+  | {
+      ok: false;
+      reason:
+        | "cancelled"
+        | "not_found"
+        | "ambiguous"
+        | "still_enabled"
+        | "elevation_unavailable"
+        | "error";
+      detail?: string;
+    };
+
+/**
+ * Disable bidirectional support (`EnableBIDI`) on a Windows printer queue by
+ * running an elevated helper through the Windows UAC consent dialog.
+ * Windows-only.
+ *
+ * Some drivers (the Brother PT-P710BT among them) crash the Print Spooler when
+ * the spooler's bidi status query runs at job-schedule time; turning BiDi off
+ * is the fix, but it's a system-level printer-config write that needs admin.
+ * The unelevated app can't do it in-process, so it shells out to an elevated
+ * child via `Start-Process -Verb RunAs`.
+ *
+ * The elevated payload is delivered via -EncodedCommand (NOT a temp -File), so
+ * there's nothing on disk for a same-user process to swap before the elevated
+ * read (Codex P1), and no space-bearing args reach Start-Process (Codex P2).
+ * The validated printer name is baked into the script as an escaped literal;
+ * the outcome crosses the RunAs boundary as an exit code. Returns a STRUCTURED
+ * result so the renderer maps it without matching any main-process string. The
+ * caller MUST have already validated the name (the IPC handler requires it to
+ * be an installed, BiDi-on queue the user was shown).
+ */
+export async function disableBidi(printerName: string): Promise<DisableBidiResult> {
+  if (process.platform !== "win32") {
+    throw new Error("Disabling bidirectional support is only supported on Windows.");
+  }
+  const psExe = windowsPowershellPath();
+  // -EncodedCommand wants base64 of UTF-16LE, per PowerShell's contract.
+  const encoded = Buffer.from(buildDisableBidiScript(printerName), "utf16le").toString("base64");
+  const launcher = buildDisableBidiLauncher(psExe, encoded);
+  let exitCode: number;
+  try {
+    await execFileP(
+      psExe,
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", launcher],
+      { timeout: DISABLE_BIDI_TIMEOUT_MS, windowsHide: true },
+    );
+    exitCode = 0;
+  } catch (err) {
+    // execFile rejects on any non-zero exit; .code carries the exit code (a
+    // timeout/kill leaves it null -> mapped to a generic error below).
+    const code = (err as { code?: unknown }).code;
+    exitCode = typeof code === "number" ? code : -1;
+  }
+  switch (exitCode) {
+    case 0:
+      return { ok: true };
+    case 2:
+      return { ok: false, reason: "not_found" };
+    case 3:
+      return { ok: false, reason: "ambiguous" };
+    case 4:
+      return { ok: false, reason: "still_enabled" };
+    case ELEVATION_CANCELLED_EXIT:
+      return { ok: false, reason: "cancelled" };
+    case ELEVATION_UNAVAILABLE_EXIT:
+      return { ok: false, reason: "elevation_unavailable" };
+    default:
+      return { ok: false, reason: "error" };
+  }
+}
+
 /**
  * A print target left over from the pre-#588 serialport transport: a macOS
  * `/dev/tty.*` / `/dev/cu.*` path, a Linux `/dev/rfcomm*`, or a Windows `COMn`.

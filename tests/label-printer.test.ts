@@ -75,6 +75,11 @@ import {
   SPOOLER_DOWN_MESSAGE,
   WINDOWS_RAW_PRINT_PS1,
   WINDOWS_PRINT_TIMEOUT_MS,
+  disableBidi,
+  buildDisableBidiScript,
+  buildDisableBidiLauncher,
+  ELEVATION_CANCELLED_EXIT,
+  ELEVATION_UNAVAILABLE_EXIT,
 } from "../electron/label-printer";
 
 const BYTES = new Uint8Array([0x1b, 0x40, 0x41, 0x42]);
@@ -448,5 +453,98 @@ describe("listWindowsPrinters — bidirectional-support detection", () => {
       const devices = await listLabelPrinters();
       expect(devices[0].bidiEnabled).toBeUndefined();
     });
+  });
+});
+
+describe("disableBidi — elevated Windows BiDi-disable helper", () => {
+  // The elevated path can't run without a real Windows host + UAC, so these are
+  // shape guards + the exit-code outcome mapping with execFile mocked. The
+  // actual Set-CimInstance write and the UAC dialog are manual-QA / release-gate
+  // items (CIM-equivalence-to-the-Ports-checkbox MUST be hardware-confirmed).
+  const onlyOffWin = process.platform === "win32" ? it.skip : it;
+
+  it("elevated script turns EnableBIDI off, RE-READS to confirm, maps outcomes to exit codes (ASCII)", () => {
+    const s = buildDisableBidiScript("Brother PT-P710BT");
+    expect(s).toContain("Set-CimInstance");
+    expect(s).toContain("Win32_Printer");
+    expect(s).toContain("EnableBIDI = $false");
+    // WQL escaping (about_WQL): backslash is the escape char — double a literal
+    // backslash (shared names like \\server\printer) and use \' for an apostrophe,
+    // NOT SQL-style '' doubling, or the Win32_Printer filter wouldn't match.
+    expect(s).toContain(`.Replace('\\', '\\\\').Replace("'", "\\'")`);
+    expect(s).toMatch(/\$after\b/); // re-read so a silent no-op reports still-on
+    expect(s).toMatch(/exit 4/); // still_enabled
+    expect(s).toMatch(/exit 2/); // not_found
+    expect(s).toMatch(/exit 3/); // ambiguous
+    expect(/^[\x00-\x7F]*$/.test(s)).toBe(true);
+  });
+
+  it("bakes the printer name in as a single-quote-escaped literal (no -File, no injection)", () => {
+    expect(buildDisableBidiScript("Brother PT-P710BT")).toContain(
+      "$PrinterName = 'Brother PT-P710BT'",
+    );
+    // A name containing a single quote is doubled, so it can't break the literal.
+    expect(buildDisableBidiScript("a'b")).toContain("$PrinterName = 'a''b'");
+  });
+
+  it("launcher elevates via -EncodedCommand and detects UAC-cancel structurally (NativeErrorCode 1223)", () => {
+    const l = buildDisableBidiLauncher(windowsPowershellPath(), "QUJD");
+    expect(l).toContain("Verb RunAs");
+    expect(l).toContain("-EncodedCommand");
+    expect(l).toContain("'QUJD'"); // base64 payload, single-quoted, no spaces
+    expect(l).toContain("NativeErrorCode");
+    expect(l).toContain("1223");
+    expect(l).toContain(`exit ${ELEVATION_CANCELLED_EXIT}`);
+    expect(l).toContain(`exit ${ELEVATION_UNAVAILABLE_EXIT}`);
+    // No mutable temp -File script reaches the elevated process (Codex P1 fix).
+    // (`-FilePath` is Start-Process's exe param — a `-File` *script arg* would
+    // appear single-quoted in the -ArgumentList array, so check that form.)
+    expect(l).not.toContain("'-File'");
+    expect(/^[\x00-\x7F]*$/.test(l)).toBe(true);
+  });
+
+  it("invokes powershell by absolute path with the launcher as -Command, carrying the base64 payload", async () => {
+    await runAsWin32(async () => {
+      h.state.execImpl = () => ({ stdout: "" }); // exit 0 -> ok
+      const res = await disableBidi("Brother PT-P710BT");
+      expect(res).toEqual({ ok: true });
+      const call = h.state.execCalls.at(-1)!;
+      expect(call.cmd).toBe(windowsPowershellPath());
+      expect(call.cmd).toMatch(/powershell\.exe$/);
+      const cmdIdx = call.args.indexOf("-Command");
+      expect(cmdIdx).toBeGreaterThan(-1);
+      const launcher = call.args[cmdIdx + 1];
+      // The elevated script crosses as base64 inside the launcher, never on disk.
+      const expectedEncoded = Buffer.from(
+        buildDisableBidiScript("Brother PT-P710BT"),
+        "utf16le",
+      ).toString("base64");
+      expect(launcher).toContain("-EncodedCommand");
+      expect(launcher).toContain(expectedEncoded);
+      // No temp files; the raw name isn't on the command line (it's in the base64).
+      expect(call.args).not.toContain("-File");
+    });
+  });
+
+  it("maps the launcher/child exit code to the structured reason", async () => {
+    const cases: Array<[number, { ok: boolean; reason?: string }]> = [
+      [2, { ok: false, reason: "not_found" }],
+      [3, { ok: false, reason: "ambiguous" }],
+      [4, { ok: false, reason: "still_enabled" }],
+      [ELEVATION_CANCELLED_EXIT, { ok: false, reason: "cancelled" }],
+      [ELEVATION_UNAVAILABLE_EXIT, { ok: false, reason: "elevation_unavailable" }],
+      [1, { ok: false, reason: "error" }],
+    ];
+    for (const [code, expected] of cases) {
+      await runAsWin32(async () => {
+        h.state.execImpl = () => ({ error: Object.assign(new Error("nonzero"), { code }) });
+        const res = await disableBidi("Brother PT-P710BT");
+        expect(res).toMatchObject(expected);
+      });
+    }
+  });
+
+  onlyOffWin("refuses to run on a non-Windows platform", async () => {
+    await expect(disableBidi("Brother PT-P710BT")).rejects.toThrow(/only supported on Windows/i);
   });
 });
