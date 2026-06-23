@@ -10,6 +10,8 @@ import { snapToStep } from "@/lib/snapToStep";
 import {
   filterColorSuggestions,
   lookupCssNamedColor,
+  isBlankColorHex,
+  isIncompleteColorHex,
   type ColorSuggestion,
 } from "@/lib/cssNamedColors";
 import {
@@ -375,6 +377,15 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
   const [colorNameSuggestions, setColorNameSuggestions] = useState<ColorSuggestion[]>([]);
   const [colorNameDropdownOpen, setColorNameDropdownOpen] = useState(false);
   const [colorNameHighlight, setColorNameHighlight] = useState(-1);
+  // GH #794 (Codex P2): does the user OWN the current hex? True once they edit
+  // it via the picker / text field — including deliberately choosing the gray
+  // #808080, which the sentinel check would otherwise treat as "blank". While
+  // false (a fresh form, or a hex that was itself auto-filled from a name), a
+  // color-name commit may fill/replace the hex; once true, a name is just a
+  // label and never overwrites it. Initialized from the loaded filament: a
+  // stored REAL color is owned; a stored sentinel/blank is unchosen so a name
+  // can still gap-fill it.
+  const [colorHexUserSet, setColorHexUserSet] = useState(() => !isBlankColorHex(initialData?.color));
   const colorNameRef = useRef<HTMLDivElement>(null);
   const nozzleRangeMaxRef = useRef<HTMLInputElement>(null);
   const [fetchErrors, setFetchErrors] = useState<string[]>([]);
@@ -1350,7 +1361,12 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               aria-label={t("form.color")}
               className="h-10 w-12 rounded border border-gray-300 dark:border-gray-600 cursor-pointer bg-transparent flex-shrink-0"
               value={form.color}
-              onChange={(e) => setForm({ ...form, color: e.target.value })}
+              onChange={(e) => {
+                // Manual pick → this hex is now user-owned (even if it's the
+                // gray sentinel); a later color name must not overwrite it (#794).
+                setForm({ ...form, color: e.target.value });
+                setColorHexUserSet(true);
+              }}
             />
             <input
               type="text"
@@ -1365,6 +1381,8 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                 let v = raw.startsWith("#") ? raw : `#${raw}`;
                 v = "#" + v.slice(1).replace(/[^0-9a-fA-F]/g, "");
                 setForm({ ...form, color: v.slice(0, 7) });
+                // Manual edit → user-owned hex; don't let a name overwrite it (#794).
+                setColorHexUserSet(true);
               }}
               onBlur={(e) => {
                 const v = e.target.value.trim();
@@ -1416,9 +1434,18 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               // can be multiple hexes under the same name (e.g. several
               // brands of "Galaxy Black"); the user must explicitly
               // pick which one they meant via the dropdown.
+              // GH #794: fill the hex from the name only when the hex isn't
+              // user-owned — i.e. it's incomplete, or never picked / itself
+              // auto-filled (tracked by colorHexUserSet, which stays false after
+              // an autofill so a later name can replace it). Never clobber a hex
+              // the user picked, including a deliberately-chosen gray sentinel.
               const cssHex = lookupCssNamedColor(form.colorName);
-              if (cssHex && form.color.toUpperCase() !== cssHex) {
-                setForm({ ...form, color: cssHex });
+              if (cssHex && (isIncompleteColorHex(form.color) || !colorHexUserSet)) {
+                setForm((f) => ({ ...f, color: cssHex }));
+                // Now name-auto-filled (not user-owned), so a later name can
+                // still replace it — even if the user had just cleared the field,
+                // which set the flag true (Codex P2).
+                setColorHexUserSet(false);
               }
             }}
             onKeyDown={(e) => {
@@ -1440,7 +1467,18 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
               ) {
                 e.preventDefault();
                 const s = filtered[colorNameHighlight];
-                setForm({ ...form, colorName: s.name, color: s.hex });
+                // GH #794: always set the name; adopt the suggestion's hex only
+                // when the hex isn't user-owned (incomplete, or never picked /
+                // auto-filled) — don't clobber a user-picked color.
+                const applyHex = isIncompleteColorHex(form.color) || !colorHexUserSet;
+                setForm((f) => ({
+                  ...f,
+                  colorName: s.name,
+                  ...(applyHex ? { color: s.hex } : {}),
+                }));
+                // Filling from a name leaves the hex name-owned, so subsequent
+                // names keep updating it (Codex P2).
+                if (applyHex) setColorHexUserSet(false);
                 setColorNameDropdownOpen(false);
                 setColorNameHighlight(-1);
               } else if (e.key === "Escape") {
@@ -1495,7 +1533,18 @@ export default function FilamentForm({ initialData, onSubmit, onDirtyChange }: P
                           // input's onBlur fires first and the dropdown closes
                           // before the click registers.
                           e.preventDefault();
-                          setForm({ ...form, colorName: s.name, color: s.hex });
+                          // GH #794: name always; hex only when not user-owned
+                          // (incomplete, or never picked / auto-filled) — never
+                          // clobber a user-picked color.
+                          const applyHex = isIncompleteColorHex(form.color) || !colorHexUserSet;
+                          setForm((f) => ({
+                            ...f,
+                            colorName: s.name,
+                            ...(applyHex ? { color: s.hex } : {}),
+                          }));
+                          // Name-owned after a fill, so later names keep updating
+                          // it (Codex P2).
+                          if (applyHex) setColorHexUserSet(false);
                           setColorNameDropdownOpen(false);
                           setColorNameHighlight(-1);
                         }}

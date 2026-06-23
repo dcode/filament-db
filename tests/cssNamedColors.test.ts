@@ -3,6 +3,9 @@ import {
   CSS_NAMED_COLOR_LIST,
   filterColorSuggestions,
   lookupCssNamedColor,
+  isBlankColorHex,
+  isIncompleteColorHex,
+  BLANK_COLOR_HEX,
   type ColorSuggestion,
 } from "@/lib/cssNamedColors";
 
@@ -132,5 +135,57 @@ describe("filterColorSuggestions", () => {
   it("returns an empty list when nothing matches a non-empty query", () => {
     const result = filterColorSuggestions([], "thiscolordoesnotexistanywhere");
     expect(result).toEqual([]);
+  });
+});
+
+describe("isBlankColorHex (GH #794)", () => {
+  it("treats the gray sentinel as blank (any case / surrounding space)", () => {
+    expect(isBlankColorHex(BLANK_COLOR_HEX)).toBe(true);
+    expect(isBlankColorHex("#808080")).toBe(true);
+    expect(isBlankColorHex("#808080".toLowerCase())).toBe(true);
+    expect(isBlankColorHex("  #808080  ")).toBe(true);
+  });
+
+  it("treats null/undefined/empty as blank (defensive — the picker never emits them)", () => {
+    expect(isBlankColorHex(null)).toBe(true);
+    expect(isBlankColorHex(undefined)).toBe(true);
+    expect(isBlankColorHex("")).toBe(true);
+  });
+
+  it("treats an incomplete/cleared hex as blank — FilamentForm stores '#' when the text field is emptied (Codex P2)", () => {
+    expect(isBlankColorHex("#")).toBe(true); // text field cleared
+    expect(isBlankColorHex("#12")).toBe(true); // mid-typing
+    expect(isBlankColorHex("#1234")).toBe(true);
+    expect(isBlankColorHex("#1234567")).toBe(true); // too long
+    expect(isBlankColorHex("not-a-hex")).toBe(true);
+  });
+
+  it("treats a real user-picked hex as NOT blank — a name commit must not clobber it", () => {
+    expect(isBlankColorHex("#FA6E1C")).toBe(false);
+    expect(isBlankColorHex("#000080")).toBe(false);
+    expect(isBlankColorHex("#000000")).toBe(false);
+    expect(isBlankColorHex("#ffffff")).toBe(false);
+  });
+});
+
+describe("isIncompleteColorHex (GH #794 Codex P2 — sentinel-exclusive)", () => {
+  it("is true for empty / cleared / partial / garbage values", () => {
+    expect(isIncompleteColorHex(null)).toBe(true);
+    expect(isIncompleteColorHex(undefined)).toBe(true);
+    expect(isIncompleteColorHex("")).toBe(true);
+    expect(isIncompleteColorHex("#")).toBe(true); // text field cleared
+    expect(isIncompleteColorHex("#12")).toBe(true); // mid-typing
+    expect(isIncompleteColorHex("#1234567")).toBe(true); // too long
+    expect(isIncompleteColorHex("nope")).toBe(true);
+  });
+
+  it("is FALSE for any complete #RRGGBB — INCLUDING the gray sentinel, so a user CAN deliberately pick gray", () => {
+    expect(isIncompleteColorHex("#FA6E1C")).toBe(false);
+    // The crux of the Codex P2 fix: #808080 is a real, complete hex. Unlike
+    // isBlankColorHex, this predicate does NOT treat it as fillable — a user who
+    // picks gray owns it (the form tracks that intent separately).
+    expect(isIncompleteColorHex(BLANK_COLOR_HEX)).toBe(false);
+    expect(isIncompleteColorHex("#808080")).toBe(false);
+    expect(isIncompleteColorHex("  #000000  ")).toBe(false);
   });
 });
