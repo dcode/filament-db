@@ -13,8 +13,9 @@
 
 import { EventEmitter } from "events";
 import pcsclite from "@pokusew/pcsclite";
-import { wrapNdefForTag, parseNdefFromTag, isCcByteReadOnly, setCcByteReadOnly } from "./ndef";
-import { decodeOpenPrintTagBinary, type DecodedOpenPrintTag } from "../src/lib/openprinttag-decode";
+import { wrapNdefForTag, parseNdefRecords, isCcByteReadOnly, setCcByteReadOnly } from "./ndef";
+import { type DecodedOpenPrintTag } from "../src/lib/openprinttag-decode";
+import { decodeFromNdefRecords, OPENPRINTTAG_MIME } from "../src/lib/tagCodecs";
 import { deriveBambuKeys, parseBambuBlocks, bambuToDecodedTag } from "./bambu-tag";
 import {
   classifyNfcError as classifyNfcErrorImpl,
@@ -70,6 +71,14 @@ interface CardReaderStatus {
 
 const BLOCK_SIZE = 4;
 const DEFAULT_BLOCK_COUNT = 80;
+
+// NTAG (NFC-A / ISO 14443 Type 2) read tuning (#864). FF B0 READ BINARY returns
+// a 4-page (16-byte) burst; the Type-2 CC sits in page 3 (bytes 12–15) with the
+// NDEF TLV area starting at page 4 (byte 16). NTAG216 tops out near 872 user
+// bytes, so 1 KB is a generous ceiling that bounds the read loop.
+const NTAG_CC_OFFSET = 12;
+const NTAG_TLV_OFFSET = 16;
+const NTAG_MAX_NDEF_BYTES = 1024;
 
 /** The MLEN byte a healthy SLIX2 tag reports: total memory / 8 =
  * 80 blocks × 4 bytes / 8 = 40. */
@@ -609,8 +618,15 @@ export class NfcService extends EventEmitter {
 
   // ── High-level operations ───────────────────────────────────────
 
-  /** Read an OpenPrintTag (NFC-V / ISO 15693) tag. */
-  private async readOpenPrintTag(protocol: number): Promise<DecodedOpenPrintTag> {
+  /**
+   * Read an NFC-V / ISO 15693 (SLIX2) tag and decode it via the codec registry.
+   * This is the OpenPrintTag transport, but #864 routes the parsed NDEF records
+   * through the registry so an `application/opentag3d` record on a SLIX2 tag also
+   * decodes (OpenTag3D ships on both SLIX2 and NTAG). An OpenPrintTag record
+   * still decodes exactly as before.
+   */
+  /** Assemble the full NFC-V / ISO-15693 (SLIX2) tag image (CC at byte 0). */
+  private async readNfcVImage(protocol: number): Promise<Buffer> {
     const block0 = await this.readBlock(protocol, 0);
     const mlen = sanitizeMlen(block0[2]);
     const numBlocks = Math.min(Math.ceil((mlen * 8) / BLOCK_SIZE), DEFAULT_BLOCK_COUNT);
@@ -633,12 +649,104 @@ export class NfcService extends EventEmitter {
         }
       }
     }
+    return allData;
+  }
 
-    const cborPayload = parseNdefFromTag(allData);
-    const decoded = decodeOpenPrintTagBinary(cborPayload);
+  private async readOpenPrintTag(protocol: number): Promise<DecodedOpenPrintTag> {
+    const allData = await this.readNfcVImage(protocol);
+    // parseNdefRecords throws the friendly "Blank or unformatted" / CC errors
+    // (Type-5 CC at offset 0), preserved verbatim for the renderer's empty-tag UI.
+    const records = parseNdefRecords(allData, 0);
+    const decoded = decodeFromNdefRecords(records);
+    if (!decoded) {
+      // NDEF present but neither OpenPrintTag nor OpenTag3D — keep the historical
+      // message so nfcErrorClassify continues to bucket it as a wrong-format tag.
+      throw new Error('No NDEF record with type "application/vnd.openprinttag" found');
+    }
     // GH #583: surface the soft read-only state (CC byte 1 write-access bits)
     // so the renderer can show a lock badge and the write probe can refuse it.
-    decoded.readOnly = isCcByteReadOnly(block0[1]);
+    decoded.readOnly = isCcByteReadOnly(allData[1]);
+    return decoded;
+  }
+
+  // ── NTAG (NFC-A / ISO 14443 Type 2) — OpenTag3D, #864 ───────────────
+
+  /** Read one 16-byte (4-page) burst via the PC/SC READ BINARY pseudo-APDU. */
+  private async readNtagBurst(protocol: number, startPage: number): Promise<Buffer> {
+    const cmd = Buffer.from([0xff, 0xb0, 0x00, startPage, 0x10]);
+    const resp = await this.transmit(cmd, 20, protocol);
+    if (!this.checkSW(resp)) {
+      throw new Error(`NTAG read page ${startPage} failed: SW=${resp.toString("hex")}`);
+    }
+    return resp.subarray(0, resp.length - 2);
+  }
+
+  /**
+   * Read an NFC-Forum Type 2 (NTAG213/215/216) tag carrying an OpenTag3D (or any
+   * registered) NDEF record. Returns:
+   *   - the decoded tag on success,
+   *   - `null` when this isn't a Type-2 tag at all (READ BINARY unsupported, e.g.
+   *     a 15693 tag) OR the CC isn't an NDEF Type-2 CC — so readTag() falls
+   *     through to the ISO-15693 path,
+   *   - throws for a REAL Type-2 tag with blank/unrecognized content, so the
+   *     friendly message surfaces instead of being buried by the 15693 attempt.
+   */
+  private async readNtagTag(protocol: number): Promise<DecodedOpenPrintTag | null> {
+    let head: Buffer;
+    try {
+      head = await this.readNtagBurst(protocol, 0); // pages 0–3 → CC at byte 12
+    } catch {
+      return null; // READ BINARY not supported here → not an NTAG/Type-2 tag
+    }
+    if (head.length < NTAG_TLV_OFFSET) return null;
+
+    // Safety guard (no hardware needed): if some ACS readers answer FF B0 for a
+    // 15693 SLIX2 storage tag too, byte 0 of what we read is that tag's NFC-Forum
+    // Type 5 CC magic (0xE1) — NOT an NTAG UID (NTAG page 0 byte 0 is the
+    // manufacturer code, never 0xE1). Treat that as "this is really a 15693 tag"
+    // and defer to the proven ISO-15693 OpenPrintTag path rather than
+    // mis-parsing the Type-5 image as Type-2 (which could mis-throw "Blank or
+    // unformatted" on a valid OPT tag). A genuine NTAG falls through to the
+    // Type-2 CC check below.
+    if (head[0] === 0xe1) return null;
+
+    const ccMagic = head[NTAG_CC_OFFSET];
+    if (ccMagic === 0x00) {
+      throw new Error("Blank or unformatted NFC tag (no NDEF data)");
+    }
+    if (ccMagic !== 0xe1) {
+      return null; // readable as Type 2 but no NDEF CC — let other paths try
+    }
+
+    const mlen = head[NTAG_CC_OFFSET + 2]; // CC byte 2 = NDEF area size / 8
+    const ndefBytes = Math.min(Math.max(0, mlen * 8), NTAG_MAX_NDEF_BYTES);
+    const data = Buffer.alloc(NTAG_TLV_OFFSET + ndefBytes);
+    head.copy(data, 0);
+
+    let page = 4;
+    let written = NTAG_TLV_OFFSET;
+    while (written < data.length) {
+      let burst: Buffer;
+      try {
+        burst = await this.readNtagBurst(protocol, page);
+      } catch {
+        try {
+          burst = await this.readNtagBurst(protocol, page); // retry once
+        } catch {
+          break; // past readable memory
+        }
+      }
+      const copyLen = Math.min(burst.length, data.length - written);
+      burst.copy(data, written, 0, copyLen);
+      written += copyLen;
+      page += 4;
+    }
+
+    const records = parseNdefRecords(data.subarray(0, written), NTAG_CC_OFFSET);
+    const decoded = decodeFromNdefRecords(records);
+    if (!decoded) {
+      throw new Error('No NDEF record with type "application/opentag3d" found');
+    }
     return decoded;
   }
 
@@ -646,22 +754,35 @@ export class NfcService extends EventEmitter {
    * Read a tag, auto-detecting its type.
    *
    * The ACR1552U returns a UID for both ISO 14443 and ISO 15693 tags via
-   * FF CA, so Get UID alone can't distinguish tag types. Instead we try
-   * the full Bambu MIFARE Classic read (auth + block reads). If auth
-   * fails, the tag isn't Bambu — fall through to ISO 15693 OpenPrintTag.
+   * FF CA, so Get UID alone can't distinguish tag types. Instead we try each
+   * transport in turn and fall through on failure:
+   *   1. Bambu MIFARE Classic (ISO 14443-3A) — auth + block reads.
+   *   2. NTAG / NFC-Forum Type 2 (ISO 14443A) — READ BINARY; OpenTag3D ships on
+   *      NTAG213/215/216 (#864). Returns null when READ BINARY isn't supported
+   *      (a 15693 tag), so we fall through; throws for a real Type-2 tag with
+   *      blank/unrecognized content so its friendly message surfaces.
+   *   3. ISO 15693 / NFC-V (SLIX2) — OpenPrintTag, or OpenTag3D on SLIX2.
    */
   async readTag(): Promise<DecodedOpenPrintTag> {
-    // Try Bambu (MIFARE Classic) first
+    // 1. Try Bambu (MIFARE Classic) first
     try {
       return await this.withConnection(async (protocol) => {
         return await this.readBambuTag(protocol);
       });
     } catch {
-      // Auth or read failed — not a Bambu tag, fall through to OpenPrintTag
+      // Auth or read failed — not a Bambu tag, fall through.
     }
 
-    // Reconnect for ISO 15693 (OpenPrintTag) — a fresh connection ensures
-    // the reader isn't in a stale state after a failed MIFARE auth attempt.
+    // 2. Try NTAG (NFC-A / ISO 14443 Type 2). A fresh connection avoids a stale
+    // reader state after the failed MIFARE auth. A null result means "not a
+    // Type-2 tag" → fall through to 15693; a throw means a real Type-2 tag with
+    // a content error and propagates (so e.g. "Blank or unformatted" surfaces).
+    const ntag = await this.withConnection(async (protocol) => {
+      return this.readNtagTag(protocol);
+    });
+    if (ntag) return ntag;
+
+    // 3. Reconnect for ISO 15693 (OpenPrintTag / OpenTag3D-on-SLIX2).
     return this.withConnection(async (protocol) => {
       return this.readOpenPrintTag(protocol);
     });
@@ -844,8 +965,14 @@ export class NfcService extends EventEmitter {
       // pass it and we'd flip ITS write-access bits, marking an unrelated tag
       // read-only. Fully parse the tag and confirm it carries an OpenPrintTag
       // record before touching block 0; only OpenPrintTags are ours to lock.
+      //
+      // #864: confirm the OpenPrintTag MIME record SPECIFICALLY — readOpenPrintTag
+      // now decodes any registered codec (incl. OpenTag3D via the registry), so
+      // checking it alone would let us flip the CC of a third-party OpenTag3D
+      // SLIX2 tag (read-only this phase — never ours to lock).
+      let records;
       try {
-        await this.readOpenPrintTag(protocol);
+        records = parseNdefRecords(await this.readNfcVImage(protocol), 0);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         // Definitive "this isn't an OpenPrintTag" signals from ndef.ts → tell
@@ -864,6 +991,11 @@ export class NfcService extends EventEmitter {
           );
         }
         throw err;
+      }
+      if (!records.some((r) => r.tnf === 0x02 && r.type === OPENPRINTTAG_MIME)) {
+        throw new Error(
+          "TAG_NOT_FORMATTED: This tag has no OpenPrintTag data to lock — write a filament to it first.",
+        );
       }
 
       const block0 = await this.readBlock(protocol, 0);
