@@ -5,7 +5,7 @@ import Nozzle from "@/models/Nozzle";
 import Printer from "@/models/Printer";
 import BedType from "@/models/BedType";
 import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
-import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError, assertActiveRefs } from "@/lib/apiErrorHandler";
+import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError, isDuplicateKeyError, assertActiveRefs } from "@/lib/apiErrorHandler";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { mergeSlicerSettings } from "@/lib/slicerSettings";
 import { assignSpoolToSlot } from "@/lib/spoolSlots";
@@ -440,6 +440,11 @@ export async function POST(
     let filament = urlIsObjectId
       ? await Filament.findOne({ _id: id, _deletedAt: null })
       : null;
+    // True ONLY when the URL ObjectId itself resolved the record (the authoritative
+    // form). NOT the same as urlIsObjectId: a 24-hex URL whose _id misses falls
+    // through to name/config-id matching below, and renaming THERE (a name-addressed
+    // semantic) would be wrong (Codex P2). This is the precise gate for the rename.
+    const matchedByUrlObjectId = !!filament;
     let matchedBy: "id" | "name" | null = filament ? "id" : null;
     // True only for a config-filamentdb_id match on a NAME-addressed sync — the
     // sole case where a name divergence is meaningful (the URL holds a real name).
@@ -692,6 +697,40 @@ export async function POST(
     }
     update.settings = merge.settings;
 
+    // #867 Phase 2 companion: on the AUTHORITATIVE ObjectId path, honor a renamed
+    // preset by applying the sent body name to the record. This is what makes the
+    // fork's "Update anyway" reconcile actually STICK — otherwise the record keeps
+    // its old name and every later name-addressed sync hits name_id_mismatch again.
+    // The NAME-addressed path deliberately never renames (the name is its addressing
+    // key, and a body.name there is ignored); only an explicit, user-confirmed
+    // id-addressed sync may rename the record.
+    if (matchedByUrlObjectId && typeof body.name === "string") {
+      const sentName = body.name.trim();
+      if (sentName && sentName !== filament.name) {
+        // Refuse if another ACTIVE filament already owns that name. The unique-on-
+        // non-deleted index would E11000 on the write anyway; the pre-check turns it
+        // into a friendly, actionable 409 (a TOCTOU race still falls back to the
+        // E11000 handler below).
+        const clash = await Filament.findOne({
+          name: sentName,
+          _deletedAt: null,
+          _id: { $ne: filament._id },
+        });
+        if (clash) {
+          return NextResponse.json(
+            {
+              error: "name_taken",
+              message: `Cannot rename to "${sentName}" — another filament already has that name.`,
+              conflictId: String(clash._id),
+            },
+            { status: 409 },
+          );
+        }
+        update.name = sentName;
+        filament.name = sentName; // keep the 200 response's matchedName accurate
+      }
+    }
+
     // GH #618: `runValidators` so the numeric range validators (#337)
     // actually fire on a PrusaSlicer sync — without it a config like
     // `filament_cost = -3` parses clean and persists a negative cost the
@@ -705,6 +744,23 @@ export async function POST(
         { runValidators: true, context: "query" },
       );
     } catch (validationErr) {
+      // #867 Phase 2: a rename that lost a TOCTOU race against a concurrent rename
+      // to the same name slips past the pre-check and surfaces here as a duplicate-
+      // key error — report it as the SAME name_taken 409 as the pre-check, not a
+      // generic 400, so the client sees one consistent contract.
+      if (update.name != null && isDuplicateKeyError(validationErr)) {
+        // Look up the winner so the race fallback returns the SAME shape as the
+        // pre-check (incl. conflictId); the rename didn't apply.
+        const clash = await Filament.findOne({ name: update.name, _deletedAt: null });
+        return NextResponse.json(
+          {
+            error: "name_taken",
+            message: `Cannot rename to "${String(update.name)}" — another filament already has that name.`,
+            ...(clash ? { conflictId: String(clash._id) } : {}),
+          },
+          { status: 409 },
+        );
+      }
       return errorResponseFromCaught(
         validationErr,
         "PrusaSlicer config contained invalid values",
