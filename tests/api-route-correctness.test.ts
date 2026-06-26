@@ -441,6 +441,130 @@ describe("API route correctness", () => {
     expect(fresh.calibrations ?? []).toHaveLength(0); // ambiguous → don't guess
   });
 
+  it("#867 — a name-addressed sync whose filamentdb_id resolves to a DIFFERENT name returns 409 and does NOT mutate (Codex P1)", async () => {
+    const f = await Filament.create({ name: "Fibreheart PPA", vendor: "Siraya Tech", type: "PPA" });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/SirayaTech%20Fibreheart%20PPA", {
+        config: { filamentdb_id: String(f._id), filament_shrinkage_compensation_xy: "0.36%" },
+      }),
+      { params: Promise.resolve({ id: "SirayaTech Fibreheart PPA" }) }, // a DIFFERENT name (rename OR copied id)
+    );
+    // Ambiguous (renamed preset vs copied id) → surface, don't silently overwrite.
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("name_id_mismatch");
+    expect(body.filamentId).toBe(String(f._id));
+    expect(body.matchedName).toBe("Fibreheart PPA");
+    expect(body.sentName).toBe("SirayaTech Fibreheart PPA");
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.shrinkageXY ?? null).toBeNull(); // NOT mutated
+    expect(await Filament.countDocuments({ _deletedAt: null })).toBe(1); // and no orphan created
+  });
+
+  it("#867 — confirming via the ObjectId URL applies the update (reconcile path)", async () => {
+    const f = await Filament.create({ name: "Fibreheart PPA", vendor: "Siraya Tech", type: "PPA" });
+    // After a 409, the fork re-syncs addressing the resolved filament by id.
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}`, {
+        config: { filamentdb_id: String(f._id), filament_shrinkage_compensation_xy: "0.36%" },
+      }),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(200);
+    expect((await Filament.findById(f._id)).shrinkageXY).toBe(0.36); // applied
+  });
+
+  it("#867 — falls back to the name match when no filamentdb_id is sent", async () => {
+    const f = await Filament.create({ name: "PLA Basic", vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%20Basic", { config: { filament_density: "1.24" } }),
+      { params: Promise.resolve({ id: "PLA Basic" }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.matchedBy).toBe("name");
+    expect(body.filamentId).toBe(String(f._id));
+  });
+
+  it("#867 — a stale filamentdb_id gracefully falls back to the name match", async () => {
+    const f = await Filament.create({ name: "PETG Pro", vendor: "X", type: "PETG" });
+    const staleId = new mongoose.Types.ObjectId().toString(); // valid ObjectId, no such doc
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PETG%20Pro", {
+        config: { filamentdb_id: staleId, filament_density: "1.27" },
+      }),
+      { params: Promise.resolve({ id: "PETG Pro" }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.matchedBy).toBe("name");
+    expect(body.filamentId).toBe(String(f._id));
+  });
+
+  it("#867 — filamentdb_id is consumed for routing, not stored in the settings bag", async () => {
+    const f = await Filament.create({ name: "ABS X", vendor: "X", type: "ABS" });
+    await slicerSync(
+      jsonReq("http://localhost/api/filaments/ABS%20X", {
+        config: { filamentdb_id: String(f._id), some_passthrough_key: "v" },
+      }),
+      { params: Promise.resolve({ id: "ABS X" }) },
+    );
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.settings?.filamentdb_id).toBeUndefined(); // routing hint, not persisted
+    expect(fresh.settings?.some_passthrough_key).toBe("v"); // real passthrough keys still stored
+  });
+
+  it("#867 — an ObjectId-URL sync (no filamentdb_id) applies (no false 409 mismatch) (Codex P2)", async () => {
+    const f = await Filament.create({ name: "Real Name", vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}`, { config: { filament_density: "1.24" } }),
+      { params: Promise.resolve({ id: String(f._id) }) }, // URL param IS the ObjectId, not a name
+    );
+    expect(res.status).toBe(200); // applied — decodedName was the id, not a name, so never a 409 mismatch
+    expect((await res.json()).matchedBy).toBe("id");
+  });
+
+  it("#867 — an ObjectId URL WITH a matching filamentdb_id applies (no false 409 mismatch) (Codex P2)", async () => {
+    const f = await Filament.create({ name: "Real Name", vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}`, {
+        config: { filamentdb_id: String(f._id), filament_density: "1.24" },
+      }),
+      { params: Promise.resolve({ id: String(f._id) }) }, // ObjectId addressing form
+    );
+    expect(res.status).toBe(200); // id addressing never 409s on a name mismatch — even with filamentdb_id
+    expect((await res.json()).matchedBy).toBe("id");
+  });
+
+  it("#867 — an ObjectId URL is authoritative; a conflicting filamentdb_id does NOT redirect the write (Codex P2)", async () => {
+    const target = await Filament.create({ name: "Target", vendor: "X", type: "PLA" });
+    const other = await Filament.create({ name: "Other", vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${target._id}`, {
+        // a copied/stale id pointing at a DIFFERENT filament — must not hijack the write
+        config: { filamentdb_id: String(other._id), filament_density: "1.5" },
+      }),
+      { params: Promise.resolve({ id: String(target._id) }) }, // URL pins the target
+    );
+    expect(res.status).toBe(200);
+    expect((await res.json()).filamentId).toBe(String(target._id)); // wrote to the URL target
+    expect((await Filament.findById(target._id)).density).toBe(1.5); // target updated
+    expect((await Filament.findById(other._id)).density ?? null).toBeNull(); // other untouched
+  });
+
+  it("#867 — a preset NAME that looks like an ObjectId still falls back to the name match (Codex P2)", async () => {
+    const hexName = "abcdef012345678901234567"; // 24 hex chars, but not any filament's _id
+    const f = await Filament.create({ name: hexName, vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${hexName}`, { config: { filament_density: "1.3" } }),
+      { params: Promise.resolve({ id: hexName }) },
+    );
+    expect(res.status).toBe(200); // not a 404 — the ObjectId lookup missed, name matched
+    const body = await res.json();
+    expect(body.filamentId).toBe(String(f._id));
+    expect(body.matchedBy).toBe("name");
+  });
+
   it("#265 — calibration sync on a variant that OVERRIDES calibrations writes to the variant", async () => {
     // Codex P1: a variant with its own non-empty calibrations array
     // owns its calibrations (resolveFilament uses them, not the
