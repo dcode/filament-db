@@ -1,5 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, createReadStream } from "fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  createReadStream,
+  readdirSync,
+  utimesSync,
+  existsSync,
+} from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import * as tar from "tar";
@@ -920,5 +929,83 @@ type: Resin
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1); // joined, not duplicated
     expect(a).toBe(b);
+  });
+
+  // Helper: count `openprinttag-*` temp dirs currently in tmpdir().
+  function countTempDirs(): number {
+    return readdirSync(tmpdir()).filter((n) => n.startsWith("openprinttag-")).length;
+  }
+
+  it("cleans up its own temp dir after a successful fetch", async () => {
+    const before = countTempDirs();
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-clean/data/brands/.gitkeep": "",
+      "OpenPrintTag-clean/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    await fetchOpenPrintTagDatabase();
+
+    // The per-attempt mkdtemp dir must be removed in the finally — no net
+    // growth in `openprinttag-*` dirs (the cause of the %TEMP% buildup).
+    expect(countTempDirs()).toBe(before);
+  });
+
+  it("sweeps stale openprinttag-* temp dirs (>1h old) on fetch", async () => {
+    // Simulate a partial copy left by an earlier interrupted run: an
+    // openprinttag-* dir with an mtime well over an hour ago.
+    const stale = mkdtempSync(join(tmpdir(), "openprinttag-"));
+    writeFileSync(join(stale, "leftover.txt"), "partial");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, twoHoursAgo, twoHoursAgo);
+    expect(existsSync(stale)).toBe(true);
+
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-sweep/data/brands/.gitkeep": "",
+      "OpenPrintTag-sweep/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    await fetchOpenPrintTagDatabase();
+
+    // The stale dir is reclaimed by the start-of-run sweep.
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it("does NOT sweep a fresh openprinttag-* dir (mtime within the window)", async () => {
+    // A concurrent instance's in-progress dir (recent mtime) must survive the
+    // sweep — only >1h-old dirs are reclaimed.
+    const fresh = mkdtempSync(join(tmpdir(), "openprinttag-"));
+    writeFileSync(join(fresh, "inprogress.txt"), "x");
+
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-fresh/data/brands/.gitkeep": "",
+      "OpenPrintTag-fresh/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    try {
+      await fetchOpenPrintTagDatabase();
+      expect(existsSync(fresh)).toBe(true);
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it("re-labels a download-phase timeout honestly (not a generic failure)", async () => {
+    // The 60s AbortSignal fires as a TimeoutError. A timeout in the download
+    // phase should surface a download-specific message.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const e = new Error("The operation was aborted due to timeout");
+      e.name = "TimeoutError";
+      throw e;
+    });
+
+    await expect(fetchOpenPrintTagDatabase()).rejects.toThrow(
+      /OpenPrintTag download timed out/,
+    );
   });
 });
