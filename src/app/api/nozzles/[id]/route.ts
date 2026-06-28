@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import mongoose from "mongoose";
 import dbConnect from "@/lib/mongodb";
 import Nozzle from "@/models/Nozzle";
 import Filament from "@/models/Filament";
@@ -63,8 +64,12 @@ export async function PUT(
     // currently has it installed gets it removed. This lets the nozzle edit
     // form manage the assignment from the nozzle side while the Printer form
     // continues to manage it from the printer side.
+    // GH #912 (Codex P3): dedupe before the one-printer check so a client that
+    // sends the same printer twice (`[id, id]` — a duplicated selection / retry
+    // payload) isn't falsely rejected; it still targets ONE unique printer and
+    // the $addToSet is idempotent. Mirrors the printer routes' ref-array dedup.
     const printerIds: string[] | undefined = Array.isArray(body.printerIds)
-      ? body.printerIds
+      ? [...new Set((body.printerIds as unknown[]).map((p): string => String(p)))]
       : undefined;
 
     // GH #424: replace the "delete each known leak field + spread the rest"
@@ -79,6 +84,39 @@ export async function PUT(
     if ("hardened" in body) update.hardened = body.hardened;
     if ("notes" in body) update.notes = body.notes;
 
+    // GH #897 / #912 (Codex P2): VALIDATE printerIds BEFORE mutating the nozzle,
+    // so a rejected assignment (multi-printer, bad/missing target) doesn't leave
+    // the nozzle partially updated (e.g. renamed but the request 400s).
+    // A single physical nozzle lives in at most ONE printer (#232); the
+    // nozzle-side assignment is AUTHORITATIVE (auto-move) — the $pull below
+    // displaces the previous claim — but it can't be in two printers at once.
+    let validatedTargetId: string | null = null;
+    if (printerIds !== undefined) {
+      if (printerIds.length > 1) {
+        return errorResponse(
+          "A nozzle can be installed in at most one printer at a time.",
+          400,
+        );
+      }
+      if (printerIds.length === 1) {
+        const targetId = printerIds[0];
+        if (typeof targetId !== "string" || !mongoose.isValidObjectId(targetId)) {
+          return errorResponse("printerIds must contain a valid printer id", 400);
+        }
+        // Target must exist + be active (mirrors the printer routes' existence
+        // check) so the assignment can't silently no-op while the $pull below
+        // still strips the nozzle from its current printer.
+        const target = await Printer.findOne(
+          { _id: targetId, _deletedAt: null },
+          { _id: 1 },
+        ).lean();
+        if (!target) {
+          return errorResponse("Target printer not found", 400);
+        }
+        validatedTargetId = targetId;
+      }
+    }
+
     const nozzle = await Nozzle.findOneAndUpdate(
       { _id: id, _deletedAt: null },
       update,
@@ -89,14 +127,14 @@ export async function PUT(
     }
 
     if (printerIds !== undefined) {
-      // Add this nozzle to every printer in the list (idempotent)
-      if (printerIds.length > 0) {
+      if (validatedTargetId) {
         await Printer.updateMany(
-          { _id: { $in: printerIds }, _deletedAt: null },
-          { $addToSet: { installedNozzles: id } }
+          { _id: validatedTargetId, _deletedAt: null },
+          { $addToSet: { installedNozzles: id } },
         );
       }
-      // Remove this nozzle from any other printer that currently has it
+      // Auto-move: remove this nozzle from every OTHER printer that has it
+      // (one-printer-per-nozzle). An empty printerIds clears the assignment.
       await Printer.updateMany(
         { _id: { $nin: printerIds }, _deletedAt: null, installedNozzles: id },
         { $pull: { installedNozzles: id } }

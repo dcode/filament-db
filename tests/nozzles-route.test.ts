@@ -371,6 +371,98 @@ describe("/api/nozzles", () => {
       );
       expect(res.status).toBe(404);
     });
+
+    it("#912: a duplicated single printer in printerIds is deduped, not rejected", async () => {
+      const noz = await Nozzle.create({ name: "Dup OK", diameter: 0.4, type: "Brass" });
+      const a = await Printer.create({ name: "PDup", manufacturer: "X", printerModel: "1" });
+      const res = await updateNozzle(
+        jsonReq(
+          `http://localhost/api/nozzles/${noz._id}`,
+          { printerIds: [String(a._id), String(a._id)] }, // same printer twice
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(200); // one unique printer → not a multi-printer reject
+      expect((await Printer.findById(a._id)).installedNozzles.map(String)).toContain(String(noz._id));
+    });
+
+    it("#912: a rejected printerIds assignment does NOT partially update the nozzle", async () => {
+      const noz = await Nozzle.create({ name: "Keep Me", diameter: 0.4, type: "Brass" });
+      const a = await Printer.create({ name: "PA", manufacturer: "X", printerModel: "1" });
+      const b = await Printer.create({ name: "PB", manufacturer: "X", printerModel: "2" });
+      const res = await updateNozzle(
+        jsonReq(
+          `http://localhost/api/nozzles/${noz._id}`,
+          { name: "Renamed", printerIds: [String(a._id), String(b._id)] }, // invalid multi-printer
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(400);
+      // The nozzle name must be UNCHANGED — validation runs before the write.
+      expect((await Nozzle.findById(noz._id)).name).toBe("Keep Me");
+    });
+
+    it("#897: rejects assigning one nozzle to MULTIPLE printers (one-printer-per-nozzle)", async () => {
+      const noz = await Nozzle.create({ name: "Shared", diameter: 0.4, type: "Brass" });
+      const a = await Printer.create({ name: "A", manufacturer: "X", printerModel: "1" });
+      const b = await Printer.create({ name: "B", manufacturer: "X", printerModel: "2" });
+      const res = await updateNozzle(
+        jsonReq(
+          `http://localhost/api/nozzles/${noz._id}`,
+          { printerIds: [String(a._id), String(b._id)] },
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(400);
+      // Neither printer got the nozzle — the invariant is preserved.
+      expect((await Printer.findById(a._id)).installedNozzles).toHaveLength(0);
+      expect((await Printer.findById(b._id)).installedNozzles).toHaveLength(0);
+    });
+
+    it("#897: assigning to a single printer auto-moves the nozzle off its previous printer", async () => {
+      const noz = await Nozzle.create({ name: "Mover", diameter: 0.4, type: "Brass" });
+      const a = await Printer.create({
+        name: "A", manufacturer: "X", printerModel: "1", installedNozzles: [noz._id],
+      });
+      const b = await Printer.create({ name: "B", manufacturer: "X", printerModel: "2" });
+      const res = await updateNozzle(
+        jsonReq(`http://localhost/api/nozzles/${noz._id}`, { printerIds: [String(b._id)] }, "PUT"),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(200);
+      // Moved from A to B (no longer in two printers).
+      expect((await Printer.findById(a._id)).installedNozzles.map(String)).not.toContain(String(noz._id));
+      expect((await Printer.findById(b._id)).installedNozzles.map(String)).toContain(String(noz._id));
+    });
+
+    it("#897: rejects a printerIds entry that isn't an active printer", async () => {
+      const noz = await Nozzle.create({ name: "Ghost Target", diameter: 0.4, type: "Brass" });
+      const res = await updateNozzle(
+        jsonReq(
+          `http://localhost/api/nozzles/${noz._id}`,
+          { printerIds: [new mongoose.Types.ObjectId().toString()] },
+          "PUT",
+        ),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(400);
+    });
+
+    it("#897: empty printerIds clears the nozzle from all printers", async () => {
+      const noz = await Nozzle.create({ name: "Unassign", diameter: 0.4, type: "Brass" });
+      const a = await Printer.create({
+        name: "A", manufacturer: "X", printerModel: "1", installedNozzles: [noz._id],
+      });
+      const res = await updateNozzle(
+        jsonReq(`http://localhost/api/nozzles/${noz._id}`, { printerIds: [] }, "PUT"),
+        { params: Promise.resolve({ id: String(noz._id) }) },
+      );
+      expect(res.status).toBe(200);
+      expect((await Printer.findById(a._id)).installedNozzles).toHaveLength(0);
+    });
   });
 
   describe("GET /api/nozzles/{id}", () => {
