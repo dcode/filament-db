@@ -45,8 +45,138 @@ function slicerExportColor(filament: FilamentDoc): string | null {
  * Structured DB fields are mapped to their PrusaSlicer equivalents.
  * The `settings` bag is merged underneath (DB fields win on conflict).
  */
+/**
+ * #872: the canonical "<Ø> <type> [HF]" suffix that distinguishes a per-nozzle
+ * preset — e.g. "0.4 Diamondback", "0.4 Brass HF". Used to NAME the exported preset
+ * (`<base> <suffix>`) AND as the `filamentdb_nozzle` hint, and re-derived on the
+ * sync-back so a per-nozzle preset is recognized and its calibration routed.
+ * Returns "" for a nozzle with no diameter (caller emits the base preset instead).
+ */
+export function nozzleSuffix(
+  nozzle: { diameter?: number; type?: string; highFlow?: boolean } | null | undefined,
+): string {
+  if (!nozzle || nozzle.diameter == null) return "";
+  return `${nozzle.diameter} ${nozzle.type ?? ""}${nozzle.highFlow ? " HF" : ""}`
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * #872: keys an export BAKES into a per-nozzle suffixed section. They are
+ * nozzle-specific (NOT the base filament's shared identity), so they are
+ * stripped when a round-tripped suffixed section is collapsed back to its base
+ * on bulk import — otherwise one nozzle's baked value would pollute the base
+ * filament's settings bag (and `compatible_printers_condition` would carry one
+ * nozzle's scope). `temperature`/`filament_max_volumetric_speed` are handled
+ * separately (the keys are omitted entirely so an UPDATE can't clobber the base).
+ */
+const PER_NOZZLE_BAKED_SETTING_KEYS = [
+  "extrusion_multiplier",
+  "filament_retract_length",
+  "filament_retract_speed",
+  "filament_retract_lift",
+  "min_fan_speed",
+  "max_fan_speed",
+  "bridge_fan_speed",
+  "temperature",
+  "first_layer_temperature",
+  "bed_temperature",
+  "first_layer_bed_temperature",
+  "filament_max_volumetric_speed",
+  "compatible_printers_condition",
+];
+
+/** Routing hints an export emits; consumed for matching, never stored as data. */
+const IMPORT_ROUTING_HINT_KEYS = ["filamentdb_id", "filamentdb_nozzle"];
+
+/**
+ * A parsed INI section after collapsing. `temperatures`/`maxVolumetricSpeed` are
+ * OPTIONAL because a collapsed per-nozzle section omits them (they were baked
+ * per-nozzle, so an UPDATE must not overwrite the base filament's shared values).
+ */
+export type CollapsedFilamentData = Omit<
+  import("./parseIni").FilamentData,
+  "temperatures" | "maxVolumetricSpeed" | "cost" | "density" | "diameter" | "color" | "vendor" | "type"
+> & {
+  temperatures?: import("./parseIni").FilamentData["temperatures"];
+  maxVolumetricSpeed?: number | null;
+  cost?: number | null;
+  density?: number | null;
+  diameter?: number;
+  color?: string;
+  vendor?: string;
+  type?: string;
+};
+
+/**
+ * #872: collapse Filament DB's OWN per-nozzle suffixed sections back to their
+ * base filament so a bundle round-trip (export → bulk import) UPDATES the
+ * original filament instead of spawning suffixed orphan records ("PLA 0.4 Brass",
+ * "PLA 0.6 Brass"). A section is a per-nozzle export iff it carries a
+ * `filamentdb_nozzle` hint; siblings share one `filamentdb_id`. The collapsed
+ * base drops the nozzle-specific baked keys + routing hints and OMITS temps /
+ * max-vol (so an update can't clobber the base's shared values). The per-nozzle
+ * calibration model is deliberately NOT reconstructed here — snapshot/restore is
+ * the lossless round-trip; this only prevents the orphan-duplication regression.
+ * Non-hinted sections pass through with the routing hints stripped.
+ */
+export function collapsePerNozzleImportSections(
+  filaments: import("./parseIni").FilamentData[],
+): CollapsedFilamentData[] {
+  const out: CollapsedFilamentData[] = [];
+  const seenGroups = new Set<string>();
+  for (const f of filaments) {
+    const hint = (f.settings.filamentdb_nozzle ?? "").trim();
+    if (!hint) {
+      // Pass through, but never persist routing hints as settings data.
+      const settings = { ...f.settings };
+      for (const k of IMPORT_ROUTING_HINT_KEYS) delete settings[k];
+      out.push({ ...f, settings });
+      continue;
+    }
+    // Per-nozzle suffixed section → fold back into its base filament.
+    const baseName = f.name.endsWith(` ${hint}`)
+      ? f.name.slice(0, f.name.length - hint.length - 1).trim()
+      : f.name;
+    const id = (f.settings.filamentdb_id ?? "").trim();
+    const groupKey = id ? `id:${id}` : `name:${baseName.toLowerCase()}`;
+    if (seenGroups.has(groupKey)) continue; // a sibling already represents the base
+    seenGroups.add(groupKey);
+    const settings = { ...f.settings };
+    for (const k of [...PER_NOZZLE_BAKED_SETTING_KEYS, ...IMPORT_ROUTING_HINT_KEYS]) {
+      delete settings[k];
+    }
+    // Drop temperatures + maxVolumetricSpeed (baked per-nozzle): omitting the keys
+    // means the importer's $set never overwrites the base filament's shared values.
+    const { temperatures, maxVolumetricSpeed, cost, density, diameter, color, vendor, type, ...sharedFields } = f;
+    void temperatures;
+    void maxVolumetricSpeed;
+    const collapsed: CollapsedFilamentData = { ...sharedFields, name: baseName, settings };
+    // Carry a shared field ONLY when the suffixed section actually SUPPLIED it (the
+    // source INI key is present) — otherwise parseIni's defaults (null / "#808080" /
+    // 1.75 / "Unknown") would $set over the base filament's real cost/density/color/
+    // diameter/vendor/type on an update (Codex P3). The normal export bakes all of
+    // these from the base, so they still round-trip; only a partial/hand-crafted
+    // section drops them (its fresh-create then fails the required-field validation,
+    // surfaced as a per-row error rather than persisting an "Unknown" record).
+    if ("filament_cost" in f.settings) collapsed.cost = cost;
+    if ("filament_density" in f.settings) collapsed.density = density;
+    if ("filament_diameter" in f.settings) collapsed.diameter = diameter;
+    if ("filament_colour" in f.settings) collapsed.color = color;
+    if ("filament_vendor" in f.settings) collapsed.vendor = vendor;
+    if ("filament_type" in f.settings) collapsed.type = type;
+    out.push(collapsed);
+  }
+  return out;
+}
+
 export function filamentToSlicerKeys(
   filament: FilamentDoc,
+  // #872: when present, BAKE this per-nozzle calibration's filament-level values
+  // into the preset (for a multi-nozzle filament exported as N flat presets, since
+  // PrusaSlicer has no parent/child for user presets). Pressure advance is
+  // printer-scoped and stays dynamic via the /calibration endpoint — not baked.
+  calibration?: FilamentDoc,
 ): Record<string, string | null> {
   // Start with the settings bag as the base — these are passthrough
   // PrusaSlicer keys preserved from a previous import
@@ -124,6 +254,31 @@ export function filamentToSlicerKeys(
   // Inherits (PrusaSlicer preset inheritance)
   if (filament.inherits) {
     keys.inherits = filament.inherits;
+  }
+
+  // #872: bake the per-nozzle calibration's FILAMENT-LEVEL values into this preset
+  // (multi-nozzle export). Only filament-scoped keys are baked; pressure_advance is
+  // a PRINTER setting and stays dynamic via the fork's /calibration endpoint. The
+  // explicit nozzle-diameter condition + filamentdb_nozzle hint scope the preset and
+  // let the sync-back route updates to the right calibration entry.
+  if (calibration) {
+    set("extrusion_multiplier", calibration.extrusionMultiplier);
+    set("filament_max_volumetric_speed", calibration.maxVolumetricSpeed);
+    set("filament_retract_length", calibration.retractLength);
+    set("filament_retract_speed", calibration.retractSpeed);
+    set("filament_retract_lift", calibration.retractLift);
+    set("temperature", calibration.nozzleTemp);
+    set("first_layer_temperature", calibration.nozzleTempFirstLayer);
+    set("bed_temperature", calibration.bedTemp);
+    set("first_layer_bed_temperature", calibration.bedTempFirstLayer);
+    set("min_fan_speed", calibration.fanMinSpeed);
+    set("max_fan_speed", calibration.fanMaxSpeed);
+    set("bridge_fan_speed", calibration.fanBridgeSpeed);
+    const nz = calibration.nozzle;
+    if (nz && typeof nz === "object" && nz.diameter != null) {
+      keys.compatible_printers_condition = `nozzle_diameter[0]==${nz.diameter}`;
+      keys.filamentdb_nozzle = nozzleSuffix(nz);
+    }
   }
 
   // Filaments synced from Filament DB are intended to be usable on every
@@ -231,12 +386,46 @@ export function generatePrusaSlicerBundle(filaments: FilamentDoc[]): string {
   lines.push("");
 
   for (const filament of filaments) {
-    const slicerKeys = filamentToSlicerKeys(filament);
+    // #872: group calibrations by DISTINCT nozzle (diameter + type), preferring the
+    // any-printer/any-bed "default" entry as each nozzle's representative.
+    const byNozzle = new Map<string, FilamentDoc>();
+    for (const cal of Array.isArray(filament.calibrations) ? filament.calibrations : []) {
+      const nz = cal?.nozzle;
+      if (!nz || typeof nz !== "object" || nz.diameter == null) continue;
+      // #872: a standard and a high-flow nozzle of the same Ø+type are DISTINCT
+      // physical nozzles (the sync route disambiguates them via ?high_flow=), so
+      // key on highFlow too — otherwise they'd collapse into one preset.
+      // Case-fold the type in the grouping key so a casing variant ("Brass" vs
+      // "brass") collapses into ONE preset, agreeing with the case-insensitive
+      // type match on the sync-back + /calibration read paths (the human-readable
+      // suffix/hint still uses the representative nozzle's original-cased type).
+      const key = `${nz.diameter}|${(nz.type ?? "").trim().toLowerCase()}|${nz.highFlow ? "HF" : ""}`;
+      const existing = byNozzle.get(key);
+      const isDefault = cal.printer == null && cal.bedType == null;
+      const existingIsDefault =
+        existing && existing.printer == null && existing.bedType == null;
+      if (!existing || (isDefault && !existingIsDefault)) byNozzle.set(key, cal);
+    }
 
-    // Output one preset per filament — nozzle-specific calibration data
-    // is applied dynamically by PrusaSlicer when the printer changes
-    // (via the /api/filaments/{name}/calibration endpoint).
-    writeSection(lines, filament.name, slicerKeys);
+    if (byNozzle.size >= 2) {
+      // Multiple nozzle profiles → one FLAT preset per nozzle, name suffixed with the
+      // nozzle (e.g. "Inslogic PA12-CF 0.4 Diamondback") because PrusaSlicer has no
+      // parent/child for USER filament presets. Each bakes its nozzle's filament-level
+      // calibration; all share one filamentdb_id and carry a filamentdb_nozzle hint
+      // so the sync-back routes updates to the right per-nozzle calibration entry.
+      for (const cal of byNozzle.values()) {
+        writeSection(
+          lines,
+          `${filament.name} ${nozzleSuffix(cal.nozzle)}`,
+          filamentToSlicerKeys(filament, cal),
+        );
+      }
+    } else {
+      // 0 or 1 distinct nozzle → a single preset (unchanged). Any per-nozzle
+      // calibration is applied dynamically by the fork when the printer changes
+      // (GET /api/filaments/{name}/calibration).
+      writeSection(lines, filament.name, filamentToSlicerKeys(filament));
+    }
   }
 
   return lines.join("\n");

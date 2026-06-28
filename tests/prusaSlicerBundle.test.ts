@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   filamentToSlicerKeys,
   generatePrusaSlicerBundle,
+  collapsePerNozzleImportSections,
 } from "@/lib/prusaSlicerBundle";
 import { parseIniFilaments } from "@/lib/parseIni";
 
@@ -494,7 +495,7 @@ describe("generatePrusaSlicerBundle", () => {
     expect(bundle).toContain("fan_always_on = 1");
   });
 
-  it("ignores calibrations (applied dynamically via API)", () => {
+  it("#872: expands a MULTI-nozzle filament into one suffixed preset per nozzle, baking calibration", () => {
     const filaments = [
       {
         name: "PLA",
@@ -506,13 +507,13 @@ describe("generatePrusaSlicerBundle", () => {
         settings: {},
         calibrations: [
           {
-            nozzle: { name: "0.4mm Brass", diameter: 0.4 },
+            nozzle: { name: "0.4 Brass", diameter: 0.4, type: "Brass" },
             printer: { name: "MK3S+" },
             extrusionMultiplier: 0.95,
             retractLength: 0.8,
           },
           {
-            nozzle: { name: "0.6mm Brass", diameter: 0.6 },
+            nozzle: { name: "0.6 Brass", diameter: 0.6, type: "Brass" },
             printer: null,
             maxVolumetricSpeed: 20,
           },
@@ -522,16 +523,76 @@ describe("generatePrusaSlicerBundle", () => {
 
     const bundle = generatePrusaSlicerBundle(filaments);
 
-    // Calibrations are not expanded into separate sections — they are
-    // applied dynamically by PrusaSlicer via the calibration API endpoint.
-    // Only the base filament section should be generated.
-    expect(bundle).toContain("[filament:PLA]");
-    expect(bundle).not.toContain("[filament:PLA MK3S+ 0.4mm Brass]");
-    expect(bundle).not.toContain("[filament:PLA 0.6mm Brass]");
-
-    // Base filament values present
+    // Two distinct nozzles → two flat, suffixed sections (no bare base section).
+    expect(bundle).toContain("[filament:PLA 0.4 Brass]");
+    expect(bundle).toContain("[filament:PLA 0.6 Brass]");
+    expect(bundle).not.toContain("[filament:PLA]");
+    // Each bakes its nozzle's filament-level calibration + a nozzle-scoped condition.
+    expect(bundle).toContain("extrusion_multiplier = 0.95");
+    expect(bundle).toContain("filament_retract_length = 0.8");
+    expect(bundle).toContain("filament_max_volumetric_speed = 20");
+    expect(bundle).toContain("compatible_printers_condition = nozzle_diameter[0]==0.4");
+    expect(bundle).toContain("compatible_printers_condition = nozzle_diameter[0]==0.6");
+    // Nozzle hint for sync-back routing.
+    expect(bundle).toContain("filamentdb_nozzle = 0.4 Brass");
+    // Base filament temps still carried in each preset.
     expect(bundle).toContain("temperature = 210");
-    expect(bundle).toContain("bed_temperature = 60");
+  });
+
+  it("#872: same-diameter nozzles differing only in type CASING collapse into ONE preset", () => {
+    // "Brass" vs "brass" at the same Ø+HF are the same physical nozzle; the
+    // grouping key case-folds the type so they don't split into two presets that
+    // would both resolve to the same calibration on the case-insensitive read/sync.
+    const filaments = [
+      {
+        name: "PLA",
+        vendor: "Generic",
+        type: "PLA",
+        diameter: 1.75,
+        temperatures: { nozzle: 210 },
+        settings: {},
+        calibrations: [
+          { nozzle: { name: "0.4 Brass", diameter: 0.4, type: "Brass" }, printer: null, extrusionMultiplier: 0.95 },
+          { nozzle: { name: "0.4 brass", diameter: 0.4, type: "brass" }, printer: { name: "MK4" }, extrusionMultiplier: 0.97 },
+        ],
+      },
+    ];
+    const bundle = generatePrusaSlicerBundle(filaments);
+    // Only ONE distinct nozzle after case-folding → a single, unsuffixed preset.
+    const sectionCount = (bundle.match(/^\[filament:/gm) || []).length;
+    expect(sectionCount).toBe(1);
+    expect(bundle).toContain("[filament:PLA]");
+    expect(bundle).not.toContain("[filament:PLA 0.4 Brass]");
+  });
+
+  it("#872: a SINGLE-nozzle filament stays one preset (calibration applied dynamically)", () => {
+    const filaments = [
+      {
+        name: "PETG",
+        vendor: "Generic",
+        type: "PETG",
+        color: "#DDDDDD",
+        diameter: 1.75,
+        temperatures: { nozzle: 240 },
+        settings: {},
+        calibrations: [
+          {
+            nozzle: { name: "0.4 Brass", diameter: 0.4, type: "Brass" },
+            printer: null,
+            extrusionMultiplier: 0.98,
+          },
+        ],
+      },
+    ];
+
+    const bundle = generatePrusaSlicerBundle(filaments);
+
+    // One distinct nozzle → single base section, NOT expanded/suffixed.
+    expect(bundle).toContain("[filament:PETG]");
+    expect(bundle).not.toContain("[filament:PETG 0.4 Brass]");
+    // Calibration is NOT baked in the single-nozzle path (stays dynamic).
+    expect(bundle).not.toContain("extrusion_multiplier = 0.98");
+    expect(bundle).not.toContain("filamentdb_nozzle");
   });
 
   it("ignores presets (single section per filament)", () => {
@@ -712,5 +773,108 @@ describe("generatePrusaSlicerBundle", () => {
     expect(p.temperatures.nozzleFirstLayer).toBe(215);
     expect(p.temperatures.bed).toBe(60);
     expect(p.temperatures.bedFirstLayer).toBe(65);
+  });
+});
+
+describe("collapsePerNozzleImportSections (#872)", () => {
+  it("collapses two suffixed sibling sections (shared filamentdb_id) into ONE base", () => {
+    // Build a real multi-nozzle bundle and re-parse it — the exact round-trip.
+    const filaments = [
+      {
+        name: "PLA",
+        vendor: "Generic",
+        type: "PLA",
+        color: "#DDDDDD",
+        diameter: 1.75,
+        _id: "64b000000000000000000001",
+        temperatures: { nozzle: 210, bed: 60 },
+        settings: {},
+        calibrations: [
+          { nozzle: { name: "0.4 Brass", diameter: 0.4, type: "Brass" }, printer: null, extrusionMultiplier: 0.95, nozzleTemp: 205 },
+          { nozzle: { name: "0.6 Brass", diameter: 0.6, type: "Brass" }, printer: null, maxVolumetricSpeed: 20, nozzleTemp: 215 },
+        ],
+      },
+    ];
+    const bundle = generatePrusaSlicerBundle(filaments);
+    const parsed = parseIniFilaments(bundle);
+    expect(parsed).toHaveLength(2); // two suffixed sections before collapsing
+
+    const collapsed = collapsePerNozzleImportSections(parsed);
+    expect(collapsed).toHaveLength(1); // ← folded back into the base
+    const base = collapsed[0];
+    expect(base.name).toBe("PLA"); // de-suffixed
+    // Routing hints + per-nozzle baked keys are stripped from the settings bag.
+    expect(base.settings.filamentdb_id).toBeUndefined();
+    expect(base.settings.filamentdb_nozzle).toBeUndefined();
+    expect(base.settings.extrusion_multiplier).toBeUndefined();
+    expect(base.settings.compatible_printers_condition).toBeUndefined();
+    // temps / max-vol are OMITTED (baked per-nozzle) so an update can't clobber them.
+    expect("temperatures" in base).toBe(false);
+    expect("maxVolumetricSpeed" in base).toBe(false);
+    // Shared identity survives.
+    expect(base.vendor).toBe("Generic");
+    expect(base.type).toBe("PLA");
+  });
+
+  it("passes a non-hinted section through, stripping only the routing hint", () => {
+    const parsed = parseIniFilaments(
+      `[filament:Plain PLA]\nfilament_type = PLA\nfilament_vendor = Acme\ntemperature = 210\nfilamentdb_id = 64b000000000000000000009\n`,
+    );
+    const collapsed = collapsePerNozzleImportSections(parsed);
+    expect(collapsed).toHaveLength(1);
+    const f = collapsed[0];
+    expect(f.name).toBe("Plain PLA"); // unchanged — no filamentdb_nozzle hint
+    expect(f.settings.filamentdb_id).toBeUndefined(); // hint never stored as data
+    expect(f.temperatures?.nozzle).toBe(210); // temps preserved for a single-nozzle import
+  });
+
+  it("groups siblings by de-suffixed name when no filamentdb_id is present", () => {
+    const parsed = parseIniFilaments(
+      `[filament:PLA 0.4 Brass]\nfilament_type = PLA\nfilamentdb_nozzle = 0.4 Brass\nextrusion_multiplier = 0.95\n\n` +
+        `[filament:PLA 0.6 Brass]\nfilament_type = PLA\nfilamentdb_nozzle = 0.6 Brass\nfilament_max_volumetric_speed = 20\n`,
+    );
+    const collapsed = collapsePerNozzleImportSections(parsed);
+    expect(collapsed).toHaveLength(1);
+    expect(collapsed[0].name).toBe("PLA");
+  });
+
+  it("omits a shared scalar a collapsed section did NOT supply (no clobber of base cost/density/color/diameter)", () => {
+    // A hint-only suffixed section that omits filament_cost/density/colour/diameter:
+    // parseIni would default them (null / null / #808080 / 1.75), but the collapse
+    // must DROP the keys so $set can't overwrite the base filament's real values.
+    const parsed = parseIniFilaments(
+      `[filament:PLA 0.4 Brass]\nfilament_type = PLA\nfilament_vendor = Generic\nfilamentdb_nozzle = 0.4 Brass\nfilamentdb_id = 64b000000000000000000002\n`,
+    );
+    const collapsed = collapsePerNozzleImportSections(parsed);
+    expect(collapsed).toHaveLength(1);
+    const base = collapsed[0];
+    expect("cost" in base).toBe(false);
+    expect("density" in base).toBe(false);
+    expect("color" in base).toBe(false);
+    expect("diameter" in base).toBe(false);
+    // Identity that WAS supplied is kept.
+    expect(base.vendor).toBe("Generic");
+    expect(base.type).toBe("PLA");
+  });
+
+  it("omits vendor/type a collapsed section did NOT supply (no clobber of base identity)", () => {
+    // Only the routing hint present — parseIni would default vendor/type to "Unknown".
+    const parsed = parseIniFilaments(
+      `[filament:PLA 0.4 Brass]\nfilamentdb_nozzle = 0.4 Brass\nfilamentdb_id = 64b000000000000000000004\n`,
+    );
+    const base = collapsePerNozzleImportSections(parsed)[0];
+    expect("vendor" in base).toBe(false);
+    expect("type" in base).toBe(false);
+  });
+
+  it("carries a shared scalar a collapsed section DID supply (normal export bakes them from the base)", () => {
+    const parsed = parseIniFilaments(
+      `[filament:PLA 0.4 Brass]\nfilament_type = PLA\nfilament_colour = #112233\nfilament_cost = 25\nfilament_density = 1.24\nfilament_diameter = 1.75\nfilamentdb_nozzle = 0.4 Brass\n`,
+    );
+    const base = collapsePerNozzleImportSections(parsed)[0];
+    expect(base.color).toBe("#112233");
+    expect(base.cost).toBe(25);
+    expect(base.density).toBe(1.24);
+    expect(base.diameter).toBe(1.75);
   });
 });

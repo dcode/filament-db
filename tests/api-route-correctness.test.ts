@@ -565,6 +565,73 @@ describe("API route correctness", () => {
     expect(body.matchedBy).toBe("name");
   });
 
+  it("#872 — a per-nozzle preset sync (filamentdb_nozzle) is NOT a name mismatch and routes calibration to that nozzle", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({
+      name: "PLA",
+      vendor: "X",
+      type: "PLA",
+      compatibleNozzles: [brass._id],
+    });
+    // The export names a multi-nozzle preset "<base> <Ø type>" but carries the
+    // base filamentdb_id — without the hint this would 409 as a name mismatch.
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%200.4%20Brass", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Brass",
+          extrusion_multiplier: "1.05",
+        },
+      }),
+      { params: Promise.resolve({ id: "PLA 0.4 Brass" }) },
+    );
+    expect(res.status).toBe(200); // suffixed name is the EXPECTED per-nozzle export, not a rename
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.name).toBe("PLA"); // base name untouched (no rename from a suffixed preset)
+    expect(fresh.calibrations).toHaveLength(1);
+    expect(fresh.calibrations[0].extrusionMultiplier).toBe(1.05);
+    expect(String(fresh.calibrations[0].nozzle)).toBe(String(brass._id));
+    expect(fresh.settings?.filamentdb_nozzle).toBeUndefined(); // routing hint, not stored
+  });
+
+  it("#872 — a per-nozzle preset disambiguates same-diameter nozzles by type", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const diamond = await Nozzle.create({ name: "0.4 Diamondback", diameter: 0.4, type: "Diamondback" });
+    const f = await Filament.create({
+      name: "PA-CF",
+      vendor: "X",
+      type: "PA",
+      compatibleNozzles: [brass._id, diamond._id],
+    });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PA-CF%200.4%20Diamondback", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Diamondback",
+          extrusion_multiplier: "0.97",
+        },
+      }),
+      { params: Promise.resolve({ id: "PA-CF 0.4 Diamondback" }) },
+    );
+    expect(res.status).toBe(200);
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.calibrations).toHaveLength(1);
+    expect(String(fresh.calibrations[0].nozzle)).toBe(String(diamond._id)); // Diamondback, not Brass
+  });
+
+  it("#872 — a suffixed-LOOKING name WITHOUT a filamentdb_nozzle hint still 409s (suppression is hint-gated)", async () => {
+    const f = await Filament.create({ name: "PLA", vendor: "X", type: "PLA" });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%200.4%20Brass", {
+        // no filamentdb_nozzle → can't prove it's a per-nozzle export → stays a #867 mismatch
+        config: { filamentdb_id: String(f._id), filament_density: "1.24" },
+      }),
+      { params: Promise.resolve({ id: "PLA 0.4 Brass" }) },
+    );
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("name_id_mismatch");
+  });
+
   it("#867 Phase 2 — an ObjectId-URL sync renames the record to the sent body.name", async () => {
     const f = await Filament.create({ name: "Old Name", vendor: "X", type: "PLA" });
     const res = await slicerSync(
@@ -589,6 +656,211 @@ describe("API route correctness", () => {
     );
     expect(res.status).toBe(200);
     expect((await Filament.findById(f._id)).name).toBe("Keeper"); // name is the addressing key — unchanged
+  });
+
+  it("#872 — an id-addressed per-nozzle sync does NOT rename the base filament to the suffixed name", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({
+      name: "PLA",
+      vendor: "X",
+      type: "PLA",
+      compatibleNozzles: [brass._id],
+    });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}`, {
+        name: "PLA 0.4 Brass", // the derived suffixed name — must NOT overwrite the base name
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Brass",
+          extrusion_multiplier: "1.02",
+        },
+      }),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(200);
+    expect((await Filament.findById(f._id)).name).toBe("PLA"); // a filamentdb_nozzle hint suppresses the rename
+  });
+
+  it("#872 — a per-nozzle sync routes max-vol/temps/fan to the CALIBRATION entry, not the filament-wide top level", async () => {
+    const brass = await Nozzle.create({ name: "0.6 Brass", diameter: 0.6, type: "Brass" });
+    const f = await Filament.create({
+      name: "PLA",
+      vendor: "X",
+      type: "PLA",
+      maxVolumetricSpeed: 12, // filament-wide default — must survive
+      temperatures: { nozzle: 210, bed: 60 },
+      compatibleNozzles: [brass._id],
+    });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%200.6%20Brass", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.6 Brass",
+          filament_max_volumetric_speed: "25",
+          temperature: "215",
+          bed_temperature: "65",
+          min_fan_speed: "40",
+          max_fan_speed: "100",
+          extrusion_multiplier: "1.05",
+          filament_retract_length: "1.2",
+        },
+      }),
+      { params: Promise.resolve({ id: "PLA 0.6 Brass" }) },
+    );
+    expect(res.status).toBe(200);
+    const fresh = await Filament.findById(f._id);
+    // Filament-wide values UNTOUCHED — one nozzle's preset must not clobber the default.
+    expect(fresh.maxVolumetricSpeed).toBe(12);
+    expect(fresh.temperatures.nozzle).toBe(210);
+    expect(fresh.temperatures.bed).toBe(60);
+    expect(fresh.settings?.min_fan_speed).toBeUndefined(); // fan didn't leak into the settings bag
+    // Codex P2: EM/retraction were captured into the calibration entry below, so they
+    // must NOT also leak into the shared settings bag (which would make this nozzle's
+    // values the default for the base filament + every other preset).
+    expect(fresh.settings?.extrusion_multiplier).toBeUndefined();
+    expect(fresh.settings?.filament_retract_length).toBeUndefined();
+    // The per-nozzle calibration entry carries them instead.
+    expect(fresh.calibrations).toHaveLength(1);
+    const cal = fresh.calibrations[0];
+    expect(cal.maxVolumetricSpeed).toBe(25);
+    expect(cal.nozzleTemp).toBe(215);
+    expect(cal.bedTemp).toBe(65);
+    expect(cal.fanMinSpeed).toBe(40);
+    expect(cal.fanMaxSpeed).toBe(100);
+    expect(cal.extrusionMultiplier).toBe(1.05);
+    expect(cal.retractLength).toBe(1.2);
+  });
+
+  it("#872 — an id-addressed per-nozzle sync routes calibration via the hint (no nozzle_diameter query) (Codex P2)", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({
+      name: "PLA",
+      vendor: "X",
+      type: "PLA",
+      compatibleNozzles: [brass._id],
+    });
+    const res = await slicerSync(
+      jsonReq(`http://localhost/api/filaments/${f._id}`, {
+        // ObjectId URL (decodedName is the id, not the suffix) + a hint → still per-nozzle
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Brass",
+          extrusion_multiplier: "1.04",
+        },
+      }),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.calibrations).toHaveLength(1);
+    expect(fresh.calibrations[0].extrusionMultiplier).toBe(1.04);
+    expect(String(fresh.calibrations[0].nozzle)).toBe(String(brass._id));
+  });
+
+  it("#872 — a per-nozzle sync with NO resolvable nozzle falls back to the top level (no data loss)", async () => {
+    // A 0.4 Brass exists, but the hint is "0.4 Carbide" — the type filter finds no
+    // match (compatibleNozzles empty + global), so no calibration entry resolves.
+    await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({ name: "PLA", vendor: "X", type: "PLA", maxVolumetricSpeed: 10 });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%200.4%20Carbide", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Carbide",
+          filament_max_volumetric_speed: "20",
+          temperature: "230",
+          extrusion_multiplier: "1.09",
+          filament_retract_length: "1.5",
+        },
+      }),
+      { params: Promise.resolve({ id: "PLA 0.4 Carbide" }) },
+    );
+    expect(res.status).toBe(200);
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.calibrations ?? []).toHaveLength(0); // no nozzle resolved → no calibration entry
+    // The top-level-homed values are NOT lost — they fall back to the filament-wide fields.
+    expect(fresh.maxVolumetricSpeed).toBe(20);
+    expect(fresh.temperatures.nozzle).toBe(230);
+    // Codex P2 round 3: EM/retraction have NO top-level home; for a per-nozzle preset
+    // they must be DROPPED (not leaked into the shared settings bag) even when no
+    // nozzle resolves — else one nozzle's EM becomes the base filament's default.
+    expect(fresh.settings?.extrusion_multiplier).toBeUndefined();
+    expect(fresh.settings?.filament_retract_length).toBeUndefined();
+  });
+
+  it("#872 — a per-nozzle sync with an out-of-range baked calibration value is rejected with 400 (nothing persisted)", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({
+      name: "PLA",
+      vendor: "X",
+      type: "PLA",
+      temperatures: { nozzle: 210 },
+      compatibleNozzles: [brass._id],
+    });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PLA%200.4%20Brass", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Brass",
+          temperature: "900", // schema max for calibration nozzleTemp is 600
+        },
+      }),
+      { params: Promise.resolve({ id: "PLA 0.4 Brass" }) },
+    );
+    expect(res.status).toBe(400);
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.calibrations ?? []).toHaveLength(0); // nothing written
+    expect(fresh.temperatures.nozzle).toBe(210); // top-level untouched too
+  });
+
+  it("#872 — an out-of-range baked FAN value is rejected with 400 (calibration validators fire)", async () => {
+    const brass = await Nozzle.create({ name: "0.4 Brass", diameter: 0.4, type: "Brass" });
+    const f = await Filament.create({
+      name: "PETG",
+      vendor: "X",
+      type: "PETG",
+      compatibleNozzles: [brass._id],
+    });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PETG%200.4%20Brass", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 Brass",
+          max_fan_speed: "150", // schema max for calibration fanMaxSpeed is 100
+        },
+      }),
+      { params: Promise.resolve({ id: "PETG 0.4 Brass" }) },
+    );
+    expect(res.status).toBe(400);
+    expect((await Filament.findById(f._id)).calibrations ?? []).toHaveLength(0);
+  });
+
+  it("#872 — sync-back nozzle-type match is case-INSENSITIVE (symmetric with the read path)", async () => {
+    // Stored nozzle is "Diamondback"; the hint is lowercased "0.4 diamondback"
+    // (a user-edited / case-normalized preset name). The match must still resolve.
+    const diamond = await Nozzle.create({ name: "0.4 DB", diameter: 0.4, type: "Diamondback" });
+    const f = await Filament.create({
+      name: "PA12-CF",
+      vendor: "X",
+      type: "PA12-CF",
+      compatibleNozzles: [diamond._id],
+    });
+    const res = await slicerSync(
+      jsonReq("http://localhost/api/filaments/PA12-CF%200.4%20diamondback", {
+        config: {
+          filamentdb_id: String(f._id),
+          filamentdb_nozzle: "0.4 diamondback", // lowercased type
+          extrusion_multiplier: "1.06",
+        },
+      }),
+      { params: Promise.resolve({ id: "PA12-CF 0.4 diamondback" }) },
+    );
+    expect(res.status).toBe(200);
+    const fresh = await Filament.findById(f._id);
+    expect(fresh.calibrations).toHaveLength(1); // resolved despite the case mismatch
+    expect(String(fresh.calibrations[0].nozzle)).toBe(String(diamond._id));
+    expect(fresh.calibrations[0].extrusionMultiplier).toBe(1.06);
+    expect(fresh.settings?.extrusion_multiplier).toBeUndefined(); // routed, not leaked
   });
 
   it("#867 Phase 2 — an ObjectId-URL rename to a TAKEN name returns 409 name_taken and does NOT rename", async () => {

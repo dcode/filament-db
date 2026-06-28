@@ -8,6 +8,7 @@ import { resolveFilament, hasVariants } from "@/lib/resolveFilament";
 import { errorResponse, errorResponseFromCaught, handleDuplicateKeyError, isDuplicateKeyError, assertActiveRefs } from "@/lib/apiErrorHandler";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { mergeSlicerSettings } from "@/lib/slicerSettings";
+import { escapeRegex } from "@/lib/matchFilament";
 import { assignSpoolToSlot } from "@/lib/spoolSlots";
 import {
   isInvertedNozzleRange,
@@ -472,6 +473,39 @@ export async function POST(
       return errorResponse(`Filament not found: ${decodedName}`, 404);
     }
 
+    // #872: a multi-nozzle filament exports as N flat presets named
+    // "<base> <Ø type [HF]>", all carrying the base filamentdb_id plus a
+    // filamentdb_nozzle hint (e.g. "0.4 Diamondback", "0.4 Brass HF"). Recognize a
+    // per-nozzle preset so (a) its suffixed name isn't read as a rename mismatch
+    // below, and (b) its calibration routes to the matching per-nozzle entry even
+    // without an explicit ?nozzle_diameter= query param (parsed from the hint).
+    const perNozzleHint =
+      typeof config.filamentdb_nozzle === "string" ? config.filamentdb_nozzle.trim() : "";
+    // Recognized for BOTH addressing modes: a name-addressed sync whose URL name is
+    // exactly "<base> <hint>", AND an id-addressed sync (the ObjectId URL) that
+    // carries the hint — the fork's re-stamped per-nozzle preset (Codex P2).
+    const isPerNozzlePreset =
+      perNozzleHint !== "" &&
+      (matchedByUrlObjectId || decodedName === `${filament.name} ${perNozzleHint}`);
+    const hintHighFlow = / HF$/i.test(perNozzleHint);
+    const hintCore = perNozzleHint.replace(/ HF$/i, "").trim();
+    const hintSpace = hintCore.indexOf(" ");
+    const hintDiameter = hintSpace > 0 ? parseFloat(hintCore.slice(0, hintSpace)) : NaN;
+    const hintType = hintSpace > 0 ? hintCore.slice(hintSpace + 1).trim() : "";
+    // #872: the calibration target diameter — the explicit ?nozzle_diameter= query
+    // when present, else the per-nozzle hint's diameter. `routeToCalibration` gates
+    // whether the preset's baked NOZZLE-SPECIFIC keys (max-vol / temps / fan) land
+    // on the matching calibration entry instead of the filament-wide top level
+    // (Codex P1 — otherwise one nozzle's value overwrites the shared default).
+    const nozzleDiameterParam = request.nextUrl.searchParams.get("nozzle_diameter");
+    const nozzleDiameter = nozzleDiameterParam
+      ? parseFloat(nozzleDiameterParam)
+      : isPerNozzlePreset
+        ? hintDiameter
+        : NaN;
+    const routeToCalibration =
+      isPerNozzlePreset && !isNaN(nozzleDiameter) && nozzleDiameter > 0;
+
     // #867 / Codex P1: the config filamentdb_id resolves to a filament whose
     // stored name differs from the preset name in the URL. This is EITHER a
     // renamed preset (id is right) OR a copied/cloned id (a Save-As that kept the
@@ -482,7 +516,9 @@ export async function POST(
     // filament anyway, re-sync addressing it by id (POST /api/filaments/{_id}),
     // which is the authoritative ObjectId form. (matchedByConfigId is only set on
     // a name-addressed config-id match, so ObjectId-URL syncs never reach here.)
-    if (matchedByConfigId && filament.name !== decodedName) {
+    // #872: a recognized per-nozzle preset's suffixed name is EXPECTED, not a
+    // rename — don't treat it as a mismatch.
+    if (matchedByConfigId && filament.name !== decodedName && !isPerNozzlePreset) {
       return NextResponse.json(
         {
           error: "name_id_mismatch",
@@ -508,13 +544,19 @@ export async function POST(
     if (config.filament_density) { const v = parseFloat(config.filament_density); if (!isNaN(v)) update.density = v; }
     if (config.filament_cost) { const v = parseFloat(config.filament_cost); if (!isNaN(v)) update.cost = v; }
     if (config.filament_spool_weight) { const v = parseFloat(config.filament_spool_weight); if (!isNaN(v)) update.spoolWeight = v; }
-    if (config.filament_max_volumetric_speed) { const v = parseFloat(config.filament_max_volumetric_speed); if (!isNaN(v)) update.maxVolumetricSpeed = v; }
+    // #872: when routing to a per-nozzle calibration entry, these baked
+    // nozzle-specific values must NOT also overwrite the filament-wide top level —
+    // they are added to the calibration `calFields` below instead (with a top-level
+    // fallback if no calibration target resolves, so nothing is lost).
+    if (config.filament_max_volumetric_speed && !routeToCalibration) { const v = parseFloat(config.filament_max_volumetric_speed); if (!isNaN(v)) update.maxVolumetricSpeed = v; }
 
     // Temperatures
-    if (config.temperature) { const v = parseInt(config.temperature); if (!isNaN(v)) temps.nozzle = v; }
-    if (config.first_layer_temperature) { const v = parseInt(config.first_layer_temperature); if (!isNaN(v)) temps.nozzleFirstLayer = v; }
-    if (config.bed_temperature) { const v = parseInt(config.bed_temperature); if (!isNaN(v)) temps.bed = v; }
-    if (config.first_layer_bed_temperature) { const v = parseInt(config.first_layer_bed_temperature); if (!isNaN(v)) temps.bedFirstLayer = v; }
+    if (!routeToCalibration) {
+      if (config.temperature) { const v = parseInt(config.temperature); if (!isNaN(v)) temps.nozzle = v; }
+      if (config.first_layer_temperature) { const v = parseInt(config.first_layer_temperature); if (!isNaN(v)) temps.nozzleFirstLayer = v; }
+      if (config.bed_temperature) { const v = parseInt(config.bed_temperature); if (!isNaN(v)) temps.bed = v; }
+      if (config.first_layer_bed_temperature) { const v = parseInt(config.first_layer_bed_temperature); if (!isNaN(v)) temps.bedFirstLayer = v; }
+    }
 
     // Shrinkage
     if (config.filament_shrinkage_compensation_xy) { const v = parseFloat(config.filament_shrinkage_compensation_xy); if (!isNaN(v)) update.shrinkageXY = v; }
@@ -576,12 +618,11 @@ export async function POST(
       | { nozzleId: string; fields: Record<string, number | null> }
       | null = null;
 
-    // Update per-nozzle calibration data when nozzle_diameter is provided.
+    // Update per-nozzle calibration data when a nozzle is resolvable.
     // PrusaSlicer passes ?nozzle_diameter=0.4&high_flow=0|1 so the API
     // knows which calibration entry to update with EM, PA, retraction, etc.
     // The high_flow flag disambiguates e.g. 0.4mm standard vs 0.4mm HF.
-    const nozzleDiameterParam = request.nextUrl.searchParams.get("nozzle_diameter");
-    const nozzleDiameter = nozzleDiameterParam ? parseFloat(nozzleDiameterParam) : NaN;
+    // (`nozzleDiameter` is computed up-front — it also gates `routeToCalibration`.)
     if (!isNaN(nozzleDiameter) && nozzleDiameter > 0) {
       const calFields: Record<string, number | null> = {};
       if (config.extrusion_multiplier) {
@@ -606,6 +647,31 @@ export async function POST(
         calFields.retractLift = v !== null && !isNaN(v) ? v : null;
       }
 
+      // #872: for a per-nozzle preset, the baked nozzle-specific temps / max-vol /
+      // fan belong on THIS calibration entry (they were skipped at the top level
+      // above). The same numeric parse the top-level path used.
+      if (routeToCalibration) {
+        const numFromConfig = (raw: string | undefined) => {
+          if (!raw) return undefined;
+          const v = parseFloat(raw);
+          return isNaN(v) ? undefined : v;
+        };
+        const calMap: Record<string, string> = {
+          filament_max_volumetric_speed: "maxVolumetricSpeed",
+          temperature: "nozzleTemp",
+          first_layer_temperature: "nozzleTempFirstLayer",
+          bed_temperature: "bedTemp",
+          first_layer_bed_temperature: "bedTempFirstLayer",
+          min_fan_speed: "fanMinSpeed",
+          max_fan_speed: "fanMaxSpeed",
+          bridge_fan_speed: "fanBridgeSpeed",
+        };
+        for (const [cfgKey, calKey] of Object.entries(calMap)) {
+          const v = numFromConfig(config[cfgKey]);
+          if (v !== undefined) calFields[calKey] = v;
+        }
+      }
+
       if (Object.keys(calFields).length > 0) {
         // Find the nozzle by diameter (and optionally high_flow) among
         // the effective compatible nozzles (`compatTarget` — the
@@ -621,9 +687,22 @@ export async function POST(
             diameter: nozzleDiameter,
             _deletedAt: null,
           };
-          // Only filter by highFlow when the param is explicitly provided
+          // Only filter by highFlow when the param is explicitly provided, else
+          // fall back to the per-nozzle hint's HF flag (#872). A non-HF hint
+          // matches `{ $ne: true }` (false OR unset) so a legacy nozzle without
+          // the field still resolves; an HF hint requires true.
           if (highFlowParam !== null) {
             nozzleQuery.highFlow = highFlowParam === "1";
+          } else if (isPerNozzlePreset) {
+            nozzleQuery.highFlow = hintHighFlow ? true : { $ne: true };
+          }
+          // #872: disambiguate same-diameter nozzles (e.g. Brass vs Diamondback) by
+          // the type carried in the per-nozzle preset's filamentdb_nozzle hint.
+          // Case-INSENSITIVE (anchored regex) so it agrees with the /calibration
+          // read path's type match — a lowercased/user-edited preset-name hint
+          // (e.g. "0.4 diamondback") must resolve the same nozzle on both sides.
+          if (isPerNozzlePreset && hintType) {
+            nozzleQuery.type = { $regex: `^${escapeRegex(hintType)}$`, $options: "i" };
           }
           const matchingNozzle = await Nozzle.findOne(nozzleQuery).lean();
 
@@ -660,6 +739,15 @@ export async function POST(
           };
           if (highFlowParam !== null) {
             globalQuery.highFlow = highFlowParam === "1";
+          } else if (isPerNozzlePreset) {
+            globalQuery.highFlow = hintHighFlow ? true : { $ne: true };
+          }
+          // #872: the per-nozzle hint's type narrows same-diameter catalog
+          // nozzles, so "0.4 Diamondback" resolves even when both a Brass and a
+          // Diamondback 0.4 exist (the bare-diameter query would punt as >1).
+          // Case-insensitive (anchored regex), symmetric with the read path.
+          if (isPerNozzlePreset && hintType) {
+            globalQuery.type = { $regex: `^${escapeRegex(hintType)}$`, $options: "i" };
           }
           const globalMatches = await Nozzle.find(globalQuery).limit(2).lean();
           if (globalMatches.length === 1) {
@@ -668,6 +756,20 @@ export async function POST(
               fields: calFields,
             };
           }
+        }
+
+        // #872: a per-nozzle preset's baked nozzle-specific values were skipped at
+        // the top level (routeToCalibration) on the assumption they'd land on a
+        // calibration entry. If NO nozzle resolved, don't lose them — write the
+        // top-level-homed ones (max-vol + temps) back to the filament-wide fields.
+        // Fan has no top-level home; it stays in the settings bag (the STRUCTURED_KEYS
+        // fan exclusion below is gated on a resolved calibrationWrite).
+        if (routeToCalibration && !calibrationWrite) {
+          if (calFields.maxVolumetricSpeed != null) update.maxVolumetricSpeed = calFields.maxVolumetricSpeed;
+          if (calFields.nozzleTemp != null) update["temperatures.nozzle"] = calFields.nozzleTemp;
+          if (calFields.nozzleTempFirstLayer != null) update["temperatures.nozzleFirstLayer"] = calFields.nozzleTempFirstLayer;
+          if (calFields.bedTemp != null) update["temperatures.bed"] = calFields.bedTemp;
+          if (calFields.bedTempFirstLayer != null) update["temperatures.bedFirstLayer"] = calFields.bedTempFirstLayer;
         }
       }
     }
@@ -686,7 +788,31 @@ export async function POST(
       // above and re-emitted from the row's _id on export, so never stored in
       // the settings bag (avoids a stale duplicate of the canonical _id).
       "filamentdb_id",
+      // #872: routing hint for a multi-nozzle preset (the "<Ø> <type> [HF]" the
+      // export baked into the preset name) — consumed below to route the
+      // calibration to the right nozzle, never stored.
+      "filamentdb_nozzle",
     ]);
+    // #872: a per-nozzle preset's nozzle-specific keys (fan, AND the EM /
+    // pressure-advance / retraction that `calFields` always pulls in) must NOT
+    // land in the filament-wide settings bag — otherwise one nozzle's value
+    // (e.g. the 0.6 preset's EM/retraction) becomes the shared default for the
+    // base filament and every other preset. Gated on `routeToCalibration` alone
+    // (NOT calibrationWrite): when a nozzle resolved they ride the calibration
+    // entry; when it did NOT, these keys have no top-level home (unlike max-vol /
+    // temps, which the fallback above writes back) so they are simply dropped
+    // rather than allowed to pollute the shared bag (Codex P2 round 3).
+    if (routeToCalibration) {
+      STRUCTURED_KEYS.add("min_fan_speed");
+      STRUCTURED_KEYS.add("max_fan_speed");
+      STRUCTURED_KEYS.add("bridge_fan_speed");
+      STRUCTURED_KEYS.add("extrusion_multiplier");
+      STRUCTURED_KEYS.add("pressure_advance");
+      STRUCTURED_KEYS.add("pressure_advance_value");
+      STRUCTURED_KEYS.add("filament_retract_length");
+      STRUCTURED_KEYS.add("filament_retract_speed");
+      STRUCTURED_KEYS.add("filament_retract_lift");
+    }
     const merge = mergeSlicerSettings(
       (filament.settings as Record<string, unknown>) || {},
       config,
@@ -704,7 +830,11 @@ export async function POST(
     // The NAME-addressed path deliberately never renames (the name is its addressing
     // key, and a body.name there is ignored); only an explicit, user-confirmed
     // id-addressed sync may rename the record.
-    if (matchedByUrlObjectId && typeof body.name === "string") {
+    // #872: a per-nozzle preset's name is the DERIVED "<base> <Ø type>" suffix, never
+    // a user rename — so when the sync carries a filamentdb_nozzle hint, suppress the
+    // rename. Otherwise an id-addressed per-nozzle sync would overwrite the base
+    // filament's name with the suffixed preset name.
+    if (matchedByUrlObjectId && typeof body.name === "string" && perNozzleHint === "") {
       const sentName = body.name.trim();
       if (sentName && sentName !== filament.name) {
         // Refuse if another ACTIVE filament already owns that name. The unique-on-
@@ -728,6 +858,31 @@ export async function POST(
         }
         update.name = sentName;
         filament.name = sentName; // keep the 200 response's matchedName accurate
+      }
+    }
+
+    // #872 (Codex P2): the per-nozzle calibration writes below are atomic
+    // $set/$push updateOne calls that do NOT run schema validators, so a baked
+    // out-of-range value (e.g. temperature=900, max_fan_speed=150) would persist
+    // unchecked — unlike the validated top-level path. Validate the calibration
+    // sub-document UP-FRONT against the schema so an invalid value rejects the
+    // WHOLE sync with 400 and nothing is written (atomic, symmetric with below).
+    if (calibrationWrite) {
+      const probe = new Filament({
+        name: filament.name,
+        vendor: filament.vendor,
+        type: filament.type,
+        calibrations: [
+          { nozzle: calibrationWrite.nozzleId, printer: null, ...calibrationWrite.fields },
+        ],
+      });
+      try {
+        await probe.validate(["calibrations"]);
+      } catch (calValidationErr) {
+        return errorResponseFromCaught(
+          calValidationErr,
+          "PrusaSlicer config contained invalid values",
+        );
       }
     }
 
