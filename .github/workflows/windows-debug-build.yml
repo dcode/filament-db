@@ -14,10 +14,11 @@ on:
       ref:
         description: Branch or ref to build
         required: false
-        default: claude/openprinttag-browse-hang-fix
+        default: claude/openprinttag-extract-timeout-sjhhny
   push:
     branches:
       - claude/openprinttag-browse-hang-fix
+      - claude/openprinttag-extract-timeout-sjhhny
 
 permissions:
   contents: read
