@@ -13,9 +13,18 @@
 
 import { EventEmitter } from "events";
 import pcsclite from "@pokusew/pcsclite";
-import { wrapNdefForTag, parseNdefRecords, isCcByteReadOnly, setCcByteReadOnly } from "./ndef";
+import {
+  wrapNdefForTag,
+  parseNdefRecords,
+  isCcByteReadOnly,
+  setCcByteReadOnly,
+  buildType2Cc,
+  buildMediaNdefRecord,
+  buildNdefMessageTlv,
+} from "./ndef";
 import { type DecodedOpenPrintTag } from "../src/lib/openprinttag-decode";
 import { decodeFromNdefRecords, OPENPRINTTAG_MIME } from "../src/lib/tagCodecs";
+import { OPENTAG3D_MIME } from "../src/lib/opentag3d";
 import { deriveBambuKeys, parseBambuBlocks, bambuToDecodedTag } from "./bambu-tag";
 import {
   classifyNfcError as classifyNfcErrorImpl,
@@ -79,6 +88,68 @@ const DEFAULT_BLOCK_COUNT = 80;
 const NTAG_CC_OFFSET = 12;
 const NTAG_TLV_OFFSET = 16;
 const NTAG_MAX_NDEF_BYTES = 1024;
+// Write/erase extent caps (Codex #927 — bound a corrupt/foreign CC size so a
+// write never runs off the chip / into config-lock pages). NTAG216 (the largest
+// real NTAG) holds 872 NDEF bytes → last user page 221 (< 256, no APDU wrap).
+const NTAG_MAX_NDEF_WRITE_BYTES = 872;
+// When the true chip size is UNKNOWN (GET_VERSION unsupported), bound the
+// hygiene zero-fill to NTAG213's user area (144 bytes) — safe on ANY chip, since
+// even the smallest NTAG's lock/config pages sit above its user area. The fresh
+// CC + empty-NDEF TLV already make the tag blank; the deeper wipe is just hygiene
+// and stale bytes past the TLV terminator are unreachable by NDEF readers.
+const NTAG_CONSERVATIVE_WIPE_BYTES = 144;
+// NXP manufacturer code (ISO/IEC 7816-6). A real NTAG21x's page-0 byte-0 (UID0)
+// is ALWAYS 0x04; it's never 0x00 or 0xE1. Used to tell a genuine Type-2 NTAG
+// apart from an ISO-15693 SLIX2 that the ACS reader also answers FF B0 for
+// (Codex P1, #927 — a blank SLIX2 reads 0x00 here, a formatted one 0xE1).
+const NTAG_NXP_MANUFACTURER_CODE = 0x04;
+
+/**
+ * OpenTag3D write (Layers 2/3): the standard a writer lays down. The renderer
+ * sends the native binary (OPT CBOR for SLIX2, the OpenTag3D fixed-binary image
+ * for NTAG) plus this discriminator so the service knows how to wrap + which
+ * chip to require.
+ */
+export type WriteStandard = "openprinttag" | "opentag3d";
+
+/**
+ * Detection result surfaced to the renderer (`detectTag()` / `nfc-detect-tag`).
+ * `family` is the chip class; `standard` is the data format already on it (null
+ * for a blank/unrecognised tag).
+ */
+export interface TagDetection {
+  family: "ntag" | "slix2" | "bambu" | "unknown";
+  standard: "opentag3d" | "openprinttag" | "bambu" | null;
+  formatted: boolean;
+  readOnly: boolean;
+  /** NDEF-usable byte capacity for an NTAG (CC size, or GET_VERSION for a blank
+   * tag), so the renderer can pick the Core (112B) vs Extended (187B) OpenTag3D
+   * image to fit a small NTAG213. null when unknown / not an NTAG. */
+  ndefCapacity: number | null;
+}
+
+/**
+ * NTAG storage-size byte (GET_VERSION response byte 6) → NDEF-usable bytes
+ * (CC byte-2 × 8). Used ONLY to size a BLANK NTAG when writing its first CC —
+ * a formatted tag's existing CC is trusted instead. An UNKNOWN size byte is
+ * treated as an error (refuse the blank tag) rather than guessing a size that
+ * could drive a write past the end of a smaller chip and corrupt it.
+ *
+ * Values are the NXP NTAG21x datasheet's authoritative storage-size bytes
+ * (§8.3.7): 213 = 0x0F, 215 = 0x11, 216 = 0x13. (The task brief quoted
+ * 0x11/0x13/0x15, which is off by one position vs. real silicon; the datasheet
+ * is the source of truth and the two sets collide on 0x11/0x13, so guessing
+ * both would be unsafe.) NDEF-usable bytes match the hardware-proven
+ * NTAG_NDEF_BYTES map in the dev write CLI: 213→144, 215→496, 216→872.
+ *
+ * GET_VERSION itself is HARDWARE-UNVERIFIED on the ACR1552U via this transport;
+ * an unsupported/odd response sizes nothing and the blank-tag write is refused.
+ */
+const NTAG_GETVERSION_STORAGE_SIZE: Record<number, number> = {
+  0x0f: 144, // NTAG213
+  0x11: 496, // NTAG215
+  0x13: 872, // NTAG216
+};
 
 /** The MLEN byte a healthy SLIX2 tag reports: total memory / 8 =
  * 80 blocks × 4 bytes / 8 = 40. */
@@ -468,10 +539,22 @@ export class NfcService extends EventEmitter {
     );
   }
 
-  private disconnect(): Promise<void> {
+  private disconnect(reset = false): Promise<void> {
     return new Promise((resolve) => {
       if (!this.activeReader) return resolve();
-      this.activeReader.disconnect(this.activeReader.SCARD_LEAVE_CARD, () => resolve());
+      // `reset` re-powers the card on disconnect (SCARD_RESET_CARD). NTAG mutating
+      // ops pass it: the ACR1552U serves Type-2 FF B0 READ BINARY from an internal
+      // card buffer that's only refreshed on card (re)activation, so after an
+      // FF D6 write the NEXT operation's read would otherwise return the STALE
+      // buffer until the tag is physically re-presented (the read-only flag not
+      // clearing, post-write "no record", erase-then-write still read-only — all
+      // observed on hardware). Resetting forces the next connect to re-read the
+      // tag fresh. SLIX2/ISO-15693 (FF FB) is a direct pass-through and never
+      // needs this, so its ops keep SCARD_LEAVE_CARD.
+      const disposition = reset
+        ? this.activeReader.SCARD_RESET_CARD
+        : this.activeReader.SCARD_LEAVE_CARD;
+      this.activeReader.disconnect(disposition, () => resolve());
     });
   }
 
@@ -497,7 +580,10 @@ export class NfcService extends EventEmitter {
 
   // ── Connection-scoped operations ────────────────────────────────
 
-  private async withConnection<T>(fn: (protocol: number) => Promise<T>): Promise<T> {
+  private async withConnection<T>(
+    fn: (protocol: number) => Promise<T>,
+    opts: { resetAfter?: boolean } = {},
+  ): Promise<T> {
     if (this.readers.size === 0) throw new Error("No NFC reader connected");
 
     const protocol = await this.connect();
@@ -514,7 +600,7 @@ export class NfcService extends EventEmitter {
       this.clearLastError();
       return result;
     } finally {
-      try { await this.disconnect(); } catch { /* */ }
+      try { await this.disconnect(opts.resetAfter); } catch { /* */ }
     }
   }
 
@@ -719,42 +805,15 @@ export class NfcService extends EventEmitter {
   }
 
   /**
-   * Read an NFC-Forum Type 2 (NTAG213/215/216) tag carrying an OpenTag3D (or any
-   * registered) NDEF record. Returns:
-   *   - the decoded tag on success,
-   *   - `null` when this isn't a Type-2 tag at all (READ BINARY unsupported, e.g.
-   *     a 15693 tag) OR the CC isn't an NDEF Type-2 CC — so readTag() falls
-   *     through to the ISO-15693 path,
-   *   - throws for a REAL Type-2 tag with blank/unrecognized content, so the
-   *     friendly message surfaces instead of being buried by the 15693 attempt.
+   * Assemble a full NTAG Type-2 image (pages 0–3 head + user pages from page 4)
+   * sized to the CC byte-2 capacity, returning the buffer and the number of
+   * bytes actually read back. Shared by the read path, the read-only OpenTag3D
+   * record check, and the write verify so they agree on assembly.
    */
-  private async readNtagTag(protocol: number): Promise<DecodedOpenPrintTag | null> {
-    let head: Buffer;
-    try {
-      head = await this.readNtagBurst(protocol, 0); // pages 0–3 → CC at byte 12
-    } catch {
-      return null; // READ BINARY not supported here → not an NTAG/Type-2 tag
-    }
-    if (head.length < NTAG_TLV_OFFSET) return null;
-
-    // Safety guard (no hardware needed): if some ACS readers answer FF B0 for a
-    // 15693 SLIX2 storage tag too, byte 0 of what we read is that tag's NFC-Forum
-    // Type 5 CC magic (0xE1) — NOT an NTAG UID (NTAG page 0 byte 0 is the
-    // manufacturer code, never 0xE1). Treat that as "this is really a 15693 tag"
-    // and defer to the proven ISO-15693 OpenPrintTag path rather than
-    // mis-parsing the Type-5 image as Type-2 (which could mis-throw "Blank or
-    // unformatted" on a valid OPT tag). A genuine NTAG falls through to the
-    // Type-2 CC check below.
-    if (head[0] === 0xe1) return null;
-
-    const ccMagic = head[NTAG_CC_OFFSET];
-    if (ccMagic === 0x00) {
-      throw new Error("Blank or unformatted NFC tag (no NDEF data)");
-    }
-    if (ccMagic !== 0xe1) {
-      return null; // readable as Type 2 but no NDEF CC — let other paths try
-    }
-
+  private async assembleNtagImage(
+    protocol: number,
+    head: Buffer,
+  ): Promise<{ data: Buffer; written: number }> {
     const mlen = head[NTAG_CC_OFFSET + 2]; // CC byte 2 = NDEF area size / 8
     const ndefBytes = Math.min(Math.max(0, mlen * 8), NTAG_MAX_NDEF_BYTES);
     const data = Buffer.alloc(NTAG_TLV_OFFSET + ndefBytes);
@@ -778,12 +837,174 @@ export class NfcService extends EventEmitter {
       written += copyLen;
       page += 4;
     }
+    return { data, written };
+  }
+
+  /**
+   * Write one 4-byte page via the PC/SC UPDATE BINARY pseudo-APDU (FF D6),
+   * checking SW=9000. Ported verbatim from scripts/write-opentag3d-tag.ts's
+   * writePage — that exact APDU is HARDWARE-PROVEN on the ACR1552U + NTAG215.
+   *
+   * SAFETY: callers must NEVER target page 2 (the static lock bytes, bytes 2–3)
+   * or the dynamic/config lock pages — those are OTP and permanent. The only
+   * pages this codebase writes are page 3 (the rewritable Type-2 CC) and the
+   * user data region (page 4 onward). See setReadOnlyImpl / writeTagImpl /
+   * formatTagImpl, all of which start at page 3 or 4.
+   */
+  private async writeNtagPage(protocol: number, page: number, four: Buffer): Promise<void> {
+    // SAFETY backstop (Codex #927): the page rides in a SINGLE APDU byte, so a
+    // page >= 256 would silently wrap (e.g. 513 → page 1) and a page < 3 would
+    // hit the UID/static-lock pages (0–2). Refuse anything outside [3, 255] so a
+    // corrupt/foreign CC size can never drive a write into the lock/config area
+    // or wrap to a low page — the OTP-lock invariant holds regardless of caller.
+    if (!Number.isInteger(page) || page < 3 || page > 0xff) {
+      throw new Error(`Refusing unsafe NTAG page write: page ${page} is out of the safe [3,255] range`);
+    }
+    const cmd = Buffer.from([0xff, 0xd6, 0x00, page, 0x04, four[0], four[1], four[2], four[3]]);
+    const resp = await this.transmit(cmd, 10, protocol);
+    if (!this.checkSW(resp)) {
+      throw new Error(`NTAG write page ${page} failed: SW=${resp.toString("hex")}`);
+    }
+  }
+
+  /**
+   * Detect an NFC-Forum Type 2 (NTAG) chip and return its pages-0–3 head (16
+   * bytes; the Type-2 CC is at byte 12). Returns null when the tag is NOT a
+   * Type-2 NTAG — i.e. READ BINARY (FF B0) throws (most 15693 SLIX2 tags), the
+   * burst is short, or page-0 byte-0 is not the NXP manufacturer code (0x04).
+   * Some ACS readers ALSO answer FF B0 for an ISO-15693 SLIX2, returning its
+   * block 0 — which starts with 0xE1 on a FORMATTED OpenPrintTag (the NFC-Forum
+   * Type 5 CC magic) or 0x00 on a BLANK one. A real NTAG21x's page-0 byte-0 is
+   * the UID manufacturer code (always 0x04, never 0x00/0xE1), so requiring it is
+   * the robust discriminator: it defers BOTH SLIX2 states to the proven 15693
+   * path. Codex P1 (#927): the old `=== 0xE1`-only guard let a BLANK SLIX2 (0x00)
+   * through as a "blank NTAG", so OpenPrintTag write/erase took the NTAG path and
+   * failed (NTAG_SIZE_UNKNOWN / Type-2 page writes) instead of formatting it.
+   * Mirrors readNtagTag's head-validation logic so detection and read agree.
+   *
+   * Non-null ⇒ NTAG (Type 2); null ⇒ SLIX2 (Type 5) / not Type 2.
+   */
+  private async detectType2Head(protocol: number): Promise<Buffer | null> {
+    let head: Buffer;
+    try {
+      head = await this.readNtagBurst(protocol, 0);
+    } catch {
+      return null; // READ BINARY not supported → not a Type-2 NTAG
+    }
+    if (head.length < NTAG_TLV_OFFSET) return null;
+    // Require the NXP manufacturer byte — a 15693 SLIX2 answering FF B0 has 0xE1
+    // (formatted) or 0x00 (blank) here, neither of which is a real NTAG UID.
+    if (head[0] !== NTAG_NXP_MANUFACTURER_CODE) return null;
+    return head;
+  }
+
+  /**
+   * Size a BLANK NTAG (no CC) via the GET_VERSION command so we can write a
+   * correctly-sized Type-2 CC. GET_VERSION is ISO 14443A `60h`; on the ACR1552U
+   * it's issued as a pass-through APDU. Returns the NDEF-usable byte count for a
+   * recognised storage-size byte, else null — in which case the caller MUST
+   * refuse the blank tag (per the locked decision: never guess the size).
+   *
+   * HARDWARE-UNVERIFIED on this reader/transport — implemented to spec; the null
+   * path keeps a wrong guess from ever corrupting a smaller chip.
+   */
+  private async getNtagNdefBytesViaGetVersion(protocol: number): Promise<number | null> {
+    let resp: Buffer;
+    try {
+      // FF 00 00 00 02 60 00 — InCommunicateThru-style pass-through carrying the
+      // ISO14443A GET_VERSION (0x60) command, mirroring the FF FB / FF B0
+      // pseudo-APDU convention this reader uses for the other transports.
+      const cmd = Buffer.from([0xff, 0x00, 0x00, 0x00, 0x02, 0x60, 0x00]);
+      resp = await this.transmit(cmd, 16, protocol);
+    } catch {
+      return null;
+    }
+    // GET_VERSION returns 8 bytes (+ SW). The storage-size byte is byte 6 of the
+    // version data. Be lenient about trailing SW — only trust a well-formed,
+    // recognised response.
+    const data = this.checkSW(resp) ? resp.subarray(0, resp.length - 2) : resp;
+    if (data.length < 7) return null;
+    const storageByte = data[6];
+    return NTAG_GETVERSION_STORAGE_SIZE[storageByte] ?? null;
+  }
+
+  /**
+   * Resolve the SAFE NDEF byte capacity of a FORMATTED NTAG for write/size
+   * decisions (Codex P1, #927). GET_VERSION (`verSize`) is authoritative when
+   * available — take the smaller of it and the CC-claimed size. When GET_VERSION
+   * is UNAVAILABLE we must NOT trust a possibly-inflated CC: a corrupt CC claiming
+   * 215/216 on a real NTAG213 would let an Extended write run past the 213's user
+   * area into its lock/config pages — a brick the writeNtagPage [3,255] guard
+   * can't catch, since those pages sit INSIDE that range on a small chip. So fall
+   * back to the conservative NTAG213 extent (144 B), safe on ANY NTAG. Real
+   * 215/216 tags then degrade to Core-only writes when GET_VERSION is unsupported
+   * (the renderer surfaces the opentag3dCoreOnly notice) rather than risking a
+   * brick. In practice GET_VERSION works on the ACR1552U (a blank-NTAG write
+   * requires it), so this conservative branch is the rare edge case.
+   */
+  private safeNtagNdefBytes(ccByte2: number, verSize: number | null): number {
+    const ccBytes = Math.min(Math.max(0, ccByte2 * 8), NTAG_MAX_NDEF_WRITE_BYTES);
+    return verSize != null
+      ? Math.min(ccBytes, verSize)
+      : Math.min(ccBytes, NTAG_CONSERVATIVE_WIPE_BYTES);
+  }
+
+  /**
+   * Read an NFC-Forum Type 2 (NTAG213/215/216) tag carrying an OpenTag3D (or any
+   * registered) NDEF record. Returns:
+   *   - the decoded tag on success,
+   *   - `null` when this isn't a Type-2 tag at all (READ BINARY unsupported, e.g.
+   *     a 15693 tag) OR the CC isn't an NDEF Type-2 CC — so readTag() falls
+   *     through to the ISO-15693 path,
+   *   - throws for a REAL Type-2 tag with blank/unrecognized content, so the
+   *     friendly message surfaces instead of being buried by the 15693 attempt.
+   */
+  private async readNtagTag(protocol: number): Promise<DecodedOpenPrintTag | null> {
+    let head: Buffer;
+    try {
+      head = await this.readNtagBurst(protocol, 0); // pages 0–3 → CC at byte 12
+    } catch {
+      return null; // READ BINARY not supported here → not an NTAG/Type-2 tag
+    }
+    if (head.length < NTAG_TLV_OFFSET) return null;
+
+    // Safety guard (no hardware needed): some ACS readers answer FF B0 for a
+    // 15693 SLIX2 storage tag too, returning its block 0 — which is the NFC-Forum
+    // Type 5 CC magic (0xE1) on a formatted OpenPrintTag, or 0x00 on a blank one.
+    // A real NTAG21x's page-0 byte-0 is the NXP manufacturer code (always 0x04,
+    // never 0x00/0xE1). Require it so BOTH SLIX2 states defer to the proven
+    // ISO-15693 path rather than being mis-parsed as Type-2 (Codex P1, #927 —
+    // mirrors detectType2Head). A genuine NTAG falls through to the CC check.
+    if (head[0] !== NTAG_NXP_MANUFACTURER_CODE) return null;
+
+    const ccMagic = head[NTAG_CC_OFFSET];
+    if (ccMagic === 0x00) {
+      throw new Error("Blank or unformatted NFC tag (no NDEF data)");
+    }
+    if (ccMagic !== 0xe1) {
+      return null; // readable as Type 2 but no NDEF CC — let other paths try
+    }
+
+    const { data, written } = await this.assembleNtagImage(protocol, head);
 
     const records = parseNdefRecords(data.subarray(0, written), NTAG_CC_OFFSET);
+    // An NDEF-formatted tag with an EMPTY message (our Erase writes the empty TLV
+    // 03 00 FE at page 4 → zero records) is BLANK, not a foreign tag. Report it as
+    // blank so the renderer's write-probe (ensureTagWritable) takes its blank-
+    // bypass and a write to a freshly-erased tag proceeds without an overwrite
+    // prompt / weight-update fail-closed (Codex #927). A non-empty record list
+    // that just isn't OpenTag3D is the genuine "foreign NDEF" case below.
+    if (records.length === 0) {
+      throw new Error("Blank or unformatted NFC tag (no NDEF data)");
+    }
     const decoded = decodeFromNdefRecords(records);
     if (!decoded) {
       throw new Error('No NDEF record with type "application/opentag3d" found');
     }
+    // NTAG read-only is NOT surfaced: the Type-2 CC page is OTP (the read-only
+    // nibble can be set but never cleared), so it isn't a meaningful reversible
+    // state and we don't act on it (see setReadOnlyImpl / writeNtagImpl). Leaving
+    // readOnly unset avoids a lock badge the user could never clear.
     return decoded;
   }
 
@@ -829,11 +1050,55 @@ export class NfcService extends EventEmitter {
     });
   }
 
-  async writeTag(cborPayload: Uint8Array, productUrl?: string, signal?: AbortSignal): Promise<void> {
-    return this.runExclusive(() => this.writeTagImpl(cborPayload, productUrl), signal); // GH #903/#915
+  /**
+   * Write a tag, dispatching by `standard` and the chip detected in the field.
+   * `payload` is the standard's NATIVE binary — OpenPrintTag CBOR (SLIX2) or the
+   * OpenTag3D fixed-binary image (NTAG). The service wraps + lays it down per
+   * transport. Throws TAG_TYPE_MISMATCH when the requested standard doesn't
+   * match the chip present, so the wrong format can't be written.
+   */
+  async writeTag(
+    payload: Uint8Array,
+    opts: { standard?: WriteStandard; productUrl?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<void> {
+    return this.runExclusive(() => this.writeTagImpl(payload, opts), signal); // GH #903/#915
   }
 
-  private async writeTagImpl(cborPayload: Uint8Array, productUrl?: string): Promise<void> {
+  private async writeTagImpl(
+    payload: Uint8Array,
+    opts: { standard?: WriteStandard; productUrl?: string } = {},
+  ): Promise<void> {
+    const standard: WriteStandard = opts.standard ?? "openprinttag";
+
+    // Detect the chip in its own connection (a probe burst), then dispatch. A
+    // fresh connection for the actual write avoids a stale reader state.
+    const head = await this.withConnection((protocol) => this.detectType2Head(protocol));
+
+    if (standard === "opentag3d") {
+      if (!head) {
+        throw new Error(
+          "TAG_TYPE_MISMATCH: This is not an NTAG/Type-2 tag, but an OpenTag3D write needs one. " +
+            "Place an NTAG (213/215/216) on the reader.",
+        );
+      }
+      return this.writeNtagImpl(payload);
+    }
+
+    // standard === "openprinttag" — require SLIX2 (not an NTAG).
+    if (head) {
+      throw new Error(
+        "TAG_TYPE_MISMATCH: This is an NTAG/Type-2 tag, but an OpenPrintTag write needs an ISO-15693 (SLIX2) tag. " +
+          "Place a SLIX2 tag on the reader.",
+      );
+    }
+    return this.writeSlix2Impl(payload, opts.productUrl);
+  }
+
+  /** EXISTING SLIX2 (OpenPrintTag) write — byte-for-byte unchanged from the
+   *  original writeTagImpl body; only extracted into its own method so the
+   *  dispatch above can pick it. */
+  private async writeSlix2Impl(cborPayload: Uint8Array, productUrl?: string): Promise<void> {
     return this.withConnection(async (protocol) => {
       const block0 = await this.readBlock(protocol, 0);
       // GH #437: refuse to overwrite a tag that doesn't carry an NFC-
@@ -908,6 +1173,154 @@ export class NfcService extends EventEmitter {
     });
   }
 
+  /**
+   * OpenTag3D write (Layer 2/3): lay an OpenTag3D fixed-binary image down on an
+   * NTAG via the Type-2 transport. `payload` is the raw OpenTag3D memory map; we
+   * wrap it as one `application/opentag3d` media record inside an NDEF-message
+   * TLV (mirrors the dev write CLI + wrapOpenTag3DType2).
+   *
+   * SAFETY INVARIANT: the ONLY pages written here are page 3 (the rewritable
+   * Type-2 CC) and page 4 onward (user data). The NTAG static lock bytes
+   * (page 2, bytes 2–3) and the dynamic lock bytes are NEVER touched — they are
+   * OTP/permanent and writing them would brick the tag. Read-only is the
+   * reversible CC byte-3 nibble only (setReadOnlyImpl).
+   *
+   * `head` is the detected pages-0–3 burst from detectType2Head (CC at byte 12).
+   */
+  private async writeNtagImpl(payload: Uint8Array): Promise<void> {
+    // NOTE: await (not return) — the verify phase below MUST run after this.
+    await this.withConnection(async (protocol) => {
+      // Re-read pages 0–3 in THIS mutating connection (Codex P2 #927). The probe's
+      // head came from a SEPARATE connection in writeTagImpl, so a tag swapped
+      // after the probe would have the #437 guard + capacity applied to the
+      // PREVIOUS tag while the page writes hit the new one. Deriving ccMagic +
+      // capacity from a fresh in-connection read keeps check-and-write atomic; a
+      // tag that's no longer an NTAG aborts here instead of being clobbered.
+      const head = await this.detectType2Head(protocol);
+      if (!head) {
+        throw new Error(
+          "TAG_TYPE_MISMATCH: The tag on the reader is no longer an NTAG/Type-2 tag. " +
+            "Keep the tag still and try again.",
+        );
+      }
+      const ccMagic = head[NTAG_CC_OFFSET];
+
+      // GH #437 parity for NTAG (Codex P2 #927): refuse to overwrite a tag whose
+      // page-3 CC byte is neither an NFC-Forum Type-2 CC (0xE1) nor blank (0x00).
+      // The byte-0 NXP guard in detectType2Head only proves it's an NXP Type-2
+      // chip — it could still be a proprietary / non-NDEF NTAG (inventory, access
+      // badge, custom app) whose data we'd clobber by formatting over it. Only an
+      // NDEF tag (0xE1 — overwritten on explicit/confirmed Write) or a genuinely
+      // blank one (0x00) is ours to write. Mirrors writeSlix2Impl's guard.
+      if (ccMagic !== 0xe1 && ccMagic !== 0x00) {
+        throw new Error(
+          "Tag refuses NFC-Forum write (page 3 CC is neither 0xE1 nor blank 0x00). " +
+            "This looks like a non-NDEF formatted NTAG — remove and replace with a blank or NDEF-formatted tag.",
+        );
+      }
+
+      // NTAG FAMILY CONFIRMATION + authoritative size (Codex P2 #927). GET_VERSION
+      // succeeds on NTAG21x but NOT on MIFARE Classic — which shares the FF B0 read
+      // APDU and can carry an NXP 0x04 UID, so the byte-0 guard alone can't exclude
+      // a non-Bambu Classic card (a coincidental 0xE1/0x00 byte-12 would otherwise
+      // reach the page writes below and clobber Classic blocks / access bits). Fail
+      // CLOSED when GET_VERSION can't confirm: never mutate a card we can't prove is
+      // an NTAG. GET_VERSION works on the ACR1552U in practice (a blank-NTAG write
+      // already required it), so this is the rare edge case.
+      const verSize = await this.getNtagNdefBytesViaGetVersion(protocol);
+      if (verSize == null) {
+        throw new Error(
+          "NTAG_SIZE_UNKNOWN: Couldn't confirm an NTAG (213/215/216) on the reader — refusing to write. " +
+            "The reader didn't return a recognized NTAG GET_VERSION response.",
+        );
+      }
+
+      // NOTE: we deliberately do NOT pre-refuse on the Type-2 CC read-only nibble
+      // (CC byte 3). On NTAG21x the CC page is OTP — a set bit can't be cleared
+      // (hardware-confirmed), so it's not a reversible signal and honoring it would
+      // permanently lock a tag out of our own write path. A GENUINELY locked NTAG
+      // (its static lock bytes set, which WE never set) just fails the page write
+      // below with an SW error. NTAG "set read-only" is unsupported for this reason.
+      let ndefBytes: number;
+      let needsFormat = false;
+      if (ccMagic === 0xe1) {
+        // Formatted: bound the payload by min(CC, verSize) via safeNtagNdefBytes so
+        // a corrupt/inflated CC (a real 213 claiming 215/216) can't drive an
+        // Extended TLV past the chip's user area into its lock/config pages (the
+        // [3,255] page guard can't catch that, since config sits in that range on a
+        // small chip).
+        ndefBytes = this.safeNtagNdefBytes(head[NTAG_CC_OFFSET + 2], verSize);
+      } else {
+        // Blank NTAG (CC magic 0x00 — the guard above ruled out every other
+        // non-0xE1 value): size from the verified GET_VERSION value; the fresh CC is
+        // written below, AFTER the capacity check.
+        ndefBytes = verSize;
+        needsFormat = true; // CC written below — AFTER the capacity check (Codex #927)
+      }
+
+      // Build the NDEF-message TLV (0x03 … one media record … 0xFE terminator)
+      // and capacity-check it BEFORE writing anything, so a too-large payload
+      // can't leave a blank tag half-formatted (CC written, no NDEF) — a partial
+      // mutation that detection/retries would then see as a malformed tag.
+      const tlv = buildNdefMessageTlv(buildMediaNdefRecord(OPENTAG3D_MIME, payload));
+      if (tlv.length > ndefBytes) {
+        throw new Error(
+          `TAG_TOO_SMALL: OpenTag3D data (${tlv.length} bytes) exceeds this NTAG's NDEF capacity ` +
+            `(${ndefBytes} bytes). Use a larger NTAG (215/216).`,
+        );
+      }
+
+      // Format a blank tag only now that the payload is known to fit.
+      if (needsFormat) {
+        await this.writeNtagPage(protocol, 3, Buffer.from(buildType2Cc(ndefBytes)));
+      }
+
+      // Write the TLV from page 4, 4 bytes per page (FF D6 UPDATE BINARY).
+      const tlvBuf = Buffer.from(tlv);
+      const numPages = Math.ceil(tlvBuf.length / 4);
+      for (let i = 0; i < numPages; i++) {
+        const page = 4 + i;
+        const chunk = Buffer.alloc(4);
+        tlvBuf.copy(chunk, 0, i * 4, Math.min((i + 1) * 4, tlvBuf.length));
+        await this.writeNtagPage(protocol, page, chunk);
+
+        // EEPROM programming delay between pages (matches the SLIX2 path).
+        if (i < numPages - 1) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+
+        this.emit("writeProgress", {
+          block: i, total: numPages,
+          percent: Math.round(((i + 1) / numPages) * 100),
+        });
+      }
+
+    }, { resetAfter: true });
+
+    // Verify in a FRESH connection (Codex #927 P1). The resetAfter above means
+    // this connect RE-ACTIVATES the card, so the read-back can't return the
+    // ACR1552U's stale pre-write READ BINARY buffer and falsely fail a write that
+    // actually landed. Reading page 0–3 fresh also picks up the just-written CC
+    // (no need to patch a stale detection head). A mismatch here is therefore a
+    // REAL failure. (The per-page FF D6 SW=9000 already confirmed each write; this
+    // byte-exact check guards against a valid-but-WRONG read-back.)
+    await this.withConnection(async (protocol) => {
+      const vhead = await this.readNtagBurst(protocol, 0);
+      const { data: image, written } = await this.assembleNtagImage(protocol, vhead);
+      const records = parseNdefRecords(image.subarray(0, written), NTAG_CC_OFFSET);
+      const rec = records.find((r) => r.tnf === 0x02 && r.type === OPENTAG3D_MIME);
+      if (!rec) {
+        throw new Error("OpenTag3D verification read failed — the tag did not read back as OpenTag3D.");
+      }
+      if (rec.payload.length !== payload.length || rec.payload.some((b, i) => b !== payload[i])) {
+        throw new Error(
+          "OpenTag3D verification mismatch — the tag read back different bytes than were written. " +
+            "The write may not have landed correctly; try again.",
+        );
+      }
+    }, { resetAfter: true });
+  }
+
   async formatTag(signal?: AbortSignal): Promise<void> {
     return this.runExclusive(() => this.formatTagImpl(), signal); // GH #903/#915
   }
@@ -929,6 +1342,15 @@ export class NfcService extends EventEmitter {
       throw new Error(
         "BAMBU_READ_ONLY: Bambu Lab tags are RSA-signed and read-only — they cannot be erased.",
       );
+    }
+
+    // OpenTag3D write (Layer 2/3): detect the chip and dispatch. NTAG → the
+    // Type-2 erase below; SLIX2 (head === null) → the existing ISO-15693 erase.
+    // This probe only picks the path; formatNtagImpl re-reads in its own mutating
+    // connection so the guards apply to the tag actually present (Codex P2 #927).
+    const head = await this.withConnection((protocol) => this.detectType2Head(protocol));
+    if (head) {
+      return this.formatNtagImpl();
     }
 
     return this.withConnection(async (protocol) => {
@@ -987,6 +1409,94 @@ export class NfcService extends EventEmitter {
   }
 
   /**
+   * OpenTag3D write (Layer 2/3): erase an NTAG (Type 2). Writes a fresh
+   * read/write Type-2 CC to page 3 (which also CLEARS the reversible soft
+   * read-only nibble — the escape hatch), an empty-NDEF TLV (03 00 FE 00) at
+   * page 4, and zeroes the remaining user pages up to capacity.
+   *
+   * SAFETY INVARIANT: only page 3 (CC) and page 4+ (user data) are written. The
+   * static lock bytes (page 2) and dynamic lock bytes are NEVER touched.
+   *
+   * Capacity: a formatted NTAG's existing CC byte-2 gives the size; a blank one
+   * is sized via GET_VERSION (refused if unknown — never guess).
+   */
+  private async formatNtagImpl(): Promise<void> {
+    return this.withConnection(async (protocol) => {
+      // Re-read pages 0–3 in THIS mutating connection (Codex P2 #927): the probe's
+      // head came from a separate connection in formatTagImpl, so a tag swapped
+      // after the probe would apply the guards to the previous tag while the writes
+      // hit the new one. A tag that's no longer an NTAG aborts here.
+      const head = await this.detectType2Head(protocol);
+      if (!head) {
+        throw new Error(
+          "TAG_TYPE_MISMATCH: The tag on the reader is no longer an NTAG/Type-2 tag. " +
+            "Keep the tag still and try again.",
+        );
+      }
+      const ccMagic = head[NTAG_CC_OFFSET];
+      // GH #437 parity for NTAG (Codex P2 #927): refuse to reformat a tag whose
+      // page-3 CC byte is neither an NFC-Forum Type-2 CC (0xE1) nor blank (0x00).
+      // The byte-0 NXP guard only proves it's an NXP Type-2 chip — it could still
+      // be a proprietary / non-NDEF NTAG whose data Erase would clobber by writing
+      // a fresh CC + TLV over it. Mirrors the SLIX2 erase/write guard.
+      if (ccMagic !== 0xe1 && ccMagic !== 0x00) {
+        throw new Error(
+          "Tag refuses NFC-Forum format (page 3 CC is neither 0xE1 nor blank 0x00). " +
+            "This looks like a non-NDEF formatted NTAG — remove and replace with a blank or NDEF-formatted tag.",
+        );
+      }
+      // NTAG FAMILY CONFIRMATION + authoritative size (Codex P2 #927). GET_VERSION
+      // succeeds on NTAG21x but NOT on MIFARE Classic — which shares the FF B0 read
+      // APDU and can carry an NXP 0x04 UID with a coincidental 0xE1/0x00 byte-12, so
+      // the byte-0 guard alone can't exclude it. Fail CLOSED when GET_VERSION can't
+      // confirm: never run the page 3/4 writes against a card we can't prove is an
+      // NTAG (they'd clobber Classic blocks / access bits). Erase REFORMATS, so it
+      // uses the verified size DIRECTLY (no min() with the existing CC) for both the
+      // rewritten CC and the zero-fill — restoring a tag previously mis-formatted
+      // small (a real 215/216 formatted as a 213, or a corrupt/zero MLEN) to its
+      // true size, while still replacing a LYING inflated CC with the real value
+      // (the size is GET_VERSION's, never the old CC's). GET_VERSION works on the
+      // ACR1552U in practice, so this is the rare edge case.
+      const verSize = await this.getNtagNdefBytesViaGetVersion(protocol);
+      if (verSize == null) {
+        throw new Error(
+          "NTAG_SIZE_UNKNOWN: Couldn't confirm an NTAG (213/215/216) on the reader — refusing to erase. " +
+            "The reader didn't return a recognized NTAG GET_VERSION response.",
+        );
+      }
+      // Verified physical capacity drives BOTH the rewritten CC and the zero-fill.
+      const wipeBytes = verSize;
+      const ndefBytes = verSize; // size written into the CC
+
+      // Fresh read/write CC to page 3 — clears any soft read-only nibble.
+      await this.writeNtagPage(protocol, 3, Buffer.from(buildType2Cc(ndefBytes)));
+
+      // Empty-NDEF-message TLV at page 4: 03 00 FE 00 (tag, len=0, terminator).
+      await this.writeNtagPage(protocol, 4, Buffer.from([0x03, 0x00, 0xfe, 0x00]));
+
+      // Zero the remaining user pages up to the SAFE wipe bound (page 5 onward).
+      const lastUserPage = 4 + Math.ceil(wipeBytes / 4) - 1;
+      const zeroes = Buffer.alloc(4);
+      const totalPages = Math.max(0, lastUserPage - 5 + 1);
+      for (let page = 5, n = 0; page <= lastUserPage; page++, n++) {
+        try {
+          await this.writeNtagPage(protocol, page, zeroes);
+        } catch {
+          break; // past writable user memory
+        }
+        if (page < lastUserPage) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        this.emit("writeProgress", {
+          block: n,
+          total: totalPages,
+          percent: totalPages > 0 ? Math.round(((n + 1) / totalPages) * 100) : 100,
+        });
+      }
+    }, { resetAfter: true });
+  }
+
+  /**
    * GH #583: set (or clear) the soft read-only flag on an OpenPrintTag by
    * flipping the NFC-Forum Type 5 CC byte-1 write-access bits and rewriting
    * block 0. Reversible — `setReadOnly(false)` clears it without touching the
@@ -1010,6 +1520,21 @@ export class NfcService extends EventEmitter {
     }
     if (bambu) {
       throw new Error("BAMBU_READ_ONLY: Bambu Lab tags are already read-only.");
+    }
+
+    // Detect the chip and dispatch. NTAG read-only is NOT supported: the Type-2
+    // CC page is OTP (the read-only nibble can be set but never cleared — so it
+    // is irreversible and would permanently lock the tag out of our write path).
+    // True NTAG read-only would need the static lock bytes, which are also OTP /
+    // bricking and which we never write. So refuse for NTAG; SLIX2 (head === null)
+    // takes the genuinely-reversible CC byte-1 path below.
+    const head = await this.withConnection((protocol) => this.detectType2Head(protocol));
+    if (head) {
+      throw new Error(
+        "NTAG_READONLY_UNSUPPORTED: Read-only isn't available for OpenTag3D/NTAG tags — " +
+          "their capability container is one-time-programmable, so it can't be undone. " +
+          "Read-only is supported on OpenPrintTag (SLIX2) tags only.",
+      );
     }
 
     return this.withConnection(async (protocol) => {
@@ -1061,6 +1586,131 @@ export class NfcService extends EventEmitter {
       const cc = Buffer.from([block0[0], newByte1, block0[2], block0[3]]);
       await this.writeBlock(protocol, 0, cc);
     });
+  }
+
+
+  /**
+   * OpenTag3D write (Layer 3): non-mutating probe of the tag in the field for the
+   * renderer — which standard to encode + whether it's locked. Bambu (MIFARE
+   * auth) → NTAG (FF B0; CC magic 0xE1 ⇒ formatted opentag3d, 0x00 ⇒ blank ntag)
+   * → SLIX2 (block 0 CC ⇒ openprinttag).
+   */
+  async detectTag(signal?: AbortSignal): Promise<TagDetection> {
+    return this.runExclusive(() => this.detectTagImpl(), signal);
+  }
+
+  private async detectTagImpl(): Promise<TagDetection> {
+    // 1. Bambu (MIFARE Classic) — its own connection (failed auth leaves a stale
+    //    state for the next transport).
+    let bambu = false;
+    try {
+      bambu = await this.withConnection((protocol) => this.isBambuTag(protocol));
+    } catch {
+      bambu = false;
+    }
+    if (bambu) {
+      return { family: "bambu", standard: "bambu", formatted: true, readOnly: true, ndefCapacity: null };
+    }
+
+    // 2. NTAG (Type 2).
+    const head = await this.withConnection((protocol) => this.detectType2Head(protocol));
+    if (head) {
+      const ccMagic = head[NTAG_CC_OFFSET];
+      if (ccMagic === 0xe1) {
+        // Parse the actual NDEF records (Codex P3 #927) — don't claim "opentag3d"
+        // from the CC byte alone, which would misreport an EMPTY/erased tag (our
+        // Erase writes 03 00 FE → 0 records) and a FOREIGN NDEF tag (URL/contact)
+        // as existing OpenTag3D. Mirrors readNtagTag: 0 records ⇒ blank, an
+        // opentag3d record ⇒ opentag3d, any other record(s) ⇒ foreign NDEF
+        // (formatted but standard null). One connection so size + read-back agree.
+        // Capacity reporting stays via safeNtagNdefBytes (Codex P1): GET_VERSION
+        // when available (smaller of it and the CC) else the conservative NTAG213
+        // extent, so the renderer's Core/Extended choice matches the write's bound.
+        return await this.withConnection(async (protocol) => {
+          const verSize = await this.getNtagNdefBytesViaGetVersion(protocol);
+          const ndefCapacity = this.safeNtagNdefBytes(head[NTAG_CC_OFFSET + 2], verSize);
+          let standard: TagDetection["standard"] = null;
+          let formatted = false;
+          try {
+            const { data, written } = await this.assembleNtagImage(protocol, head);
+            const records = parseNdefRecords(data.subarray(0, written), NTAG_CC_OFFSET);
+            if (records.length > 0) {
+              formatted = true; // carries an NDEF message…
+              if (records.some((r) => r.tnf === 0x02 && r.type === OPENTAG3D_MIME)) {
+                standard = "opentag3d"; // …and it's ours
+              }
+            }
+            // 0 records ⇒ empty/erased ⇒ blank (formatted:false, standard:null)
+          } catch {
+            // Read-back failed — leave as blank/unknown rather than over-claiming.
+          }
+          return {
+            family: "ntag",
+            standard,
+            formatted,
+            readOnly: false, // NTAG read-only is unsupported (CC page is OTP) — never report it
+            ndefCapacity,
+          };
+        });
+      }
+      // Readable as Type 2 but no NDEF CC (blank / non-NDEF) — a blank NTAG.
+      // GET_VERSION it (best-effort) so the renderer can size the payload; null
+      // when unsupported (renderer falls back to Extended; service refuses on write).
+      const cap = await this.withConnection((p) => this.getNtagNdefBytesViaGetVersion(p));
+      return { family: "ntag", standard: null, formatted: false, readOnly: false, ndefCapacity: cap };
+    }
+
+    // 3. SLIX2 (Type 5). Read block 0; an 0xE1/0xE2 CC ⇒ an OpenPrintTag-class
+    //    formatted tag, else blank/unknown.
+    try {
+      return await this.withConnection(async (protocol) => {
+        const block0 = await this.readBlock(protocol, 0);
+        const ccMagic = block0[0];
+        if (ccMagic !== 0xe1 && ccMagic !== 0xe2) {
+          // No NFC-Forum Type-5 CC — blank/unknown SLIX2.
+          return { family: "slix2" as const, standard: null, formatted: false, readOnly: false, ndefCapacity: null };
+        }
+        // Has a Type-5 CC — parse the actual NDEF records (Codex P3 #927) so a
+        // blank-after-erase SLIX2 (CC + terminator, no NDEF message) or a
+        // foreign/OpenTag3D record isn't mislabeled as OpenPrintTag from the CC
+        // byte alone. Mirrors the NTAG branch + setReadOnlyImpl's record check.
+        let standard: TagDetection["standard"] = null;
+        let formatted = false;
+        try {
+          const records = parseNdefRecords(await this.readNfcVImage(protocol), 0);
+          if (records.length > 0) {
+            formatted = true; // carries an NDEF message…
+            if (records.some((r) => r.tnf === 0x02 && r.type === OPENPRINTTAG_MIME)) {
+              standard = "openprinttag"; // …and it's ours
+            } else if (records.some((r) => r.tnf === 0x02 && r.type === OPENTAG3D_MIME)) {
+              standard = "opentag3d"; // OpenTag3D-on-SLIX2 (read-only support, #864)
+            }
+          }
+          // 0 records ⇒ empty/erased ⇒ blank (formatted:false, standard:null)
+        } catch (err) {
+          // An erased SLIX2's TLV area is just the FE terminator, so
+          // parseNdefRecords THROWS "No NDEF TLV found before terminator" rather
+          // than returning [] (NTAG erase writes 03 00 FE → []; SLIX2 erase writes
+          // FE only). Treat the no-NDEF / blank signals as BLANK (Codex P3 #927) so
+          // a freshly-erased SLIX2 reads as blank, not OpenPrintTag. Any OTHER error
+          // is a genuine read glitch — fall back to the CC-only signal (it has a
+          // Type-5 CC) rather than under-claiming a real tag as blank.
+          const msg = err instanceof Error ? err.message : String(err);
+          const blank = msg.includes("No NDEF") || msg.includes("Blank or unformatted");
+          formatted = !blank;
+          standard = blank ? null : "openprinttag";
+        }
+        return {
+          family: "slix2" as const,
+          standard,
+          formatted,
+          readOnly: isCcByteReadOnly(block0[1]),
+          ndefCapacity: null, // SLIX2 payload is fixed-size; not needed
+        };
+      });
+    } catch {
+      return { family: "unknown", standard: null, formatted: false, readOnly: false, ndefCapacity: null };
+    }
   }
 
   destroy(): void {

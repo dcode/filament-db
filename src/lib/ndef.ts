@@ -286,7 +286,15 @@ export function buildNdefMessageTlv(message: Uint8Array): Uint8Array {
   return out;
 }
 
-/** NFC-Forum Type 2 Capability Container (NTAG page 3): `E1 10 <userMem/8> 00`. */
+/**
+ * NFC-Forum Type 2 Capability Container (NTAG page 3): `E1 10 <userMem/8> 00`.
+ * Byte 3 (the read/write-access byte) is always `0x00` (read/write). There is
+ * NO NTAG read-only helper: on NTAG21x the CC page (page 3) is OTP — its bits
+ * can be set but never cleared (hardware-confirmed) — so a read-only nibble
+ * would be irreversible. NTAG read-only is therefore unsupported (the static
+ * lock bytes are likewise OTP and never written); read-only is a SLIX2-only
+ * feature via the Type-5 CC byte below.
+ */
 export function buildType2Cc(userMemoryBytes: number): Uint8Array {
   return new Uint8Array([0xe1, 0x10, Math.floor(userMemoryBytes / 8) & 0xff, 0x00]);
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "@/i18n/TranslationProvider";
 import { useIsElectron } from "@/hooks/useIsElectron";
 import { useNfcContext } from "@/components/NfcProvider";
@@ -23,6 +23,14 @@ export default function DevicesSettingsPage() {
   const [formatResult, setFormatResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [showFormatConfirm, setShowFormatConfirm] = useState(false);
   const [settingReadOnly, setSettingReadOnly] = useState(false);
+  // #864 OpenTag3D write: the chip + standard of the tag currently on the reader,
+  // probed via nfcDetectTag on tag-present so the user knows what they're acting on.
+  const [detected, setDetected] = useState<{
+    family: "ntag" | "slix2" | "bambu" | "unknown";
+    standard: "opentag3d" | "openprinttag" | "bambu" | null;
+    formatted: boolean;
+    readOnly: boolean;
+  } | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -34,6 +42,57 @@ export default function DevicesSettingsPage() {
     const unsub = api.onNfcStatusChange(setNfcStatus);
     return () => { controller.abort(); unsub(); };
   }, []);
+
+  // #864: probe the loaded tag whenever one is present (and clear when lifted).
+  // Best-effort — a detect failure just leaves the line hidden.
+  useEffect(() => {
+    const api = window.electronAPI;
+    if (!api?.nfcDetectTag) return;
+    if (!nfcStatus.tagPresent) {
+      setDetected(null); // eslint-disable-line react-hooks/set-state-in-effect -- clear in response to external reader state
+      return;
+    }
+    let cancelled = false;
+    api.nfcDetectTag()
+      .then((d) => { if (!cancelled) setDetected(d); })
+      .catch(() => { if (!cancelled) setDetected(null); });
+    return () => { cancelled = true; };
+  }, [nfcStatus.tagPresent, nfcStatus.tagUid]);
+
+  // Re-probe the loaded tag after an action that CHANGES it (erase / read-only
+  // toggle). Those mutate the tag in place without a tagPresent/tagUid change, so
+  // the detect effect above wouldn't re-run and the card would keep the pre-action
+  // label until the user lifts + replaces the tag (Codex P3 #927).
+  const refreshDetected = useCallback(() => {
+    const api = window.electronAPI;
+    if (!api?.nfcDetectTag) return;
+    api.nfcDetectTag().then(setDetected).catch(() => setDetected(null));
+  }, []);
+
+  // Map a detection result to a human label, reusing the read-dialog provenance
+  // wording vocabulary (#864).
+  const detectedLabel = (() => {
+    if (!detected) return null;
+    if (detected.family === "bambu") return t("settings.nfcLoadedBambu");
+    if (detected.family === "ntag") {
+      if (detected.standard === "opentag3d") return t("settings.nfcLoadedNtagOpenTag3d");
+      // Codex P3 #927: a formatted-but-not-OpenTag3D NTAG (foreign URL/contact
+      // NDEF) is distinct from a blank one — don't label it "OpenTag3D".
+      return detected.formatted
+        ? t("settings.nfcLoadedNtagForeign")
+        : t("settings.nfcLoadedNtagBlank");
+    }
+    if (detected.family === "slix2") {
+      if (detected.standard === "openprinttag") return t("settings.nfcLoadedSlix2OpenPrintTag");
+      if (detected.standard === "opentag3d") return t("settings.nfcLoadedSlix2OpenTag3d");
+      // Codex P3 #927: a formatted-but-not-OpenPrintTag SLIX2 (foreign NDEF) is
+      // distinct from a blank one — don't label it "OpenPrintTag".
+      return detected.formatted
+        ? t("settings.nfcLoadedSlix2Foreign")
+        : t("settings.nfcLoadedSlix2Blank");
+    }
+    return t("settings.nfcLoadedUnknown");
+  })();
 
   const showFormatConfirmVisible = showFormatConfirm && nfcStatus.tagPresent;
 
@@ -48,9 +107,12 @@ export default function DevicesSettingsPage() {
       await window.electronAPI.nfcFormatTag();
       notifyTagErased();
       setFormatResult({ ok: true, message: t("settings.nfcEraseSuccess") });
+      refreshDetected(); // tag is now blank — update the loaded-tag label (#927)
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
-      const message = raw.includes("BAMBU_READ_ONLY") ? t("settings.nfcEraseBambuReadOnly") : raw;
+      let message = raw;
+      if (raw.includes("BAMBU_READ_ONLY")) message = t("settings.nfcEraseBambuReadOnly");
+      else if (raw.includes("NTAG_SIZE_UNKNOWN")) message = t("settings.nfcNtagSizeUnknown");
       setFormatResult({ ok: false, message });
     } finally {
       setFormatting(false);
@@ -66,11 +128,13 @@ export default function DevicesSettingsPage() {
       }
       await window.electronAPI.nfcSetReadOnly(readOnly);
       setFormatResult({ ok: true, message: t(readOnly ? "settings.nfcReadOnlySet" : "settings.nfcWritableSet") });
+      refreshDetected(); // read-only state changed — refresh the lock badge (#927)
     } catch (err: unknown) {
       const raw = err instanceof Error ? err.message : String(err);
       let message = raw;
       if (raw.includes("BAMBU_READ_ONLY")) message = t("settings.nfcReadOnlyBambu");
       else if (raw.includes("TAG_NOT_FORMATTED")) message = t("settings.nfcReadOnlyNotFormatted");
+      else if (raw.includes("NTAG_READONLY_UNSUPPORTED")) message = t("settings.nfcReadOnlyNtagUnsupported");
       setFormatResult({ ok: false, message });
     } finally {
       setSettingReadOnly(false);
@@ -89,6 +153,14 @@ export default function DevicesSettingsPage() {
           <div className="rounded-lg border border-gray-200 dark:border-gray-800 p-5">
             <h2 className="text-lg font-semibold text-gray-800 dark:text-gray-200 mb-1">{t("settings.nfcTools")}</h2>
             <p className="text-sm text-gray-500 mb-4">{t("settings.nfcToolsDesc")}</p>
+
+            {/* #864: which chip + standard is on the reader right now. */}
+            {nfcStatus.tagPresent && detectedLabel && (
+              <p className="text-sm text-gray-600 dark:text-gray-300 mb-4">
+                <span className="text-gray-400 dark:text-gray-500">{t("settings.nfcLoadedTag")}</span>{" "}
+                <span className="font-medium">{detectedLabel}</span>
+              </p>
+            )}
 
             {!showFormatConfirmVisible ? (
               <button
@@ -125,7 +197,7 @@ export default function DevicesSettingsPage() {
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <button
                 onClick={() => handleSetReadOnly(true)}
-                disabled={settingReadOnly || formatting || !nfcStatus.tagPresent}
+                disabled={settingReadOnly || formatting || !nfcStatus.tagPresent || detected?.family === "ntag"}
                 className="px-3 py-1.5 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded text-sm hover:bg-gray-300 dark:hover:bg-gray-600 disabled:opacity-30 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-2"
               >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -135,7 +207,7 @@ export default function DevicesSettingsPage() {
               </button>
               <button
                 onClick={() => handleSetReadOnly(false)}
-                disabled={settingReadOnly || formatting || !nfcStatus.tagPresent}
+                disabled={settingReadOnly || formatting || !nfcStatus.tagPresent || detected?.family === "ntag"}
                 className="px-3 py-1.5 text-gray-600 dark:text-gray-300 rounded text-sm hover:bg-gray-100 dark:hover:bg-gray-800 disabled:opacity-30 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-2"
               >
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -144,6 +216,11 @@ export default function DevicesSettingsPage() {
                 {t("settings.nfcMakeWritable")}
               </button>
             </div>
+            {nfcStatus.tagPresent && detected?.family === "ntag" && (
+              <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                {t("settings.nfcReadOnlyNtagUnsupported")}
+              </p>
+            )}
             <p className="mt-2 text-xs text-gray-400 dark:text-gray-500">{t("settings.nfcReadOnlyHint")}</p>
 
             {formatResult && (
