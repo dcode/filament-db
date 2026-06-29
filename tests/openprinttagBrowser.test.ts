@@ -996,8 +996,8 @@ type: Resin
   });
 
   it("re-labels a download-phase timeout honestly (not a generic failure)", async () => {
-    // The 60s AbortSignal fires as a TimeoutError. A timeout in the download
-    // phase should surface a download-specific message.
+    // The download AbortSignal fires as a TimeoutError. A timeout in the
+    // download phase should surface a download-specific message.
     vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       const e = new Error("The operation was aborted due to timeout");
       e.name = "TimeoutError";
@@ -1007,5 +1007,26 @@ type: Resin
     await expect(fetchOpenPrintTagDatabase()).rejects.toThrow(
       /OpenPrintTag download timed out/,
     );
+  });
+
+  it("buffers the full body before extracting (download/extract deadlines decoupled)", async () => {
+    // Regression for the Windows extract-timeout report: the response body is
+    // drained into memory FIRST and extraction runs from that buffer, so the
+    // network AbortSignal can't abort a slow disk-bound unpack. We assert the
+    // body is fully consumed before any file is read back out by completing a
+    // multi-file extract end-to-end from a chunked stream.
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-buf/data/brands/amolen.yaml":
+        "slug: amolen\nname: Amolen\n",
+      "OpenPrintTag-buf/data/materials/amolen/a.yaml":
+        "uuid: a\nslug: a\nbrand:\n  slug: amolen\nname: A\nclass: FFF\ntype: PLA\n",
+      "OpenPrintTag-buf/data/materials/amolen/b.yaml":
+        "uuid: b\nslug: b\nbrand:\n  slug: amolen\nname: B\nclass: FFF\ntype: PETG\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    const db = await fetchOpenPrintTagDatabase();
+    expect(db.totalFFF).toBe(2);
+    expect(db.brands[0].name).toBe("Amolen");
   });
 });

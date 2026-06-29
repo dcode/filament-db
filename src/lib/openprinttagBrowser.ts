@@ -589,6 +589,21 @@ async function runFetchWithRetries(): Promise<OPTDatabase> {
     : new Error("OpenPrintTag fetch failed: " + String(lastError));
 }
 
+// Download is network-bound and fast (the compressed tarball is ~3 MB and
+// completes in well under a second on a healthy connection). The extract,
+// by contrast, writes ~11k tiny YAML files to disk — and on Windows hosts
+// real-time antivirus (Defender) scans every one of those writes, which can
+// push a cold extract past a minute even when the download itself took 600ms.
+// So the two phases get SEPARATE, independently-armed deadlines: a tight one
+// for the network, a generous one for the disk-bound unpack.
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const EXTRACT_TIMEOUT_MS = 180_000;
+// Cap the compressed download we buffer into memory before extracting, so a
+// hostile/huge response can't OOM the embedded server. The real OpenPrintTag
+// tarball is ~3 MB; 128 MB is generous headroom. (The decompressed-size /
+// file-count tar-bomb guard still runs per-entry during extraction below.)
+const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
+
 /**
  * Single-attempt fetch + tarball extract + parse. Factored out so the
  * retry loop above can call it multiple times against fresh temp dirs.
@@ -621,9 +636,10 @@ async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
         // GitHub returns 403 on unauthenticated requests with no UA.
         "User-Agent": "filament-db",
       },
-      // 60s matches the previous execSync timeout. AbortSignal.timeout
-      // produces a TypeError-shaped abort if exceeded.
-      signal: AbortSignal.timeout(60_000),
+      // The download gets its OWN deadline (the extract that follows gets a
+      // separate, more generous one). AbortSignal.timeout produces a
+      // TimeoutError-shaped abort if exceeded.
+      signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS),
       ...(dispatcher ? { dispatcher } : {}),
     } as RequestInit & { dispatcher?: Dispatcher });
     if (!response.ok) {
@@ -634,8 +650,33 @@ async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
     if (!response.body) {
       throw new Error("GitHub tarball response had no body");
     }
+
+    // Buffer the full compressed tarball into memory FIRST, bounded by the
+    // download AbortSignal above. This decouples the extract phase from the
+    // network: previously the response body was streamed straight into tar.x,
+    // so the 60s download signal stayed armed across the whole disk-bound
+    // unpack and a slow Windows extract (antivirus scanning each of ~11k file
+    // writes) aborted the still-open fetch even though the bytes were already
+    // down. With the bytes fully in hand, extraction runs under its own,
+    // independent deadline (EXTRACT_TIMEOUT_MS) and the network timeout can no
+    // longer misfire mid-unpack.
+    let downloadedBytes = 0;
+    const chunks: Buffer[] = [];
+    for await (const chunk of Readable.fromWeb(
+      response.body as Parameters<typeof Readable.fromWeb>[0],
+    )) {
+      const buf = chunk as Buffer;
+      downloadedBytes += buf.length;
+      if (downloadedBytes > MAX_DOWNLOAD_BYTES) {
+        throw new Error(
+          "OpenPrintTag download exceeds size limit (possible malicious response).",
+        );
+      }
+      chunks.push(buf);
+    }
+    const tarballBuffer = Buffer.concat(chunks);
     console.log(
-      `${LOG} download response ${response.status} in ${Date.now() - downloadStart}ms — extracting`,
+      `${LOG} download response ${response.status}, ${downloadedBytes} bytes in ${Date.now() - downloadStart}ms — extracting`,
     );
 
     // tar.x is a Writable transform that auto-detects gzip; pipeline()
@@ -647,40 +688,56 @@ async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
     // — or a flood of small entries — trips the limit before the data
     // is written. It also rejects absolute paths and `..` traversal as
     // defence-in-depth over tar's own path sanitisation.
+    //
+    // The extract gets its OWN AbortController/timeout, independent of the
+    // network deadline — a slow disk (Windows + antivirus) gets the full
+    // EXTRACT_TIMEOUT_MS budget. Aborting the pipeline rejects with an
+    // AbortError, which `isTimeoutAbort` recognises so the surfaced message
+    // names the extract phase honestly.
     phase = "extract";
     const extractStart = Date.now();
     const MAX_TARBALL_EXTRACT_BYTES = 256 * 1024 * 1024;
     const MAX_TARBALL_FILES = 50_000;
     let extractedBytes = 0;
     let fileCount = 0;
-    await pipeline(
-      // Cast: response.body is a Web ReadableStream, Readable.fromWeb wants
-      // the same shape but the type lib for streams/web is a bit loose
-      // across Node versions. Functionally identical.
-      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0]),
-      tar.x({
-        cwd: tmpDir,
-        filter: (entryPath: string, entry: { size?: number }) => {
-          if (
-            entryPath.startsWith("/") ||
-            entryPath.split(/[\\/]/).includes("..")
-          ) {
-            throw new Error(`Unsafe tarball entry path: ${entryPath}`);
-          }
-          fileCount += 1;
-          extractedBytes += entry.size ?? 0;
-          if (
-            fileCount > MAX_TARBALL_FILES ||
-            extractedBytes > MAX_TARBALL_EXTRACT_BYTES
-          ) {
-            throw new Error(
-              "OpenPrintTag tarball exceeds extraction limits (possible tar bomb).",
-            );
-          }
-          return true;
-        },
-      }),
+    const extractController = new AbortController();
+    const extractTimer = setTimeout(
+      () => extractController.abort(),
+      EXTRACT_TIMEOUT_MS,
     );
+    try {
+      await pipeline(
+        // Wrap in an array so the whole buffer is emitted as ONE chunk —
+        // `Readable.from(buffer)` is special-cased today but the array form is
+        // unambiguous across Node versions (CI runs 20 + 22).
+        Readable.from([tarballBuffer]),
+        tar.x({
+          cwd: tmpDir,
+          filter: (entryPath: string, entry: { size?: number }) => {
+            if (
+              entryPath.startsWith("/") ||
+              entryPath.split(/[\\/]/).includes("..")
+            ) {
+              throw new Error(`Unsafe tarball entry path: ${entryPath}`);
+            }
+            fileCount += 1;
+            extractedBytes += entry.size ?? 0;
+            if (
+              fileCount > MAX_TARBALL_FILES ||
+              extractedBytes > MAX_TARBALL_EXTRACT_BYTES
+            ) {
+              throw new Error(
+                "OpenPrintTag tarball exceeds extraction limits (possible tar bomb).",
+              );
+            }
+            return true;
+          },
+        }),
+        { signal: extractController.signal },
+      );
+    } finally {
+      clearTimeout(extractTimer);
+    }
 
     console.log(
       `${LOG} extract done: ${fileCount} files / ${extractedBytes} bytes in ${Date.now() - extractStart}ms`,
@@ -784,10 +841,13 @@ async function fetchAndParse(tmpDir: string): Promise<OPTDatabase> {
     // instead of implying a download/connection failure for an extract/parse
     // stall. Non-timeout errors keep their own message.
     if (isTimeoutAbort(err)) {
+      const limitSec = Math.round(
+        (phase === "download" ? DOWNLOAD_TIMEOUT_MS : EXTRACT_TIMEOUT_MS) / 1000,
+      );
       throw new Error(
         phase === "download"
-          ? "OpenPrintTag download timed out (60s limit)"
-          : `OpenPrintTag ${phase} timed out (60s limit) — the download completed but the ${phase} phase exceeded the deadline`,
+          ? `OpenPrintTag download timed out (${limitSec}s limit)`
+          : `OpenPrintTag ${phase} timed out (${limitSec}s limit) — the download completed but the ${phase} phase exceeded the deadline`,
       );
     }
     throw err;
