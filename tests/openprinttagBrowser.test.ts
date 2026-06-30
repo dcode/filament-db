@@ -1,5 +1,24 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, createReadStream } from "fs";
+import {
+  describe,
+  it,
+  expect,
+  vi,
+  beforeEach,
+  afterEach,
+  beforeAll,
+  afterAll,
+} from "vitest";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  createReadStream,
+  readdirSync,
+  utimesSync,
+  existsSync,
+} from "fs";
 import { dirname, join } from "path";
 import { tmpdir } from "os";
 import * as tar from "tar";
@@ -14,6 +33,10 @@ import {
   fetchOpenPrintTagDatabase,
   getProxyDispatcher,
   clearCache,
+  downloadTarballToBuffer,
+  isTimeoutAbort,
+  relabelTimeoutError,
+  extractAndParse,
 } from "@/lib/openprinttagBrowser";
 import { EnvHttpProxyAgent } from "undici";
 
@@ -715,6 +738,35 @@ describe("getProxyDispatcher", () => {
 describe("fetchOpenPrintTagDatabase", () => {
   let tarballsToCleanup: string[] = [];
 
+  // Isolate the temp root from the shared real os.tmpdir(): the suite's
+  // countTempDirs()/sweep assertions key off the literal `openprinttag-`
+  // prefix, but production sweepStaleTempDirs() runs against that same dir on
+  // every fetch — a >1h-old leftover from a crashed earlier CI run would make
+  // a count assertion fail for unrelated reasons. os.tmpdir() reads
+  // TMPDIR/TMP/TEMP at call time, so pointing them at a private dir redirects
+  // both the module's mkdtemp/sweep AND this file's helpers there.
+  const savedTmpEnv: Record<string, string | undefined> = {};
+  let isolatedTmpRoot = "";
+  beforeAll(() => {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) savedTmpEnv[k] = process.env[k];
+    // Create the private root under the ORIGINAL temp dir before we repoint.
+    isolatedTmpRoot = mkdtempSync(join(tmpdir(), "opt-test-root-"));
+    process.env.TMPDIR = isolatedTmpRoot;
+    process.env.TMP = isolatedTmpRoot;
+    process.env.TEMP = isolatedTmpRoot;
+  });
+  afterAll(() => {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) {
+      if (savedTmpEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedTmpEnv[k];
+    }
+    try {
+      rmSync(isolatedTmpRoot, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+
   beforeEach(() => {
     clearCache();
     tarballsToCleanup = [];
@@ -920,5 +972,262 @@ type: Resin
 
     expect(globalThis.fetch).toHaveBeenCalledTimes(1); // joined, not duplicated
     expect(a).toBe(b);
+  });
+
+  // Helper: count `openprinttag-*` temp dirs currently in tmpdir().
+  function countTempDirs(): number {
+    return readdirSync(tmpdir()).filter((n) => n.startsWith("openprinttag-")).length;
+  }
+
+  it("cleans up its own temp dir after a successful fetch", async () => {
+    const before = countTempDirs();
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-clean/data/brands/.gitkeep": "",
+      "OpenPrintTag-clean/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    await fetchOpenPrintTagDatabase();
+
+    // The per-attempt mkdtemp dir must be removed in the finally — no net
+    // growth in `openprinttag-*` dirs (the cause of the %TEMP% buildup).
+    expect(countTempDirs()).toBe(before);
+  });
+
+  it("sweeps stale openprinttag-* temp dirs (>1h old) on fetch", async () => {
+    // Simulate a partial copy left by an earlier interrupted run: an
+    // openprinttag-* dir with an mtime well over an hour ago.
+    const stale = mkdtempSync(join(tmpdir(), "openprinttag-"));
+    writeFileSync(join(stale, "leftover.txt"), "partial");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, twoHoursAgo, twoHoursAgo);
+    expect(existsSync(stale)).toBe(true);
+
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-sweep/data/brands/.gitkeep": "",
+      "OpenPrintTag-sweep/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    await fetchOpenPrintTagDatabase();
+
+    // The stale dir is reclaimed by the start-of-run sweep.
+    expect(existsSync(stale)).toBe(false);
+  });
+
+  it("does NOT sweep a fresh openprinttag-* dir (mtime within the window)", async () => {
+    // A concurrent instance's in-progress dir (recent mtime) must survive the
+    // sweep — only >1h-old dirs are reclaimed.
+    const fresh = mkdtempSync(join(tmpdir(), "openprinttag-"));
+    writeFileSync(join(fresh, "inprogress.txt"), "x");
+
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-fresh/data/brands/.gitkeep": "",
+      "OpenPrintTag-fresh/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    try {
+      await fetchOpenPrintTagDatabase();
+      expect(existsSync(fresh)).toBe(true);
+    } finally {
+      rmSync(fresh, { recursive: true, force: true });
+    }
+  });
+
+  it("re-labels a download-phase timeout honestly (not a generic failure)", async () => {
+    // The download AbortSignal fires as a TimeoutError. A timeout in the
+    // download phase should surface a download-specific message.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const e = new Error("The operation was aborted due to timeout");
+      e.name = "TimeoutError";
+      throw e;
+    });
+
+    await expect(fetchOpenPrintTagDatabase()).rejects.toThrow(
+      /OpenPrintTag download timed out/,
+    );
+  });
+
+  it("buffers the full body before extracting (download/extract deadlines decoupled)", async () => {
+    // Regression for the Windows extract-timeout report: the response body is
+    // drained into memory FIRST and extraction runs from that buffer, so the
+    // network AbortSignal can't abort a slow disk-bound unpack. We assert the
+    // body is fully consumed before any file is read back out by completing a
+    // multi-file extract end-to-end from a chunked stream.
+    const tarballPath = mockFetchTarball({
+      "OpenPrintTag-buf/data/brands/amolen.yaml":
+        "slug: amolen\nname: Amolen\n",
+      "OpenPrintTag-buf/data/materials/amolen/a.yaml":
+        "uuid: a\nslug: a\nbrand:\n  slug: amolen\nname: A\nclass: FFF\ntype: PLA\n",
+      "OpenPrintTag-buf/data/materials/amolen/b.yaml":
+        "uuid: b\nslug: b\nbrand:\n  slug: amolen\nname: B\nclass: FFF\ntype: PETG\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+
+    const db = await fetchOpenPrintTagDatabase();
+    expect(db.totalFFF).toBe(2);
+    expect(db.brands[0].name).toBe("Amolen");
+  });
+
+  it("rejects a download that exceeds the size cap (OOM/DoS guard)", async () => {
+    // Stream more bytes than the (injected, tiny) cap and assert the guard
+    // trips. The check runs BEFORE the chunk is retained, so this never holds
+    // more than one over-limit chunk in memory.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          // 3 × 100-byte chunks = 300 bytes, over the 150-byte cap below.
+          for (let i = 0; i < 3; i++) controller.enqueue(new Uint8Array(100));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, statusText: "OK" });
+    });
+
+    await expect(
+      downloadTarballToBuffer({ maxBytes: 150 }),
+    ).rejects.toThrow(/exceeds size limit/);
+  });
+
+  it("returns the buffered body when under the size cap", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array([1, 2, 3]));
+          controller.enqueue(new Uint8Array([4, 5]));
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, statusText: "OK" });
+    });
+
+    const buf = await downloadTarballToBuffer({ maxBytes: 1024 });
+    expect(Buffer.isBuffer(buf)).toBe(true);
+    expect(Array.from(buf)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("relabels a download-phase fetch timeout as a download timeout", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      const e = new Error("The operation was aborted due to timeout");
+      e.name = "TimeoutError";
+      throw e;
+    });
+
+    await expect(
+      downloadTarballToBuffer({ timeoutMs: 45_000 }),
+    ).rejects.toThrow(/OpenPrintTag download timed out \(45s limit\)/);
+  });
+});
+
+describe("isTimeoutAbort", () => {
+  it("is true for TimeoutError and AbortError", () => {
+    const t = new Error("timeout");
+    t.name = "TimeoutError";
+    const a = new Error("aborted");
+    a.name = "AbortError";
+    expect(isTimeoutAbort(t)).toBe(true);
+    expect(isTimeoutAbort(a)).toBe(true);
+  });
+
+  it("is false for other errors and non-errors", () => {
+    expect(isTimeoutAbort(new Error("nope"))).toBe(false);
+    expect(isTimeoutAbort("AbortError")).toBe(false);
+    expect(isTimeoutAbort(null)).toBe(false);
+  });
+});
+
+describe("relabelTimeoutError", () => {
+  it("labels an extract-phase AbortError honestly (download completed)", () => {
+    // The core of PR #933: an extract stall must NOT read as a download
+    // failure. An AbortError from the extract AbortController feeds this.
+    const abort = new Error("The operation was aborted");
+    abort.name = "AbortError";
+    const out = relabelTimeoutError(abort, "extract");
+    expect(out).toBeInstanceOf(Error);
+    expect(out!.message).toMatch(/extract timed out \(120s limit\)/);
+    expect(out!.message).toMatch(/the download completed but the extract phase/);
+  });
+
+  it("labels a download-phase TimeoutError as a download timeout", () => {
+    const to = new Error("timeout");
+    to.name = "TimeoutError";
+    const out = relabelTimeoutError(to, "download");
+    expect(out!.message).toMatch(/OpenPrintTag download timed out \(45s limit\)/);
+  });
+
+  it("honours injected deadlines in the surfaced message", () => {
+    const abort = new Error("aborted");
+    abort.name = "AbortError";
+    expect(
+      relabelTimeoutError(abort, "extract", { extractTimeoutMs: 90_000 })!.message,
+    ).toMatch(/90s limit/);
+    expect(
+      relabelTimeoutError(abort, "download", { downloadTimeoutMs: 30_000 })!.message,
+    ).toMatch(/30s limit/);
+  });
+
+  it("returns null for a non-timeout error (caller rethrows the original)", () => {
+    expect(relabelTimeoutError(new Error("tar bomb"), "extract")).toBeNull();
+  });
+});
+
+describe("extractAndParse maxExtractBytes cap", () => {
+  // Parity test for PR #933 review follow-up: downloadTarballToBuffer({maxBytes})
+  // is exported + tested for the compressed download cap. The symmetric guard
+  // on the DECOMPRESSED stream (the counting Transform between gunzip and
+  // tar.x) needs the same coverage so a future refactor can't silently drop
+  // the bound. The cap is injectable so we can trip it without allocating
+  // 256 MB of zeros.
+  let tarballsToCleanup: string[] = [];
+  let extractTmpDir = "";
+
+  beforeEach(() => {
+    clearCache();
+    tarballsToCleanup = [];
+    extractTmpDir = mkdtempSync(join(tmpdir(), "opt-test-extract-"));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const p of tarballsToCleanup) {
+      try { rmSync(p, { force: true }); } catch { /* swallow */ }
+    }
+    try { rmSync(extractTmpDir, { recursive: true, force: true }); } catch { /* swallow */ }
+  });
+
+  it("rejects a tarball whose decompressed bytes exceed the injected cap (tar-bomb guard)", async () => {
+    // A normal-looking tarball with a few hundred bytes of decompressed
+    // content. Setting maxExtractBytes well below that total trips the
+    // counting Transform mid-stream; the pipeline tears down and the error
+    // surfaces with the tar-bomb wording.
+    const tarballPath = buildTarball({
+      "OpenPrintTag-bomb/data/brands/.gitkeep": "",
+      // ~500 bytes of payload — comfortably over the 100-byte cap below.
+      "OpenPrintTag-bomb/data/materials/big.yaml":
+        "x".repeat(500),
+    });
+    tarballsToCleanup.push(tarballPath);
+    const buf = readFileSync(tarballPath);
+
+    await expect(
+      extractAndParse(buf, extractTmpDir, { maxExtractBytes: 100 }),
+    ).rejects.toThrow(/exceeds extraction limits/);
+  });
+
+  it("accepts a tarball whose decompressed bytes stay under the injected cap", async () => {
+    const tarballPath = buildTarball({
+      "OpenPrintTag-ok/data/brands/.gitkeep": "",
+      "OpenPrintTag-ok/data/materials/m.yaml":
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+    const buf = readFileSync(tarballPath);
+
+    // Generous cap — the tiny test tarball decompresses to well under 10 KB.
+    const db = await extractAndParse(buf, extractTmpDir, { maxExtractBytes: 10 * 1024 });
+    expect(db.totalFFF).toBe(1);
   });
 });
