@@ -31,12 +31,14 @@ import {
   parseMaterialYaml,
   mapToFilamentPayload,
   fetchOpenPrintTagDatabase,
+  fetchUpstreamCommitSha,
   getProxyDispatcher,
   clearCache,
   downloadTarballToBuffer,
   isTimeoutAbort,
   relabelTimeoutError,
   extractAndParse,
+  shasMatch,
 } from "@/lib/openprinttagBrowser";
 import { EnvHttpProxyAgent } from "undici";
 
@@ -1229,5 +1231,445 @@ describe("extractAndParse maxExtractBytes cap", () => {
     // Generous cap — the tiny test tarball decompresses to well under 10 KB.
     const db = await extractAndParse(buf, extractTmpDir, { maxExtractBytes: 10 * 1024 });
     expect(db.totalFFF).toBe(1);
+  });
+});
+
+// ── #931: SHA-aware refresh ────────────────────────────────────────────
+
+describe("shasMatch", () => {
+  it("matches identical full SHAs", () => {
+    expect(shasMatch("abc1234def5678", "abc1234def5678")).toBe(true);
+  });
+
+  it("matches abbreviated against full (cached short, upstream long)", () => {
+    // The tarball-directory SHA is typically 7 chars; the commits API
+    // returns the full 40-char SHA. The compare must succeed.
+    expect(
+      shasMatch(
+        "abc1234567890abcdef1234567890abcdef123456",
+        "abc1234",
+      ),
+    ).toBe(true);
+  });
+
+  it("is case-insensitive (GitHub returns lowercase, tar may capitalise)", () => {
+    expect(shasMatch("ABC1234", "abc1234")).toBe(true);
+  });
+
+  it("returns false on a real mismatch", () => {
+    expect(shasMatch("abc1234", "xyz9999")).toBe(false);
+  });
+
+  it("returns false for empty inputs", () => {
+    expect(shasMatch("", "abc1234")).toBe(false);
+    expect(shasMatch("abc1234", "")).toBe(false);
+  });
+
+  it("rejects a degenerately short common prefix", () => {
+    // A 2-char overlap shouldn't count as a match.
+    expect(shasMatch("ab", "abcdef1234")).toBe(false);
+  });
+
+  it("rejects anything shorter than MIN_SHA_PREFIX_LEN (7 chars)", () => {
+    // The tarball regex emits `[0-9a-f]{7,40}`, so 7 is the smallest length
+    // either source can produce. A 4–6 char value reaching shasMatch is a
+    // malformed / truncated / hostile response and must NOT match — 1/65k
+    // (4-char) or better random collision rate would let a broken proxy
+    // lock the cache on a low-entropy prefix (hyiger P1 on PR #937).
+    expect(shasMatch("abcdef", "abcdef1234567890abcdef1234567890abcdef12")).toBe(
+      false,
+    );
+    expect(shasMatch("abcdef", "abcdef")).toBe(false);
+    // 7 chars is the minimum accepted length.
+    expect(
+      shasMatch("abcdef1", "abcdef1234567890abcdef1234567890abcdef12"),
+    ).toBe(true);
+  });
+});
+
+describe("fetchUpstreamCommitSha", () => {
+  beforeEach(() => {
+    clearCache();
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("returns the SHA from the commits API on success", async () => {
+    // Codex P2 on PR #937: the probe asks for `application/vnd.github.sha`
+    // now, so GitHub returns the SHA as text/plain (a bare 40-char string),
+    // NOT the full JSON commit blob. The mock mirrors that shape.
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+      return new Response(
+        "deadbeefcafef00d1234567890abcdef12345678",
+        { status: 200, headers: { "content-type": "text/plain" } },
+      );
+    });
+    const sha = await fetchUpstreamCommitSha();
+    expect(sha).toBe("deadbeefcafef00d1234567890abcdef12345678");
+  });
+
+  it("trims a trailing newline from the SHA text response", async () => {
+    // Some HTTP clients append `\n` to text bodies; the probe must tolerate
+    // that so the returned SHA is a pure hex string (Codex P2 on PR #937).
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        "deadbeefcafef00d1234567890abcdef12345678\n",
+        { status: 200, headers: { "content-type": "text/plain" } },
+      ),
+    );
+    const sha = await fetchUpstreamCommitSha();
+    expect(sha).toBe("deadbeefcafef00d1234567890abcdef12345678");
+  });
+
+  it("sends Accept: application/vnd.github.sha so GitHub returns the SHA as text/plain", async () => {
+    // Codex P2 on PR #937 targeted a specific failure mode: on a big-refactor
+    // upstream commit the default JSON response includes the changed-file
+    // list and can exceed the 4 KB `readBodyCapped` cap. The switch to the
+    // SHA media type is the load-bearing mechanism keeping the probe useful.
+    // Without this assertion a silent revert to `application/vnd.github+json`
+    // — the exact regression the fix targets — would pass every other test
+    // in this file (all fetch mocks ignore the RequestInit argument).
+    let capturedAcceptHeader: string | null | undefined;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      // RequestInit.headers is HeadersInit — normalise via a Headers instance
+      // so plain-object and Headers-instance callers are both handled.
+      const h = new Headers((init as RequestInit)?.headers);
+      capturedAcceptHeader = h.get("accept");
+      return new Response(
+        "deadbeefcafef00d1234567890abcdef12345678",
+        { status: 200, headers: { "content-type": "text/plain" } },
+      );
+    });
+    await fetchUpstreamCommitSha();
+    expect(capturedAcceptHeader).toBe("application/vnd.github.sha");
+  });
+
+  it("returns null on a non-2xx response (fail-open)", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("rate limited", { status: 403 }),
+    );
+    expect(await fetchUpstreamCommitSha()).toBeNull();
+  });
+
+  it("returns null on network failure (fail-open)", async () => {
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("ENOTFOUND"));
+    expect(await fetchUpstreamCommitSha()).toBeNull();
+  });
+
+  it("returns null when the response body is empty", async () => {
+    // The SHA media type returns text/plain; an empty body signals a hostile
+    // or broken response — fail-open to the tarball path.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    expect(await fetchUpstreamCommitSha()).toBeNull();
+  });
+
+  it("returns null when the SHA is shorter than MIN_SHA_PREFIX_LEN (7)", async () => {
+    // Belt-and-suspenders alongside shasMatch's own floor: reject the
+    // degenerate prefix before it ever reaches the equality check, so a
+    // hostile / truncated response can't stamp a low-entropy prefix on the
+    // cache via subsequent flows (hyiger P1 on PR #937).
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("abc123", {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    expect(await fetchUpstreamCommitSha()).toBeNull();
+  });
+
+  it("rejects a body that exceeds the 4 KB response cap", async () => {
+    // The SHA-only payload is ~40 bytes; a hostile / misconfigured proxy
+    // that returned a multi-MB body would previously be fully buffered
+    // before parsing. `readBodyCapped` at 4 KB now backstops that (Codex P2
+    // + hyiger P2 on PR #937). Simulate an oversize response via a manual
+    // ReadableStream chunk larger than the cap.
+    const oversize = Buffer.alloc(8 * 1024, "x");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(new Uint8Array(oversize), {
+        status: 200,
+        headers: { "content-type": "text/plain" },
+      }),
+    );
+    expect(await fetchUpstreamCommitSha()).toBeNull();
+  });
+});
+
+/**
+ * #931 — end-to-end coverage for the SHA-aware refresh path.
+ *
+ * Setup model: `fetch` is mocked to discriminate on URL. The first call
+ * populates the cache with a tarball whose directory name carries SHA "aaa…".
+ * Subsequent `{force:true}` calls hit the commits API first; the test sets
+ * the mock to return either the same SHA (slide-TTL path), a different SHA
+ * (tarball refetch path), or 503 (fail-open → tarball refetch).
+ */
+describe("SHA-aware refresh (#931)", () => {
+  let tarballsToCleanup: string[] = [];
+
+  // The fetch shim needs the same isolated TMPDIR trick the parent suite uses,
+  // because populating the cache requires running a full tarball extract.
+  const savedTmpEnv: Record<string, string | undefined> = {};
+  let isolatedTmpRoot = "";
+  beforeAll(() => {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) savedTmpEnv[k] = process.env[k];
+    isolatedTmpRoot = mkdtempSync(join(tmpdir(), "opt-test-sha-root-"));
+    process.env.TMPDIR = isolatedTmpRoot;
+    process.env.TMP = isolatedTmpRoot;
+    process.env.TEMP = isolatedTmpRoot;
+  });
+  afterAll(() => {
+    for (const k of ["TMPDIR", "TMP", "TEMP"]) {
+      if (savedTmpEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedTmpEnv[k];
+    }
+    try {
+      rmSync(isolatedTmpRoot, { recursive: true, force: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+
+  beforeEach(() => {
+    clearCache();
+    tarballsToCleanup = [];
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    for (const p of tarballsToCleanup) {
+      try { rmSync(p, { force: true }); } catch { /* swallow */ }
+    }
+  });
+
+  // Build a tarball whose extracted-root directory name embeds a particular
+  // SHA. The extract path keys off the directory name suffix, so this is the
+  // only way to seed a known cached SHA without poking at module internals.
+  function tarballWithSha(sha: string): string {
+    const tarballPath = buildTarball({
+      [`OpenPrintTag-openprinttag-database-${sha}/data/brands/x.yaml`]:
+        "slug: x\nname: X\n",
+      [`OpenPrintTag-openprinttag-database-${sha}/data/materials/x/m.yaml`]:
+        "uuid: m\nslug: m\nbrand:\n  slug: x\nname: M\nclass: FFF\ntype: PLA\n",
+    });
+    tarballsToCleanup.push(tarballPath);
+    return tarballPath;
+  }
+
+  /**
+   * Install a `fetch` mock that returns:
+   *  - the commits-API response when the URL matches the commits endpoint
+   *  - a streamed tarball otherwise
+   *
+   * Each commits-API response can be a SHA string (200/JSON), a status code
+   * (4xx/5xx with empty body), or a thrown error to simulate network failure.
+   * We also count calls per-bucket so the assertions can pin "tarball was/
+   * wasn't re-downloaded".
+   */
+  function installMock(opts: {
+    commitsResponses: Array<string | number | "throw">;
+    tarballPath: string;
+  }): { commitsCalls: () => number; tarballCalls: () => number } {
+    let commitsIdx = 0;
+    let commitsCalls = 0;
+    let tarballCalls = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/commits/main")) {
+        commitsCalls += 1;
+        const next = opts.commitsResponses[commitsIdx++];
+        if (next === "throw") throw new Error("ENOTFOUND");
+        if (typeof next === "number") {
+          return new Response("err", { status: next });
+        }
+        // The probe asks for `application/vnd.github.sha` (Codex P2 on
+        // PR #937), so GitHub returns the SHA as text/plain (a bare 40-char
+        // string) — not the full JSON commit blob.
+        return new Response(next, {
+          status: 200,
+          headers: { "content-type": "text/plain" },
+        });
+      }
+      // Otherwise: stream the tarball.
+      tarballCalls += 1;
+      const nodeStream = createReadStream(opts.tarballPath);
+      const webStream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          nodeStream.on("data", (chunk: Buffer | string) => {
+            controller.enqueue(
+              typeof chunk === "string"
+                ? new TextEncoder().encode(chunk)
+                : new Uint8Array(chunk),
+            );
+          });
+          nodeStream.on("end", () => controller.close());
+          nodeStream.on("error", (err) => controller.error(err));
+        },
+        cancel() {
+          nodeStream.destroy();
+        },
+      });
+      return new Response(webStream, {
+        status: 200,
+        headers: { "content-type": "application/x-gzip" },
+      });
+    });
+    return {
+      commitsCalls: () => commitsCalls,
+      tarballCalls: () => tarballCalls,
+    };
+  }
+
+  it("same SHA: probes commits API, serves cached, does NOT re-fetch tarball", async () => {
+    const SHA = "abcdef0123456789abcdef0123456789abcdef01";
+    const tarballPath = tarballWithSha(SHA);
+
+    // First call: seed the cache with a tarball whose dir-name SHA matches.
+    const counters = installMock({
+      commitsResponses: [SHA], // for the SECOND call's probe
+      tarballPath,
+    });
+    const first = await fetchOpenPrintTagDatabase();
+    expect(first.totalFFF).toBe(1);
+    expect(first.sha).toBe(SHA); // extracted from the tarball dir name
+    expect(counters.tarballCalls()).toBe(1);
+    expect(counters.commitsCalls()).toBe(0);
+
+    // Second call with force=true: must hit commits API, see same SHA, and
+    // serve cached data without re-downloading the tarball.
+    const second = await fetchOpenPrintTagDatabase({ force: true });
+    expect(counters.commitsCalls()).toBe(1);
+    expect(counters.tarballCalls()).toBe(1); // unchanged from the first call
+    expect(second.totalFFF).toBe(1);
+    expect(second.sha).toBe(SHA);
+    // The probe path stamped `shaCheckedAt` with a fresh ISO timestamp.
+    // Pre-review this asserted `!== first.shaCheckedAt` which could flake on
+    // fast CI when both `Date.now()` calls returned the same ms (Codex P2 on
+    // PR #937). The commits-call counter above already proves the probe
+    // branch ran; here we just pin that a valid ISO string landed.
+    expect(second.shaCheckedAt).toMatch(
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/,
+    );
+    // Slide-TTL uses a SHALLOW spread — `materials` and `brands` MUST be the
+    // same array references as the previous parse (a future refactor to
+    // `structuredClone()` / `JSON.parse(JSON.stringify(...))` would re-allocate
+    // ~11k materials on every probe, so this pins the reference-identity
+    // invariant; hyiger P3 on PR #937).
+    expect(second.materials).toBe(first.materials);
+    expect(second.brands).toBe(first.brands);
+  });
+
+  it("changed SHA: probes commits API, then re-fetches tarball", async () => {
+    const SHA_OLD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_NEW = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Seed with the OLD tarball.
+    let counters = installMock({
+      commitsResponses: [],
+      tarballPath: tarballWithSha(SHA_OLD),
+    });
+    const first = await fetchOpenPrintTagDatabase();
+    expect(first.sha).toBe(SHA_OLD);
+    expect(counters.tarballCalls()).toBe(1);
+    vi.restoreAllMocks();
+
+    // Now: commits API reports the NEW SHA, tarball stream serves the NEW
+    // tarball. The library must probe THEN re-fetch.
+    counters = installMock({
+      commitsResponses: [SHA_NEW],
+      tarballPath: tarballWithSha(SHA_NEW),
+    });
+    const second = await fetchOpenPrintTagDatabase({ force: true });
+    expect(counters.commitsCalls()).toBe(1);
+    expect(counters.tarballCalls()).toBe(1); // the NEW tarball was fetched
+    expect(second.sha).toBe(SHA_NEW);
+  });
+
+  it("commits-API failure: falls through to tarball (fail-open)", async () => {
+    const SHA = "cccccccccccccccccccccccccccccccccccccccc";
+    // Seed.
+    let counters = installMock({
+      commitsResponses: [],
+      tarballPath: tarballWithSha(SHA),
+    });
+    await fetchOpenPrintTagDatabase();
+    expect(counters.tarballCalls()).toBe(1);
+    vi.restoreAllMocks();
+
+    // Refresh: commits API returns 503 — must NOT wedge the refresh.
+    counters = installMock({
+      commitsResponses: [503],
+      tarballPath: tarballWithSha(SHA),
+    });
+    const refreshed = await fetchOpenPrintTagDatabase({ force: true });
+    expect(counters.commitsCalls()).toBe(1);
+    // Tarball WAS re-fetched (the fail-open fallback path).
+    expect(counters.tarballCalls()).toBe(1);
+    expect(refreshed.totalFFF).toBe(1);
+  });
+
+  it("cold start: no cache means no commits probe — straight to tarball", async () => {
+    const SHA = "1111111111111111111111111111111111111111";
+    const counters = installMock({
+      commitsResponses: [],
+      tarballPath: tarballWithSha(SHA),
+    });
+    // Force=true on a clean cache. There's nothing to compare against, so
+    // the SHA probe must NOT run (it has no baseline) and we go directly to
+    // the tarball download.
+    const db = await fetchOpenPrintTagDatabase({ force: true });
+    expect(counters.commitsCalls()).toBe(0);
+    expect(counters.tarballCalls()).toBe(1);
+    expect(db.totalFFF).toBe(1);
+    expect(db.sha).toBe(SHA);
+  });
+
+  it("single-flight: N concurrent forced refreshes share ONE probe call", async () => {
+    const SHA = "2222222222222222222222222222222222222222";
+
+    // Seed the cache first so the probe branch is reachable.
+    let counters = installMock({
+      commitsResponses: [],
+      tarballPath: tarballWithSha(SHA),
+    });
+    await fetchOpenPrintTagDatabase();
+    expect(counters.tarballCalls()).toBe(1);
+    vi.restoreAllMocks();
+
+    // Now install a mock whose commits response can be consumed exactly ONCE
+    // (a second commits call would return `undefined` and throw the mock —
+    // making the amplification visible). Fire N forced refreshes IN PARALLEL:
+    // pre-review each would fire its own probe → N calls hitting GitHub's
+    // 60/hr unauthenticated quota; post-review the single-flight guard wraps
+    // the probe so all N share ONE probe call and ONE decision.
+    counters = installMock({
+      commitsResponses: [SHA], // only ONE commits response provisioned
+      tarballPath: tarballWithSha(SHA),
+    });
+    const results = await Promise.all([
+      fetchOpenPrintTagDatabase({ force: true }),
+      fetchOpenPrintTagDatabase({ force: true }),
+      fetchOpenPrintTagDatabase({ force: true }),
+      fetchOpenPrintTagDatabase({ force: true }),
+      fetchOpenPrintTagDatabase({ force: true }),
+    ]);
+    // ONE probe call, ZERO tarball calls (same SHA → slide-TTL).
+    expect(counters.commitsCalls()).toBe(1);
+    expect(counters.tarballCalls()).toBe(0);
+    // All callers got the same (slide-TTL upgraded) result.
+    for (const r of results) {
+      expect(r.sha).toBe(SHA);
+      expect(r.totalFFF).toBe(1);
+    }
+    // And the shallow-spread invariant: all 5 results are the SAME object
+    // reference (single-flight returned the same in-progress promise to
+    // every caller, and the slide-TTL branch returns `cachedDatabase`).
+    for (const r of results) {
+      expect(r).toBe(results[0]);
+    }
   });
 });

@@ -23,6 +23,7 @@ import { createGunzip } from "node:zlib";
 import * as tar from "tar";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
 import { OPT_TAG } from "@/lib/openprinttag";
+import { readBodyCapped } from "@/lib/externalUrlGuard";
 
 /**
  * Build an undici dispatcher that honours `HTTP_PROXY` / `HTTPS_PROXY` /
@@ -96,6 +97,16 @@ export interface OPTDatabase {
   cachedAt: string;
   totalFFF: number;
   totalSLA: number;
+  /** #931: SHA of the upstream `main` commit the cached data was parsed from.
+   *  Stamped by `extractAndParse` from the tarball directory name (the GitHub
+   *  tarball API extracts to `<owner>-<repo>-<sha>/`), or set after a
+   *  successful commits-API probe. Optional because pre-#931 caches won't
+   *  carry it on first load. */
+  sha?: string;
+  /** #931: ISO timestamp of the most recent commits-API probe (independent
+   *  of `cachedAt`, which records the last tarball parse). When the probe
+   *  finds the same SHA we serve cached data but update this. */
+  shaCheckedAt?: string;
 }
 
 // ── Tag string → OPT_TAG enum mapping ──────────────────────────────────
@@ -519,25 +530,209 @@ async function sweepStaleTempDirs(): Promise<void> {
  *   stale payload instead of throwing. The freshness window is wide enough
  *   that users prefer a one-hour-old brand list to "Failed to load."
  */
-export async function fetchOpenPrintTagDatabase(): Promise<OPTDatabase> {
-  // Check cache
-  if (cachedDatabase && Date.now() - cacheTimestamp < CACHE_TTL_MS) {
+export async function fetchOpenPrintTagDatabase(
+  opts?: { force?: boolean },
+): Promise<OPTDatabase> {
+  const force = opts?.force === true;
+
+  // Cache hit on the natural fast path (TTL not expired, not a forced refresh).
+  // The SHA-aware probe below intentionally does NOT run here — when the TTL
+  // is fresh the user just saw current data, no point hitting GitHub.
+  if (!force && cachedDatabase && Date.now() - cacheTimestamp < CACHE_TTL_MS) {
     return cachedDatabase;
   }
 
-  // #743: single-flight. On a fresh install the cache is empty, and the page
-  // auto-fetches on mount — a reload / re-navigation / second tab would each
-  // otherwise kick off an independent GitHub download + tar extract + ~11k-file
-  // parse, piling up on the one embedded-server event loop and compounding the
-  // freeze. Share ONE in-progress load; clear it in `finally` (success OR
-  // failure) so a failed cold load doesn't leave a rejected promise that every
-  // later caller awaits forever.
+  // #743 + #931 + PR #937 review (hyiger P2/P3): single-flight EVERYTHING
+  // beyond the fast-path check — the SHA probe AND the tarball fetch.
+  //
+  // Pre-review the probe ran BEFORE the single-flight guard, so N concurrent
+  // forced refreshes each fired their own commits-API request. With the
+  // unauthenticated GitHub quota at 60 req/hr, a user mashing Refresh across
+  // tabs could burn the quota fast; the 403/Retry-After path then 502s the UI
+  // back for an hour. Wrapping the probe alongside the tarball fetch in one
+  // in-flight promise makes concurrent forced refreshes share ONE probe result
+  // AND ONE tarball-fetch decision.
+  //
+  // It also closes the slide-TTL race: pre-review two forced-refresh callers
+  // could overlap on `await fetchUpstreamCommitSha()`, then caller A's
+  // "unchanged" spread would overwrite caller B's newer `cachedDatabase` with
+  // a stale sha (spread captures B's new content but re-stamps A's old sha).
+  // Inside the single-flight guard only ONE caller runs `probeAndFetch` at a
+  // time, so no interleaving is possible.
   if (inFlightFetch) return inFlightFetch;
-  inFlightFetch = runFetchWithRetries();
+  inFlightFetch = probeAndFetch();
   try {
     return await inFlightFetch;
   } finally {
     inFlightFetch = null;
+  }
+}
+
+/**
+ * #931 + PR #937 review: probe + decide + tarball. Runs INSIDE the single-flight
+ * guard, so concurrent forced refreshes share ONE probe call and ONE tarball
+ * fetch. Only invoked by `fetchOpenPrintTagDatabase` — not part of the public
+ * surface.
+ */
+async function probeAndFetch(): Promise<OPTDatabase> {
+  // Capture the baseline BEFORE the probe so the spread below merges from a
+  // known snapshot even if a `clearCache` slips in between (single-flight
+  // guarantees no other `probeAndFetch` runs concurrently, but the module
+  // state is still mutable from test setup).
+  const baseline = cachedDatabase;
+  const baselineSha = baseline?.sha;
+  if (baseline && baselineSha) {
+    const upstreamSha = await fetchUpstreamCommitSha();
+    if (upstreamSha === null) {
+      // Probe failed — fall through to the tarball path (fail-open). A
+      // commits-API hiccup must not wedge the refresh flow that was already
+      // willing to download the whole tarball anyway.
+      console.warn(`${LOG} commits probe failed — falling through to tarball`);
+    } else if (shasMatch(upstreamSha, baselineSha)) {
+      // Upstream unchanged. Slide the TTL and stamp the probe time so the UI
+      // can show "checked Xm ago". `cachedAt` is untouched (it records the
+      // last actual parse).
+      console.log(
+        `${LOG} commits SHA unchanged (${upstreamSha.slice(0, 7)}) — sliding TTL`,
+      );
+      cacheTimestamp = Date.now();
+      // Stamp the FULL upstream SHA so subsequent compares don't keep losing
+      // precision via the abbreviated tarball-dir SHA.
+      cachedDatabase = {
+        ...baseline,
+        sha: upstreamSha,
+        shaCheckedAt: new Date().toISOString(),
+      };
+      return cachedDatabase;
+    } else {
+      console.log(
+        `${LOG} commits SHA changed ${baselineSha.slice(0, 7)} → ${upstreamSha.slice(0, 7)} — fetching tarball`,
+      );
+    }
+  }
+
+  return await runFetchWithRetries();
+}
+
+/**
+ * #931: minimum SHA prefix length that we're willing to trust for equality.
+ *
+ * The tarball regex emits `[0-9a-f]{7,40}` and GitHub's commits API returns a
+ * full 40-char SHA — so 7 is the smallest length either source produces. Any
+ * value shorter than that arriving in `shasMatch` (or the commits-API JSON)
+ * is a malformed / truncated response, and letting a shorter prefix match
+ * would silently open us up to a hostile / broken proxy locking the cache
+ * on a low-entropy prefix: at 4 chars the random collision rate is 1/65k,
+ * at 7 chars it's 1/268M. Post PR #937 review (hyiger P1). Kept as an
+ * exported constant so `fetchUpstreamCommitSha`'s length guard can't drift
+ * from `shasMatch`'s floor.
+ */
+export const MIN_SHA_PREFIX_LEN = 7;
+
+/**
+ * #931: Case-insensitive prefix-compatible SHA equality.
+ *
+ * The cached SHA might be an abbreviated 7-char value extracted from the
+ * tarball directory name (`<owner>-<repo>-<sha>/`) on first parse, while the
+ * commits API always returns the full 40-char SHA. Plain `===` would mis-
+ * report "changed" every time after a first cold load. We compare by the
+ * shorter of the two lengths so a 7-char cached SHA matches its 40-char
+ * upstream counterpart. Once a probe finds a match we re-stamp the cache with
+ * the full SHA so subsequent compares are exact.
+ *
+ * A bare-prefix compare is safe here because GitHub's tarball-directory SHA
+ * abbreviation is itself derived from the same commit — there's no third-
+ * party-controlled value being prefix-matched. (Git's own short-SHA collision
+ * risk is irrelevant: we're comparing the SAME repo's hashes, not searching
+ * for a commit by prefix.) But we still refuse anything shorter than
+ * `MIN_SHA_PREFIX_LEN` so a malformed / hostile / truncated value can't
+ * lock the cache on a low-entropy prefix.
+ */
+export function shasMatch(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const minLen = Math.min(a.length, b.length);
+  if (minLen < MIN_SHA_PREFIX_LEN) return false;
+  return a.slice(0, minLen).toLowerCase() === b.slice(0, minLen).toLowerCase();
+}
+
+/**
+ * #931: Cheap "did upstream change?" probe. Hits GitHub's commits API for the
+ * latest commit on `main` and returns just the SHA — no file list, no author
+ * blob, no `parents` array. Returns the full SHA on success, `null` on any
+ * failure; every caller fail-opens to the tarball path on null, so this
+ * never wedges a refresh — the probe is pure latency savings.
+ *
+ * Honours the same proxy dispatcher as `downloadTarballToBuffer` so air-gapped
+ * / proxied deployments work the same as the tarball path.
+ *
+ * Response shape (Codex P2 on PR #937): asks for `application/vnd.github.sha`
+ * — the docs-supported media type that makes GitHub return the SHA as
+ * text/plain (a bare 40-char string), NOT the full JSON commit blob. Pre-fix
+ * the default JSON shape included the commit's changed-file list and could
+ * exceed the read cap when the latest upstream commit touched many files,
+ * killing the probe on exactly the "big refactor merged" days where the
+ * probe path was most valuable. The SHA media type is fixed-size regardless
+ * of commit content.
+ *
+ * Response-size cap (PR #937 review, hyiger P2): body is read via
+ * `readBodyCapped` at 4 KB. The SHA-only response is ~40 bytes; 4 KB
+ * accommodates any error-body GitHub might still stuff into the response
+ * without permitting an OOM from a hostile / misconfigured proxy.
+ *
+ * Timeout (PR #937 review, hyiger P3): 5s default (was 10s). A 40-byte API
+ * call that takes longer than 5s means the connection is dead — fail fast
+ * and let the tarball path's existing retry backoff cover it. The full retry
+ * budget comment near `runFetchWithRetries` bounds the worst-case wait; a
+ * 10s probe eroded ~5s of that budget on a bad-network path.
+ */
+export async function fetchUpstreamCommitSha(opts?: {
+  timeoutMs?: number;
+}): Promise<string | null> {
+  const timeoutMs = opts?.timeoutMs ?? 5_000;
+  const commitsUrl =
+    "https://api.github.com/repos/OpenPrintTag/openprinttag-database/commits/main";
+  const dispatcher = getProxyDispatcher();
+  try {
+    const response = await fetch(commitsUrl, {
+      headers: {
+        // Codex P2 on PR #937: text/plain SHA rather than the full JSON
+        // commit blob, so the response is fixed-size and can't blow the
+        // read cap on a large commit's file list.
+        Accept: "application/vnd.github.sha",
+        "User-Agent": "filament-db",
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+      ...(dispatcher ? { dispatcher } : {}),
+    } as RequestInit & { dispatcher?: Dispatcher });
+    if (!response.ok) {
+      console.warn(
+        `${LOG} commits API returned ${response.status} ${response.statusText}`,
+      );
+      return null;
+    }
+    // Cap the body BEFORE reading so a hostile proxy can't OOM the embedded
+    // server. `readBodyCapped` throws when the cap is hit; the outer catch
+    // treats that as a probe failure and fail-opens to the tarball path.
+    // 4 KB is enormous for a 40-char SHA but leaves room for any error-body
+    // GitHub might still send with a 2xx (unlikely; belt and suspenders).
+    const rawBody = await readBodyCapped(response, 4 * 1024);
+    // The SHA media type returns raw text — trim in case of a trailing
+    // newline. Reject a shorter-than-`MIN_SHA_PREFIX_LEN` value so a
+    // degenerate / hostile response can't lock the cache on a low-entropy
+    // prefix (PR #937 review, hyiger P1). Length is checked against the same
+    // constant `shasMatch` uses, so the two guards can never drift.
+    const sha = rawBody.toString("utf-8").trim();
+    if (sha.length < MIN_SHA_PREFIX_LEN) {
+      console.warn(`${LOG} commits API response had no usable sha`);
+      return null;
+    }
+    return sha;
+  } catch (err) {
+    console.warn(
+      `${LOG} commits API request failed:`,
+      err instanceof Error ? err.message : err,
+    );
+    return null;
   }
 }
 
@@ -833,6 +1028,14 @@ export async function extractAndParse(
     const extracted = await readdir(tmpDir);
     if (extracted.length === 0) throw new Error("Tarball extraction produced no files");
     const repoRoot = join(tmpDir, extracted[0]);
+    // #931: pull the upstream commit SHA out of the directory name
+    // (`<owner>-<repo>-<sha>/`) so the SHA-aware refresh probe has a baseline
+    // to compare against later. GitHub's tarball API only emits the abbreviated
+    // 7-char SHA in this path; we keep whatever it gives us. A missing/short
+    // match still parses successfully — `sha` stays undefined and the SHA
+    // probe falls through to a tarball fetch on first refresh.
+    const shaMatch = /-([0-9a-f]{7,40})\/?$/i.exec(extracted[0]);
+    const sha = shaMatch ? shaMatch[1] : undefined;
 
     // Parse brands
     const parseStart = Date.now();
@@ -913,6 +1116,8 @@ export async function extractAndParse(
       cachedAt: new Date().toISOString(),
       totalFFF: materials.length,
       totalSLA,
+      sha,
+      shaCheckedAt: new Date().toISOString(),
     };
 
     // Cache
@@ -978,16 +1183,18 @@ let cacheTimestamp = 0;
 let inFlightFetch: Promise<OPTDatabase> | null = null;
 
 /**
- * Clear the cached database (useful for forcing a refresh).
+ * Clear the cached database. Kept exported for test setup — production code
+ * no longer calls it (the refresh-POST path now goes through
+ * `fetchOpenPrintTagDatabase({force:true})`, which deliberately KEEPS the
+ * cached entry so the SHA-aware probe has a baseline to compare against, #931).
  *
- * #743 (Codex P1): clears ONLY the cached result — NOT `inFlightFetch`. The
- * refresh-POST path calls this and then re-fetches; if a cold load is still
- * running, forgetting (not cancelling) the in-flight promise would let the
- * refetch start a SECOND download+parse instead of joining the running one,
- * and the older load's `finally` could later clobber the newer in-flight/cache
- * state — reintroducing the duplicate cold parses this fix prevents. Leaving
- * `inFlightFetch` intact means a refresh joins any in-progress load (which is
- * itself a fresh download), or starts a clean one when none is running.
+ * #743 (Codex P1): clears ONLY the cached result — NOT `inFlightFetch`. If a
+ * cold load is still running, forgetting (not cancelling) the in-flight
+ * promise would let a subsequent fetch start a SECOND download+parse instead
+ * of joining the running one, and the older load's `finally` could later
+ * clobber the newer in-flight/cache state — reintroducing the duplicate cold
+ * parses this fix prevents. Leaving `inFlightFetch` intact means a refresh
+ * joins any in-progress load, or starts a clean one when none is running.
  */
 export function clearCache(): void {
   cachedDatabase = null;
