@@ -29,6 +29,33 @@ import { formatGrams } from "@/lib/formatWeight";
 
 type Filament = FilamentDetail;
 
+/** Today's date as a `YYYY-MM-DD` string in the user's LOCAL timezone, for
+ *  seeding a native `<input type="date">` (#941). `toISOString()` would use
+ *  UTC and show "tomorrow" for users east of UTC late in the day. */
+function localTodayInput(): string {
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 10);
+}
+
+/** True when the stored value is exactly UTC midnight — the shape a
+ *  date-only usage entry takes (the picker sends a bare `YYYY-MM-DD`,
+ *  stored as `00:00:00.000Z`). Real "now" timestamps (job/slicer
+ *  entries, mobile logs, manual logs from before the picker) are
+ *  effectively never exactly midnight UTC, so this cleanly separates
+ *  calendar-day values from instants (#941 / Codex review). */
+function isUtcMidnight(value: string | Date): boolean {
+  const d = value instanceof Date ? value : new Date(value);
+  return (
+    !Number.isNaN(d.getTime()) &&
+    d.getUTCHours() === 0 &&
+    d.getUTCMinutes() === 0 &&
+    d.getUTCSeconds() === 0 &&
+    d.getUTCMilliseconds() === 0
+  );
+}
+
 function computeRemaining(filament: Filament, overrideTotalWeight?: number | null) {
   const { spoolWeight, netFilamentWeight, density, diameter } = filament;
   const totalWeight = overrideTotalWeight !== undefined ? overrideTotalWeight : filament.totalWeight;
@@ -966,7 +993,7 @@ function FilamentDetail() {
 
   const handleLogUsage = async (
     spoolId: string,
-    entry: { grams: number; jobLabel?: string },
+    entry: { grams: number; jobLabel?: string; date?: string },
   ) => {
     if (!filament) return;
     try {
@@ -2223,7 +2250,7 @@ interface SpoolCardProps {
   onUpdatePhoto: (dataUrl: string | null) => void;
   onToggleRetire: (retired: boolean) => void;
   onLogDryCycle: (entry: { tempC?: number | null; durationMin?: number | null; notes?: string }) => void;
-  onLogUsage: (entry: { grams: number; jobLabel?: string }) => void;
+  onLogUsage: (entry: { grams: number; jobLabel?: string; date?: string }) => void;
   /**
    * GH #601: provenance fields (lotNumber, purchaseDate, openedDate). All
    * three already round-trip through the spool subdoc schema, the
@@ -2283,6 +2310,37 @@ function SpoolCard({
   const [dryDuration, setDryDuration] = useState("");
   const [usageGrams, setUsageGrams] = useState("");
   const [usageLabel, setUsageLabel] = useState("");
+  // #941: let the user record WHEN the usage happened (they may log a print
+  // days later), not just "now". Defaults to today in the user's LOCAL date so
+  // the native date picker opens on the expected day. Fed to the usage POST,
+  // which already accepts an optional `date`; Analytics buckets by this date.
+  // Seeded post-mount (not in the initializer) so the value derives from the
+  // BROWSER's timezone, never the server's — a server-side render around a UTC
+  // date boundary would otherwise bake in the server's "today" and mismatch
+  // the client's local day. `todayInput` also drives the picker's `max`.
+  // Mirrors the post-mount seeding pattern in src/app/inventory/page.tsx.
+  const [usageDate, setUsageDate] = useState("");
+  const [todayInput, setTodayInput] = useState("");
+  // Whether the user has actually edited the date field. An UNTOUCHED
+  // default must always log as "now", never as a backdate — otherwise a
+  // page left open across local midnight (seeded default now reads as
+  // "yesterday") would silently backdate a plain "log now" click to
+  // yesterday (#941 / Codex review). Only an explicit edit counts as a
+  // backdate. `refreshDefaultDate` re-seeds the default + `max` from the
+  // CURRENT local day so an untouched field/picker stays current across a
+  // rollover.
+  const [usageDateDirty, setUsageDateDirty] = useState(false);
+  const refreshDefaultDate = () => {
+    if (usageDateDirty) return;
+    const t = localTodayInput();
+    setTodayInput(t);
+    setUsageDate(t);
+  };
+  useEffect(() => {
+    const t = localTodayInput();
+    setTodayInput(t); // eslint-disable-line react-hooks/set-state-in-effect -- local-date seed (avoids SSR/first-paint TZ mismatch)
+    setUsageDate(t);
+  }, []);
   // #608: expandable view of the spool's logged usage entries.
   const [showUsageHistory, setShowUsageHistory] = useState(false);
   // GH #601: provenance edits. ISO-string fields are sliced to YYYY-MM-DD
@@ -2823,7 +2881,18 @@ function SpoolCard({
                       className="flex items-center gap-2 text-xs text-gray-600 dark:text-gray-300 border-b border-gray-100 dark:border-gray-800 pb-1 last:border-0"
                     >
                       <span className="text-gray-400 dark:text-gray-500 w-20 shrink-0">
-                        {formatDate(u.date, locale)}
+                        {/* Date-only entries (stored UTC midnight) format in
+                            UTC so the picked day shows for every time zone
+                            and matches the UTC-bucketed Analytics chart. Real
+                            timestamps (job/slicer entries, mobile logs, older
+                            manual logs) format in LOCAL time so a print
+                            logged at 8 PM doesn't read as tomorrow west of
+                            UTC (#941 / Codex review). */}
+                        {formatDate(
+                          u.date,
+                          locale,
+                          isUtcMidnight(u.date) ? { timeZone: "UTC" } : undefined,
+                        )}
                       </span>
                       <span className="font-medium w-14 shrink-0 text-right">
                         {formatGrams(u.grams)}g
@@ -2849,6 +2918,24 @@ function SpoolCard({
                 value={usageGrams}
                 onChange={(e) => setUsageGrams(e.target.value)}
               />
+              {/* #941: when the usage actually happened (defaults to today).
+                  Capped at today — usage can't be logged in the future. */}
+              <input
+                type="date"
+                className="px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded bg-transparent"
+                aria-label={t("detail.spool.usageDate")}
+                title={t("detail.spool.usageDate")}
+                max={todayInput}
+                value={usageDate}
+                // Refresh the default + max to the CURRENT day when the user
+                // opens the picker, so a page left open across midnight
+                // doesn't offer a stale "yesterday" default/max.
+                onFocus={refreshDefaultDate}
+                onChange={(e) => {
+                  setUsageDate(e.target.value);
+                  setUsageDateDirty(true);
+                }}
+              />
               <input
                 type="text"
                 className="flex-1 min-w-0 px-2 py-1 text-xs border border-gray-300 dark:border-gray-600 rounded bg-transparent"
@@ -2865,13 +2952,54 @@ function SpoolCard({
                 // back, see (apparently) cleared inputs, click again,
                 // and not know whether their click did nothing or
                 // re-posted the previous value.
-                disabled={!(Number(usageGrams) > 0)}
+                // Also disable on a future date: the picker's `max` blocks
+                // selection but not typed/pasted input, and a future-dated
+                // log would decrement the spool yet be hidden from Analytics
+                // until that day (#936). The onClick clamps too, as defense.
+                disabled={
+                  !(Number(usageGrams) > 0) ||
+                  (!!usageDate && !!todayInput && usageDate > todayInput)
+                }
                 onClick={() => {
                   const g = Number(usageGrams);
                   if (!Number.isFinite(g) || g <= 0) return;
-                  onLogUsage({ grams: g, jobLabel: usageLabel });
+                  // Two storage shapes, one per case (#941 / Codex review):
+                  // - BACKDATE: send the bare YYYY-MM-DD → stored as UTC
+                  //   midnight of that day. The history list renders
+                  //   date-only values in UTC and Analytics buckets in UTC,
+                  //   so the picked day shows identically for every time
+                  //   zone, and a past day's UTC midnight is never in the
+                  //   future.
+                  // - TODAY or FUTURE (the default / clamp): omit `date` so
+                  //   the server stamps the actual instant. The history list
+                  //   renders timestamps in LOCAL time, so it shows the
+                  //   picked day for every zone, and the entry is immediately
+                  //   visible in Analytics (bucketed by its UTC instant,
+                  //   exactly like job/slicer/mobile entries). Sending today's
+                  //   YYYY-MM-DD instead would store a UTC midnight that, east
+                  //   of UTC, hasn't happened yet — Analytics excludes future
+                  //   entries (#936), so a just-logged entry would vanish from
+                  //   totals until UTC catches up. Only a STRICTLY-PAST date
+                  //   is sent as a backdate; a typed/pasted future date (the
+                  //   picker's `max` doesn't block manual entry) is clamped to
+                  //   "now" rather than posted into the future. Only an
+                  //   EDITED field (`usageDateDirty`) is ever a backdate — an
+                  //   untouched default is always "now", even if it's gone
+                  //   stale across a midnight rollover.
+                  const today = localTodayInput();
+                  onLogUsage({
+                    grams: g,
+                    jobLabel: usageLabel,
+                    date:
+                      usageDateDirty && usageDate && usageDate < today
+                        ? usageDate
+                        : undefined,
+                  });
                   setUsageGrams("");
                   setUsageLabel("");
+                  setUsageDate(today);
+                  setTodayInput(today);
+                  setUsageDateDirty(false);
                 }}
                 className="px-3 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700 disabled:bg-gray-400 dark:disabled:bg-gray-700 disabled:text-gray-200 disabled:cursor-not-allowed disabled:hover:bg-gray-400"
               >

@@ -18,7 +18,8 @@ import { useTranslation } from "@/i18n/TranslationProvider";
 import type { FilamentSummary } from "@/types/filament";
 import { getRemainingGrams, getRemainingPct, getSpoolCount } from "@/lib/inventoryStats";
 import { formatGrams } from "@/lib/formatWeight";
-import { compareFilaments, nextSortState, type SortKey, type SortDir } from "@/lib/sortFilamentList";
+import { compareFilaments, nextSortState, earliestSpoolDate, type SortKey, type SortDir } from "@/lib/sortFilamentList";
+import { formatDate } from "@/lib/dateFormat";
 import { buildFilamentGroups } from "@/lib/groupFilaments";
 
 type Filament = FilamentSummary;
@@ -159,7 +160,7 @@ function FilamentStats({ filaments }: { filaments: Filament[] }) {
 // catalog, which reads as "filaments missing". Loaded post-mount so SSR /
 // first paint stay on defaults (no hydration mismatch).
 const HOME_PREFS_KEY = "filamentdb-home-prefs";
-const SORT_KEY_VALUES: SortKey[] = ["name", "vendor", "type", "nozzle", "bed", "cost", "remaining"];
+const SORT_KEY_VALUES: SortKey[] = ["name", "vendor", "type", "nozzle", "bed", "cost", "remaining", "purchased", "opened"];
 
 function loadHomePrefs(): { sortKey: SortKey; sortDir: SortDir } {
   if (typeof window === "undefined") return { sortKey: "name", sortDir: "asc" };
@@ -177,7 +178,7 @@ function loadHomePrefs(): { sortKey: SortKey; sortDir: SortDir } {
 }
 
 export default function Home() {
-  const { t } = useTranslation();
+  const { t, locale } = useTranslation();
   const { format: formatCurrency } = useCurrency();
   const [filaments, setFilaments] = useState<Filament[]>([]);
   const [loading, setLoading] = useState(true);
@@ -876,7 +877,7 @@ export default function Home() {
     if (!expandedSpools.has(f._id) || spools.length === 0) return null;
     return (
       <tr className="border-b border-gray-200 dark:border-gray-800 bg-blue-50/40 dark:bg-blue-950/20">
-        <td colSpan={10} className="py-2 px-2 pl-10">
+        <td colSpan={12} className="py-2 px-2 pl-10">
           <div className="space-y-1.5">
             {spools.map((s, i) => (
               <div key={s._id} className="flex items-center gap-3 text-xs flex-wrap">
@@ -938,6 +939,25 @@ export default function Home() {
           </div>
         </td>
       </tr>
+    );
+  };
+
+  // #941: Purchased / Opened cells — the earliest date across this filament's
+  // own spools (matches the sort value from earliestSpoolDate). "—" when unset.
+  const dateCells = (spools: Filament["spools"] | undefined) => {
+    const purchased = earliestSpoolDate(spools, "purchaseDate");
+    const opened = earliestSpoolDate(spools, "openedDate");
+    const cls = "py-2 px-2 whitespace-nowrap text-xs text-gray-500 dark:text-gray-400";
+    // purchaseDate/openedDate are calendar-day values stored as UTC midnight
+    // (the SpoolCard date picker sends a bare YYYY-MM-DD → Mongoose casts it to
+    // UTC midnight). Format in UTC so the day matches the detail page + CSV
+    // export and doesn't shift back a day for users west of UTC (#941 review).
+    const fmt = (iso: string) => formatDate(iso, locale, { timeZone: "UTC" });
+    return (
+      <>
+        <td className={cls}>{purchased ? fmt(purchased) : "—"}</td>
+        <td className={cls}>{opened ? fmt(opened) : "—"}</td>
+      </>
     );
   };
 
@@ -1039,6 +1059,7 @@ export default function Home() {
           );
         })()}
       </td>
+      {dateCells(f.spools)}
       <td className="py-2 px-2 text-right">
         <Link
           href={`/filaments/${f._id}/edit`}
@@ -1154,6 +1175,7 @@ export default function Home() {
               );
             })()}
           </td>
+          {dateCells(f.spools)}
           <td className="py-2 px-2 text-right">
             <Link
               href={`/filaments/${f._id}/edit`}
@@ -1168,7 +1190,7 @@ export default function Home() {
         {isExpanded && group.variants.map((v) => renderRow(v, true))}
         {!isExpanded && (
           <tr key={`${f._id}-colors`} className="border-b border-gray-200">
-            <td colSpan={10} className="py-1 px-2 pl-10">
+            <td colSpan={12} className="py-1 px-2 pl-10">
               <div className="flex items-center gap-1.5">
                 {group.variants.map((v) => (
                   <Link
@@ -1544,7 +1566,7 @@ export default function Home() {
                   />
                 </th>
                 <th scope="col" className="text-left py-3 px-2">{t("filaments.table.color")}</th>
-                {(["name", "vendor", "type", "nozzle", "bed", "cost", "remaining"] as SortKey[]).map((col) => (
+                {(["name", "vendor", "type", "nozzle", "bed", "cost", "remaining", "purchased", "opened"] as SortKey[]).map((col) => (
                   <th
                     key={col}
                     scope="col"
