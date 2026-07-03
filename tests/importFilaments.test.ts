@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { mapHeaders, rowToImport, splitInheritedImportSet, upsertImportRows } from "@/lib/importFilaments";
+import { mapHeaders, pruneInheritedCreateDoc, rowToImport, splitInheritedImportSet, upsertImportRows } from "@/lib/importFilaments";
 
 describe("mapHeaders", () => {
   it("maps standard export headers", () => {
@@ -1147,6 +1147,137 @@ describe("splitInheritedImportSet (GH #628)", () => {
     expect(set).toEqual({ name: "V" });
     expect(unset).toEqual([]);
   });
+
+  // GH #951 (Codex F2): `inherits` is now an inheritable scalar.
+  it("skips $set for `inherits` when it matches the parent, keeps a genuine override", () => {
+    const p = { ...parent, inherits: "*PLA*" };
+    const skip = splitInheritedImportSet({ name: "V", inherits: "*PLA*" }, { inherits: null }, p);
+    expect(skip.set).toEqual({ name: "V" });
+    const keep = splitInheritedImportSet({ name: "V", inherits: "*PLA-CF*" }, { inherits: null }, p);
+    expect(keep.set).toEqual({ name: "V", inherits: "*PLA-CF*" });
+  });
+
+  // GH #951 (Codex F1): `settings` inherits by shallow per-key merge.
+  it("filters `settings` per-key against the parent (parent-equal keys keep inheriting)", () => {
+    const p = { ...parent, settings: { fan_speed: "60", z_hop: "0.2", nozzle: "hot" } };
+    const { set } = splitInheritedImportSet(
+      // fan_speed matches parent → drop; z_hop differs → keep; brim is variant-only → keep
+      { name: "V", settings: { fan_speed: "60", z_hop: "0.4", brim: "5" } },
+      { settings: {} },
+      p,
+    );
+    expect(set).toEqual({ name: "V", settings: { z_hop: "0.4", brim: "5" } });
+  });
+
+  it("writes `settings` through unchanged when the parent has no settings to inherit", () => {
+    const p = { ...parent }; // no settings key
+    const { set } = splitInheritedImportSet(
+      { name: "V", settings: { fan_speed: "60" } },
+      { settings: {} },
+      p,
+    );
+    expect(set).toEqual({ name: "V", settings: { fan_speed: "60" } });
+  });
+});
+
+/**
+ * GH #951 — pure-helper coverage for the create/resurrect inheritance prune.
+ * Counterpart to splitInheritedImportSet: instead of {set, unset} for an
+ * UPDATE, it returns a create doc with each parent-equal inheritable field
+ * reset to its inherit sentinel (null for scalars/temps, [] for
+ * secondaryColors). Never touches vendor/type (required) or name/color.
+ */
+describe("pruneInheritedCreateDoc (GH #951)", () => {
+  const parent = {
+    vendor: "Acme",
+    type: "PLA",
+    cost: 25,
+    density: 1.24,
+    diameter: 1.75,
+    spoolType: "cardboard",
+    temperatures: { nozzle: 215, bed: 60 },
+    secondaryColors: ["#FF0000", "#00FF00"],
+  };
+
+  it("nulls a scalar whose incoming value equals the parent (keep inheriting)", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", cost: 25, density: 1.24 },
+      parent,
+    );
+    expect(out.cost).toBeNull();
+    expect(out.density).toBeNull();
+    expect(out.name).toBe("V");
+  });
+
+  it("keeps a scalar that differs from the parent (genuine override)", () => {
+    const out = pruneInheritedCreateDoc({ name: "V", cost: 30 }, parent);
+    expect(out.cost).toBe(30);
+  });
+
+  it("nulls diameter when it equals the parent (inheritable, not excluded)", () => {
+    const out = pruneInheritedCreateDoc({ name: "V", diameter: 1.75 }, parent);
+    expect(out.diameter).toBeNull();
+  });
+
+  it("never nulls the schema-required fields vendor/type even when they match the parent", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", vendor: "Acme", type: "PLA" },
+      parent,
+    );
+    expect(out.vendor).toBe("Acme");
+    expect(out.type).toBe("PLA");
+  });
+
+  it("never touches name/color (variant-only)", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", color: "#123456", colorName: "Custom" },
+      { ...parent, color: "#123456" },
+    );
+    expect(out.color).toBe("#123456");
+    // colorName is not an inheritable scalar → passes through untouched.
+    expect(out.colorName).toBe("Custom");
+  });
+
+  it("nulls temperature subfields equal to the parent, keeps differing ones", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", temperatures: { nozzle: 215, bed: 55, nozzleFirstLayer: null } },
+      parent,
+    );
+    const temps = out.temperatures as Record<string, unknown>;
+    expect(temps.nozzle).toBeNull(); // == parent 215 → inherit
+    expect(temps.bed).toBe(55); // differs from parent 60 → override kept
+    expect(temps.nozzleFirstLayer).toBeNull();
+  });
+
+  it("empties secondaryColors when the incoming array equals the parent's (whole-array inheritance)", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", secondaryColors: ["#FF0000", "#00FF00"] },
+      parent,
+    );
+    expect(out.secondaryColors).toEqual([]);
+  });
+
+  it("keeps secondaryColors that differ from the parent's", () => {
+    const out = pruneInheritedCreateDoc(
+      { name: "V", secondaryColors: ["#0000FF"] },
+      parent,
+    );
+    expect(out.secondaryColors).toEqual(["#0000FF"]);
+  });
+
+  it("leaves fields the row didn't supply (undefined) untouched — schema defaults still apply", () => {
+    const out = pruneInheritedCreateDoc({ name: "V", vendor: "Acme", type: "PLA" }, parent);
+    expect("cost" in out).toBe(false);
+    expect("diameter" in out).toBe(false);
+  });
+
+  it("does not mutate the input doc", () => {
+    const doc = { name: "V", cost: 25, temperatures: { nozzle: 215 } };
+    const out = pruneInheritedCreateDoc(doc, parent);
+    expect(doc.cost).toBe(25); // original untouched
+    expect((doc.temperatures as Record<string, unknown>).nozzle).toBe(215);
+    expect(out).not.toBe(doc);
+  });
 });
 
 /**
@@ -1308,5 +1439,217 @@ describe("upsertImportRows — variant round-trip preserves inheritance (GH #628
     const updated = await Filament.findById(variant._id).lean();
     // $unset → the field is gone/null and inheritance resumes.
     expect(updated.cost == null).toBe(true);
+  });
+});
+
+/**
+ * GH #951 — the create + resurrect paths must preserve inheritance the same
+ * way the update path (GH #628) does. The export flattens a variant through
+ * resolveFilament; importing that row into a FRESH DB (migration) or onto a
+ * TRASHED variant (restore) used to pin every inherited value as a local
+ * override, severing GH #106 live inheritance on create/resurrect.
+ */
+describe("upsertImportRows — create/resurrect preserve inheritance (GH #951)", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let Filament: any;
+
+  beforeEach(async () => {
+    Filament = (await import("@/models/Filament")).default;
+  });
+
+  const COLS = ["Name", "Vendor", "Type", "Color", "Cost", "Density", "Nozzle Temp", "Bed Temp", "Parent"];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const toRows = (rows: any[][]) => {
+    const mapping = mapHeaders(COLS);
+    return rows.map((r) => rowToImport(r, mapping));
+  };
+
+  it("CREATE into a fresh DB does not pin parent-inherited values (parent + variant in one file)", async () => {
+    // The export wrote the parent-resolved values into the variant row
+    // (cost 25 / density 1.24 / nozzle 215 / bed 60 — all == parent).
+    const result = await upsertImportRows(
+      toRows([
+        ["Universal PLA", "Acme", "PLA", "#808080", 25, 1.24, 215, 60, ""],
+        ["Universal PLA — Red", "Acme", "PLA", "#FF0000", 25, 1.24, 215, 60, "Universal PLA"],
+      ]),
+    );
+    expect(result.created).toBe(2);
+    expect(result.skipped).toBe(0);
+
+    const parent = await Filament.findOne({ name: "Universal PLA" }).lean();
+    const variant = await Filament.findOne({ name: "Universal PLA — Red" }).lean();
+    expect(variant.parentId?.toString()).toBe(parent._id.toString());
+
+    // Inherited fields were NOT pinned — they read as null on the variant.
+    expect(variant.cost).toBeNull();
+    expect(variant.density).toBeNull();
+    expect(variant.temperatures?.nozzle ?? null).toBeNull();
+    expect(variant.temperatures?.bed ?? null).toBeNull();
+    // Variant-specific values survive.
+    expect(variant.color).toBe("#FF0000");
+
+    // …and a later parent edit still propagates (GH #106 live link intact).
+    await Filament.updateOne({ _id: parent._id }, { $set: { cost: 30, density: 1.3 } });
+    const { resolveFilament } = await import("@/lib/resolveFilament");
+    const freshParent = await Filament.findById(parent._id).lean();
+    const resolved = resolveFilament(variant, freshParent);
+    expect(resolved.cost).toBe(30);
+    expect(resolved.density).toBe(1.3);
+    expect(resolved.temperatures.nozzle).toBe(215);
+  });
+
+  it("CREATE keeps a genuine variant override that differs from the parent", async () => {
+    const result = await upsertImportRows(
+      toRows([
+        ["Universal PETG", "Acme", "PETG", "#808080", 20, 1.27, 240, 70, ""],
+        // variant overrides nozzle temp (250 ≠ 240) and cost (22 ≠ 20)
+        ["Universal PETG — Blue", "Acme", "PETG", "#0000FF", 22, 1.27, 250, 70, "Universal PETG"],
+      ]),
+    );
+    expect(result.created).toBe(2);
+
+    const variant = await Filament.findOne({ name: "Universal PETG — Blue" }).lean();
+    expect(variant.cost).toBe(22); // genuine override kept
+    expect(variant.temperatures.nozzle).toBe(250); // genuine override kept
+    expect(variant.density).toBeNull(); // == parent → inherited
+    expect(variant.temperatures?.bed ?? null).toBeNull(); // == parent → inherited
+  });
+
+  it("CREATE does not pin inherited RANGE temps (nozzleRangeMin/Max/standby) on a variant", async () => {
+    // Regression for GH #951 Codex finding 3: the dotted `temperatures.*` keys
+    // added alongside the nested `temperatures` object overrode the null that
+    // `pruneInheritedCreateDoc` writes, re-pinning inherited range temps.
+    const RANGE_COLS = [
+      "Name",
+      "Vendor",
+      "Type",
+      "Color",
+      "Nozzle Range Min (°C)",
+      "Nozzle Range Max (°C)",
+      "Standby Temp (°C)",
+      "Parent",
+    ];
+    const mapping = mapHeaders(RANGE_COLS);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rangeRows = (rows: any[][]) => rows.map((r) => rowToImport(r, mapping));
+
+    const result = await upsertImportRows(
+      rangeRows([
+        ["Range Parent", "Acme", "PLA", "#808080", 190, 230, 150, ""],
+        // variant row carries the parent-resolved range temps (flattened export)
+        ["Range Parent — Red", "Acme", "PLA", "#FF0000", 190, 230, 150, "Range Parent"],
+      ]),
+    );
+    expect(result.created).toBe(2);
+    expect(result.skipped).toBe(0);
+
+    const variant = await Filament.findOne({ name: "Range Parent — Red" }).lean();
+    // Inherited range temps must NOT be pinned — they read as null on the variant.
+    expect(variant.temperatures?.nozzleRangeMin ?? null).toBeNull();
+    expect(variant.temperatures?.nozzleRangeMax ?? null).toBeNull();
+    expect(variant.temperatures?.standby ?? null).toBeNull();
+
+    // …and a later parent edit still propagates through resolveFilament.
+    const parent = await Filament.findOne({ name: "Range Parent" }).lean();
+    await Filament.updateOne(
+      { _id: parent._id },
+      { $set: { "temperatures.nozzleRangeMin": 200 } },
+    );
+    const { resolveFilament } = await import("@/lib/resolveFilament");
+    const freshParent = await Filament.findById(parent._id).lean();
+    const resolved = resolveFilament(variant, freshParent);
+    expect(resolved.temperatures.nozzleRangeMin).toBe(200);
+    expect(resolved.temperatures.standby).toBe(150);
+  });
+
+  it("RESURRECT of a trashed variant with RANGE temps succeeds (no dotted/nested conflict)", async () => {
+    // Regression for GH #951 Codex finding 3: on resurrect the dotted
+    // `temperatures.nozzleRangeMin` key + the nested `temperatures` object
+    // collided in a single updateOne (MongoServerError code 40), so the row
+    // was caught and SKIPPED — the trashed variant never came back.
+    const parent = await Filament.create({
+      name: "Range Resurrect Parent",
+      vendor: "Acme",
+      type: "PLA",
+      temperatures: { nozzleRangeMin: 190, nozzleRangeMax: 230, standby: 150 },
+    });
+    const variant = await Filament.create({
+      name: "Range Resurrect Variant",
+      vendor: "Acme",
+      type: "PLA",
+      color: "#00FF00",
+      parentId: parent._id,
+      _deletedAt: new Date(), // trashed
+    });
+
+    const RANGE_COLS = [
+      "Name",
+      "Vendor",
+      "Type",
+      "Color",
+      "Nozzle Range Min (°C)",
+      "Nozzle Range Max (°C)",
+      "Standby Temp (°C)",
+      "Parent",
+    ];
+    const mapping = mapHeaders(RANGE_COLS);
+    const result = await upsertImportRows([
+      rowToImport(
+        ["Range Resurrect Variant", "Acme", "PLA", "#00FF00", 190, 230, 150, "Range Resurrect Parent"],
+        mapping,
+      ),
+    ]);
+
+    expect(result.skipped).toBe(0);
+    expect(result.updated).toBe(1);
+
+    const resurrected = await Filament.findById(variant._id).lean();
+    expect(resurrected._deletedAt).toBeNull(); // actually revived
+    // inherited range temps not pinned
+    expect(resurrected.temperatures?.nozzleRangeMin ?? null).toBeNull();
+    expect(resurrected.temperatures?.nozzleRangeMax ?? null).toBeNull();
+    expect(resurrected.temperatures?.standby ?? null).toBeNull();
+  });
+
+  it("RESURRECT of a trashed variant does not pin parent-inherited values", async () => {
+    const parent = await Filament.create({
+      name: "Universal ABS",
+      vendor: "Acme",
+      type: "ABS",
+      cost: 28,
+      density: 1.04,
+      temperatures: { nozzle: 245, bed: 100 },
+    });
+    const variant = await Filament.create({
+      name: "Universal ABS — Grey",
+      vendor: "Acme",
+      type: "ABS",
+      color: "#888888",
+      parentId: parent._id,
+      // fully inheriting
+      _deletedAt: new Date(), // trashed
+    });
+
+    // Re-import the flattened export row for the trashed variant (values == parent).
+    const result = await upsertImportRows(
+      toRows([
+        ["Universal ABS — Grey", "Acme", "ABS", "#888888", 28, 1.04, 245, 100, "Universal ABS"],
+      ]),
+    );
+    expect(result.updated).toBe(1);
+    expect(result.created).toBe(0);
+
+    const resurrected = await Filament.findById(variant._id).lean();
+    expect(resurrected._deletedAt).toBeNull(); // revived
+    expect(resurrected.cost).toBeNull(); // inherited, not pinned
+    expect(resurrected.density).toBeNull();
+    expect(resurrected.temperatures?.nozzle ?? null).toBeNull();
+    expect(resurrected.temperatures?.bed ?? null).toBeNull();
+
+    // parent edit propagates.
+    await Filament.updateOne({ _id: parent._id }, { $set: { cost: 33 } });
+    const { resolveFilament } = await import("@/lib/resolveFilament");
+    const freshParent = await Filament.findById(parent._id).lean();
+    expect(resolveFilament(resurrected, freshParent).cost).toBe(33);
   });
 });

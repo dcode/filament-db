@@ -42,6 +42,21 @@ describe("/api/filaments/import + export", () => {
     return new NextRequest(url, { method: "POST", body: fd });
   }
 
+  /** Return the body lines of a `[filament:<name>]` section from a bundle. */
+  function extractSection(bundle: string, name: string): string {
+    const lines = bundle.split("\n");
+    const start = lines.findIndex((l) => l.trim() === `[filament:${name}]`);
+    if (start === -1) return "";
+    let end = lines.length;
+    for (let i = start + 1; i < lines.length; i++) {
+      if (lines[i].trim().startsWith("[")) {
+        end = i;
+        break;
+      }
+    }
+    return lines.slice(start + 1, end).join("\n");
+  }
+
   describe("POST /api/filaments/import (INI)", () => {
     it("returns 400 when no file is attached", async () => {
       const req = new NextRequest("http://localhost/api/filaments/import", {
@@ -188,6 +203,55 @@ filament_max_volumetric_speed = 20
       expect(fresh.settings?.filamentdb_nozzle).toBeUndefined();
       expect(fresh.settings?.extrusion_multiplier).toBeUndefined();
     });
+
+    it("#951: re-importing a variant's flattened section does NOT pin parent-inherited values", async () => {
+      // The bundle export resolves a variant through resolveFilament, so its
+      // flat [filament:…] section carries the parent's cost/density/temps.
+      // Re-importing must skip pinning them so GH #106 live inheritance survives.
+      const parent = await Filament.create({
+        name: "PLA Base",
+        vendor: "Acme",
+        type: "PLA",
+        cost: 25,
+        density: 1.24,
+        temperatures: { nozzle: 215, bed: 60 },
+      });
+      const variant = await Filament.create({
+        name: "PLA Base — Red",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#FF0000",
+        parentId: parent._id,
+        // fully inheriting
+      });
+
+      const ini = `[filament:PLA Base — Red]
+filament_type = PLA
+filament_vendor = Acme
+filament_cost = 25
+filament_density = 1.24
+temperature = 215
+bed_temperature = 60
+`;
+      const file = new File([ini], "variant.ini", { type: "text/plain" });
+      const res = await importFilaments(
+        multipartReq("http://localhost/api/filaments/import", file),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.cost).toBeNull();
+      expect(fresh.density).toBeNull();
+      expect(fresh.temperatures?.nozzle ?? null).toBeNull();
+      expect(fresh.temperatures?.bed ?? null).toBeNull();
+
+      // parent edit still propagates.
+      await Filament.updateOne({ _id: parent._id }, { $set: { cost: 30 } });
+      const { resolveFilament } = await import("@/lib/resolveFilament");
+      const freshParent = await Filament.findById(parent._id).lean();
+      expect(resolveFilament(fresh, freshParent).cost).toBe(30);
+    });
   });
 
   describe("POST /api/filaments/prusaslicer (bundle import)", () => {
@@ -284,6 +348,412 @@ filamentdb_nozzle = 0.4 Brass
       expect(body.errors[0]).toMatch(/Ghost/);
       expect(await Filament.findOne({ name: "Good PLA" })).toBeTruthy();
       expect(await Filament.findOne({ name: "Ghost" })).toBeNull();
+    });
+
+    it("#951: re-importing a variant's flattened section keeps inheritance (text-body route)", async () => {
+      const parent = await Filament.create({
+        name: "PETG Base",
+        vendor: "Acme",
+        type: "PETG",
+        cost: 20,
+        temperatures: { nozzle: 240, bed: 70 },
+      });
+      const variant = await Filament.create({
+        name: "PETG Base — Blue",
+        vendor: "Acme",
+        type: "PETG",
+        color: "#0000FF",
+        parentId: parent._id,
+      });
+
+      // Section carries parent-equal cost/temps, plus one genuine override (bed 80).
+      const ini = `[filament:PETG Base — Blue]
+filament_type = PETG
+filament_vendor = Acme
+filament_cost = 20
+temperature = 240
+bed_temperature = 80
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.cost).toBeNull(); // == parent → not pinned
+      expect(fresh.temperatures?.nozzle ?? null).toBeNull(); // == parent → not pinned
+      expect(fresh.temperatures.bed).toBe(80); // ≠ parent 70 → genuine override written
+    });
+
+    it("#951: temps flatten to dot-keys — an update no longer wipes untouched range/standby subfields", async () => {
+      // A root import that carries only nozzle/bed must NOT reset the stored
+      // nozzleRangeMin/Max/standby (the old whole-object $set replaced the
+      // entire subdoc). Dot-key merge leaves untouched siblings intact.
+      const root = await Filament.create({
+        name: "ASA Base",
+        vendor: "Acme",
+        type: "ASA",
+        temperatures: {
+          nozzle: 200,
+          bed: 90,
+          nozzleRangeMin: 190,
+          nozzleRangeMax: 250,
+          standby: 170,
+        },
+      });
+      const ini = `[filament:ASA Base]
+filament_type = ASA
+filament_vendor = Acme
+temperature = 250
+bed_temperature = 100
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await Filament.findById(root._id).lean();
+      expect(fresh.temperatures.nozzle).toBe(250); // updated
+      expect(fresh.temperatures.bed).toBe(100); // updated
+      expect(fresh.temperatures.nozzleRangeMin).toBe(190); // preserved (was wiped pre-fix)
+      expect(fresh.temperatures.nozzleRangeMax).toBe(250); // preserved
+      expect(fresh.temperatures.standby).toBe(170); // preserved
+    });
+
+    it("#951: a variant whose parent is trashed writes values verbatim (nothing to inherit)", async () => {
+      // Guard branch: with no active parent, there is no inheritance to
+      // preserve, so the flattened values are written as the variant's own.
+      const parent = await Filament.create({
+        name: "TPU Base",
+        vendor: "Acme",
+        type: "TPU",
+        cost: 40,
+      });
+      const variant = await Filament.create({
+        name: "TPU Base — Red",
+        vendor: "Acme",
+        type: "TPU",
+        color: "#FF0000",
+        parentId: parent._id,
+      });
+      await Filament.updateOne({ _id: parent._id }, { $set: { _deletedAt: new Date() } });
+
+      const ini = `[filament:TPU Base — Red]
+filament_type = TPU
+filament_vendor = Acme
+filament_cost = 99
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.cost).toBe(99); // written as the variant's own value
+    });
+
+    it("#951: re-importing a section matching the parent clears a variant's stale override ($unset)", async () => {
+      const parent = await Filament.create({
+        name: "PC Base",
+        vendor: "Acme",
+        type: "PC",
+        cost: 45,
+      });
+      const variant = await Filament.create({
+        name: "PC Base — Clear",
+        vendor: "Acme",
+        type: "PC",
+        color: "#EEEEEE",
+        parentId: parent._id,
+        cost: 50, // stale local divergence
+      });
+
+      const ini = `[filament:PC Base — Clear]
+filament_type = PC
+filament_vendor = Acme
+filament_cost = 45
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.cost == null).toBe(true); // $unset → inheritance resumes
+    });
+
+    it("#951 (Codex F2): re-importing a variant does NOT pin the inherited `inherits` preset key", async () => {
+      const parent = await Filament.create({
+        name: "PLA Inh",
+        vendor: "Acme",
+        type: "PLA",
+        inherits: "*PLA*",
+      });
+      const variant = await Filament.create({
+        name: "PLA Inh — Red",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#FF0000",
+        parentId: parent._id,
+        // inheriting `inherits` from the parent
+      });
+
+      const ini = `[filament:PLA Inh — Red]
+filament_type = PLA
+filament_vendor = Acme
+inherits = *PLA*
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).updated).toBe(1);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      // Top-level `inherits` matches the parent → NOT pinned (keeps inheriting).
+      expect(fresh.inherits == null).toBe(true);
+
+      // parent edit still propagates.
+      await Filament.updateOne({ _id: parent._id }, { $set: { inherits: "*PLA-HF*" } });
+      const { resolveFilament } = await import("@/lib/resolveFilament");
+      const freshParent = await Filament.findById(parent._id).lean();
+      expect(resolveFilament(fresh, freshParent).inherits).toBe("*PLA-HF*");
+    });
+
+    it("#951 (Codex R2-B): re-importing a variant leaves NO structured shadow in its settings bag, so a later parent-clear doesn't leak stale values on re-export", async () => {
+      const { INI_TOP_LEVEL_SETTING_KEYS } = await import("@/lib/parseIni");
+      const parent = await Filament.create({
+        name: "RT Base",
+        vendor: "Acme",
+        type: "PLA",
+        cost: 25,
+        density: 1.24,
+        temperatures: { nozzle: 210, bed: 60 },
+        inherits: "*PLA*",
+      });
+      const variant = await Filament.create({
+        name: "RT Base — Red",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#FF0000",
+        parentId: parent._id,
+        // fully inheriting
+      });
+
+      // The flattened variant section the export produced (parent values baked in).
+      const ini = `[filament:RT Base — Red]
+filament_type = PLA
+filament_vendor = Acme
+filament_colour = #FF0000
+filament_cost = 25
+filament_density = 1.24
+temperature = 210
+bed_temperature = 60
+inherits = *PLA*
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      // No structured shadow survives in the settings bag.
+      const vs = (fresh.settings ?? {}) as Record<string, unknown>;
+      for (const k of INI_TOP_LEVEL_SETTING_KEYS) {
+        expect(vs[k]).toBeUndefined();
+      }
+      // Top-level inheritance intact.
+      expect(fresh.cost).toBeNull();
+      expect(fresh.temperatures?.nozzle ?? null).toBeNull();
+      expect(fresh.inherits == null).toBe(true);
+
+      // Now the parent CLEARS those fields. A stale shadow would keep leaking
+      // them into the export; with the shadow stripped the variant emits nothing.
+      await Filament.updateOne(
+        { _id: parent._id },
+        { $set: { cost: null, inherits: null }, $unset: { "temperatures.nozzle": "" } },
+      );
+      const exportRes = await exportFilaments();
+      const bundle = await exportRes.text();
+      const section = extractSection(bundle, "RT Base — Red");
+      expect(section).not.toMatch(/^\s*inherits\s*=\s*\*PLA\*/m);
+      expect(section).not.toMatch(/^\s*filament_cost\s*=\s*25/m);
+      expect(section).not.toMatch(/^\s*temperature\s*=\s*210/m);
+    });
+
+    it("#951 (Codex R2-B): a fresh ROOT create drops structured shadows from settings but keeps the top-level fields", async () => {
+      const { INI_TOP_LEVEL_SETTING_KEYS } = await import("@/lib/parseIni");
+      const ini = `[filament:Fresh ABS]
+filament_type = ABS
+filament_vendor = Acme
+filament_cost = 30
+filament_density = 1.04
+temperature = 245
+inherits = *ABS*
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      expect((await res.json()).created).toBe(1);
+
+      const fresh = await Filament.findOne({ name: "Fresh ABS" }).lean();
+      const vs = (fresh.settings ?? {}) as Record<string, unknown>;
+      for (const k of INI_TOP_LEVEL_SETTING_KEYS) {
+        expect(vs[k]).toBeUndefined();
+      }
+      // Values persisted via their canonical top-level fields.
+      expect(fresh.cost).toBe(30);
+      expect(fresh.density).toBe(1.04);
+      expect(fresh.temperatures.nozzle).toBe(245);
+      expect(fresh.inherits).toBe("*ABS*");
+    });
+
+    it("#951 (Codex R2-B/R3): settings-only keys survive; top-level-mapped keys are stripped + extracted", async () => {
+      const ini = `[filament:Passthrough PLA]
+filament_type = PLA
+filament_vendor = Acme
+filament_spool_weight = 250
+filament_soluble = 1
+filament_notes = keep me
+filament_settings_id = MyPreset
+filament_shrinkage_compensation_xy = 0.3%
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await Filament.findOne({ name: "Passthrough PLA" }).lean();
+      const vs = (fresh.settings ?? {}) as Record<string, unknown>;
+      // No top-level home in the INI mapping → must remain in the settings bag.
+      expect(vs.filament_soluble).toBe("1");
+      expect(vs.filament_notes).toBe("keep me");
+      expect(vs.filament_settings_id).toBe("MyPreset");
+      // GH #951 (R3): spool weight + shrinkage now HAVE a top-level home, so they
+      // are stripped from the settings bag and stored as structured fields.
+      expect(vs.filament_spool_weight).toBeUndefined();
+      expect(vs.filament_shrinkage_compensation_xy).toBeUndefined();
+      expect(fresh.spoolWeight).toBe(250);
+      expect(fresh.shrinkageXY).toBe(0.3);
+    });
+
+    it("#951 (Codex R3): a variant inheriting spool weight + shrinkage doesn't leak the shadow on re-export after a FORM-created parent clears them", async () => {
+      // The parent sets spoolWeight/shrinkage as TOP-LEVEL fields only (as the
+      // form does) — the case option (b) would have missed.
+      const parent = await Filament.create({
+        name: "SW Base",
+        vendor: "Acme",
+        type: "PLA",
+        spoolWeight: 250,
+        shrinkageXY: 0.3,
+      });
+      const variant = await Filament.create({
+        name: "SW Base — Red",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#FF0000",
+        parentId: parent._id,
+        // inheriting spoolWeight + shrinkageXY
+      });
+
+      // The flattened export bakes the parent's resolved values into the section.
+      const ini = `[filament:SW Base — Red]
+filament_type = PLA
+filament_vendor = Acme
+filament_spool_weight = 250
+filament_shrinkage_compensation_xy = 0.3
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await Filament.findById(variant._id).lean();
+      // No shadow in settings, and top-level stays inheriting (null).
+      const vs = (fresh.settings ?? {}) as Record<string, unknown>;
+      expect(vs.filament_spool_weight).toBeUndefined();
+      expect(vs.filament_shrinkage_compensation_xy).toBeUndefined();
+      expect(fresh.spoolWeight ?? null).toBeNull();
+      expect(fresh.shrinkageXY ?? null).toBeNull();
+
+      // Parent CLEARS the fields; a stale shadow would re-emit them on export.
+      await Filament.updateOne(
+        { _id: parent._id },
+        { $set: { spoolWeight: null, shrinkageXY: null } },
+      );
+      const exportRes = await exportFilaments();
+      const section = extractSection(await exportRes.text(), "SW Base — Red");
+      expect(section).not.toMatch(/^\s*filament_spool_weight\s*=/m);
+      expect(section).not.toMatch(/^\s*filament_shrinkage_compensation_xy\s*=/m);
+    });
+
+    it("#951 (Codex R3): a partial INI that omits spool weight does NOT clobber an existing top-level value (no-clobber guard)", async () => {
+      const root = await Filament.create({
+        name: "Clobber Guard PLA",
+        vendor: "Acme",
+        type: "PLA",
+        spoolWeight: 200,
+        shrinkageXY: 0.4,
+      });
+      // Re-import a section for the same name WITHOUT filament_spool_weight/shrinkage.
+      const ini = `[filament:Clobber Guard PLA]
+filament_type = PLA
+filament_vendor = Acme
+filament_cost = 25
+`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+
+      const fresh = await Filament.findById(root._id).lean();
+      expect(fresh.spoolWeight).toBe(200); // NOT nulled by the omitted key
+      expect(fresh.shrinkageXY).toBe(0.4);
+      expect(fresh.cost).toBe(25); // the supplied field did update
     });
   });
 
