@@ -257,9 +257,62 @@ describe("API route correctness", () => {
     );
     expect(res.status).toBe(200);
     const body = await res.json();
-    // The only parent spool is retired → no usable stock → "no data",
-    // not a false ok-based-on-a-retired-spool.
+    // The only parent spool is retired → no usable stock. GH #954: this now
+    // warns (ok:false) instead of silently passing with a "no data" message —
+    // weight data EXISTS, it's just all retired, which is exactly the case the
+    // retired exclusion is meant to surface to the slicer.
     expect(body.spools).toHaveLength(0);
+    expect(body.ok).toBe(false);
+    expect(body.warning).toMatch(/retired/i);
+    expect(body.message).toBeUndefined();
+  });
+
+  it("#954 (Codex): all-retired stock warns even with a null tare (retired check runs before the tare guard)", async () => {
+    // No spoolWeight anywhere (null tare, no parent) + the only weighed stock is
+    // retired. The tare guard would return ok:true first; the retired detection
+    // must run before it so PrusaSlicer still gets the warning.
+    const f = await Filament.create({
+      name: "Null-Tare Retired PLA",
+      vendor: "Prusa",
+      type: "PLA",
+      density: 1.24,
+      diameter: 1.75,
+      // spoolWeight intentionally omitted (null) — no tare.
+      spools: [{ label: "Old", totalWeight: 1000, retired: true }],
+    });
+    const res = await spoolCheck(
+      getReq(`http://localhost/api/filaments/${f._id}/spool-check?weight=100`),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(false);
+    expect(body.warning).toMatch(/retired/i);
+  });
+
+  it("#954 (Codex): an UNWEIGHED active spool + a weighed retired spool stays ok:true (no false warning)", async () => {
+    // Active stock exists — it's just unmeasured. The retired spool has weight but
+    // is out of service. This must NOT warn (active stock exists), it's a no-data case.
+    const f = await Filament.create({
+      name: "Unweighed-Active PLA",
+      vendor: "Prusa",
+      type: "PLA",
+      spoolWeight: 200,
+      density: 1.24,
+      diameter: 1.75,
+      spools: [
+        { label: "Fresh", retired: false }, // active but no totalWeight (unweighed)
+        { label: "Old", totalWeight: 1000, retired: true }, // weighed but retired
+      ],
+    });
+    const res = await spoolCheck(
+      getReq(`http://localhost/api/filaments/${f._id}/spool-check?weight=100`),
+      { params: Promise.resolve({ id: String(f._id) }) },
+    );
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.ok).toBe(true); // active stock exists (unmeasured) → no false warning
+    expect(body.warning).toBeUndefined();
     expect(body.message).toMatch(/no spool weight data/i);
   });
 
