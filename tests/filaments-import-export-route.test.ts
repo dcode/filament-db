@@ -293,6 +293,166 @@ filamentdb_nozzle = 0.6 Brass
       expect(fresh.temperatures.nozzle).toBe(240); // not clobbered by 235/245
     });
 
+    it("#950.8b: a non-hinted import by name MERGES settings — omitted keys (openprinttag_slug/_uuid) survive", async () => {
+      const existing = await Filament.create({
+        name: "Prusament PLA",
+        vendor: "Prusa",
+        type: "PLA",
+        temperatures: { nozzle: 215 },
+        settings: { openprinttag_slug: "prusa-pla", openprinttag_uuid: "abc-123", some_fork_key: "keep" },
+      });
+      // A foreign/hand-crafted section (e.g. from stock PrusaSlicer) that OMITS the OPT keys.
+      const ini = `[filament:Prusament PLA]\nfilament_type = PLA\nfilament_vendor = Prusa\ntemperature = 220\ncooling = 1\n`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      const fresh = await Filament.findById(existing._id);
+      // The OPT re-sync linkage the section didn't carry is PRESERVED (merge, not whole-replace).
+      expect(fresh.settings.openprinttag_slug).toBe("prusa-pla");
+      expect(fresh.settings.openprinttag_uuid).toBe("abc-123");
+      expect(fresh.settings.some_fork_key).toBe("keep");
+      expect(fresh.settings.cooling).toBe("1"); // the section's own passthrough key applied
+      // item5 guard: structured shadows still NOT persisted in the bag.
+      expect(fresh.settings.filament_type).toBeUndefined();
+      expect(fresh.settings.temperature).toBeUndefined();
+      expect(fresh.temperatures.nozzle).toBe(220); // incoming temp landed on the structured field
+    });
+
+    it("#950.8b: a variant re-import MERGES settings — the variant's own openprinttag_slug survives", async () => {
+      const parent = await Filament.create({
+        name: "Base PLA",
+        vendor: "Prusa",
+        type: "PLA",
+        temperatures: { nozzle: 215 },
+      });
+      const variant = await Filament.create({
+        name: "Base PLA Red",
+        vendor: "Prusa",
+        type: "PLA",
+        color: "#cc0000",
+        parentId: parent._id,
+        settings: { openprinttag_slug: "opt-red", some_key: "v" },
+      });
+      const ini = `[filament:Base PLA Red]\nfilament_type = PLA\nfilament_vendor = Prusa\nfilament_colour = #cc0000\ntemperature = 218\n`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      const fresh = await Filament.findById(variant._id);
+      expect(fresh.settings.openprinttag_slug).toBe("opt-red"); // variant's own linkage preserved
+      expect(fresh.settings.some_key).toBe("v");
+    });
+
+    it("#969: a variant's stale settings override that now matches the parent SELF-HEALS (merge-safe $unset)", async () => {
+      const parent = await Filament.create({
+        name: "Heal PLA",
+        vendor: "Prusa",
+        type: "PLA",
+        temperatures: { nozzle: 215 },
+        settings: { cooling: "1" },
+      });
+      const variant = await Filament.create({
+        name: "Heal PLA Red",
+        vendor: "Prusa",
+        type: "PLA",
+        color: "#cc0000",
+        parentId: parent._id,
+        // A stale local override that DIVERGES from the parent, plus an OPT
+        // linkage the imported section will NOT carry.
+        settings: { cooling: "0", openprinttag_slug: "opt-red" },
+      });
+      // The imported section carries cooling = 1, matching the parent — so the
+      // variant should stop overriding it and resume inheriting the parent's "1".
+      const ini = `[filament:Heal PLA Red]\nfilament_type = PLA\nfilament_vendor = Prusa\nfilament_colour = #cc0000\ncooling = 1\n`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      const fresh = await Filament.findById(variant._id).lean();
+      // Self-heal: the stale local override is cleared so inheritance resumes.
+      expect(fresh?.settings?.cooling).toBeUndefined();
+      // Omitted-key preservation still holds — the OPT linkage survives.
+      expect(fresh?.settings?.openprinttag_slug).toBe("opt-red");
+      // And the effective (resolved) value now tracks the parent's "1".
+      const { resolveFilament } = await import("@/lib/resolveFilament");
+      const resolved = resolveFilament(fresh, parent.toObject());
+      expect(resolved.settings?.cooling).toBe("1");
+    });
+
+    it("#950.8b: merge still does NOT persist a never-bagged key (filament_settings_id) into the bag", async () => {
+      const existing = await Filament.create({
+        name: "Guard PLA",
+        vendor: "X",
+        type: "PLA",
+        settings: { openprinttag_slug: "keep-me" },
+      });
+      const ini = `[filament:Guard PLA]\nfilament_type = PLA\nfilament_vendor = X\nfilament_settings_id = Guard PLA\ncooling = 1\n`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      const fresh = await Filament.findById(existing._id);
+      expect(fresh.settings.filament_settings_id).toBeUndefined(); // stripped (item5/950.5)
+      expect(fresh.settings.openprinttag_slug).toBe("keep-me"); // preserved (950.8b merge)
+      expect(fresh.settings.cooling).toBe("1");
+    });
+
+    it("#969 (r4/r5): purges LEGACY never-bagged AND top-level-field shadows on the doc, keeping OPT keys", async () => {
+      // A pre-existing doc carrying stale shadows (from old import code): both
+      // never-bagged hints (filament_settings_id / filamentdb_nozzle) and
+      // top-level-field shadows (temperature / filament_cost). The incoming
+      // section doesn't carry them and the dot-key merge only writes present
+      // keys — so without an explicit purge they'd survive and keep overriding
+      // the re-derived / inherited values on the next export. All must be $unset;
+      // the OPT linkage must survive.
+      const existing = await Filament.create({
+        name: "Legacy PLA",
+        vendor: "X",
+        type: "PLA",
+        settings: {
+          filament_settings_id: "Old Stale Name",
+          filamentdb_nozzle: "0.4 Brass",
+          temperature: "999", // stale top-level-field shadow (r5)
+          filament_cost: "5", // stale top-level-field shadow (r5)
+          openprinttag_slug: "opt-keep",
+          cooling: "0",
+        },
+      });
+      const ini = `[filament:Legacy PLA]\nfilament_type = PLA\nfilament_vendor = X\ncooling = 1\n`;
+      const res = await prusaImport(
+        new NextRequest("http://localhost/api/filaments/prusaslicer", {
+          method: "POST",
+          headers: { "content-type": "text/plain" },
+          body: ini,
+        }),
+      );
+      expect(res.status).toBe(200);
+      const fresh = await Filament.findById(existing._id).lean();
+      expect(fresh.settings.filament_settings_id).toBeUndefined(); // never-bagged shadow purged
+      expect(fresh.settings.filamentdb_nozzle).toBeUndefined(); // never-bagged hint purged
+      expect(fresh.settings.temperature).toBeUndefined(); // top-level shadow purged (r5)
+      expect(fresh.settings.filament_cost).toBeUndefined(); // top-level shadow purged (r5)
+      expect(fresh.settings.openprinttag_slug).toBe("opt-keep"); // OPT linkage preserved
+      expect(fresh.settings.cooling).toBe("1"); // section value applied
+    });
+
     it("#872: a hint-only collapsed section does NOT clobber the base's vendor/type/cost/density/color", async () => {
       const base = await Filament.create({
         name: "ABS",

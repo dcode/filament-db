@@ -213,4 +213,141 @@ describe("upsertIniFilament — create-race recovery (GH #951)", () => {
       expect(await Filament.findOne({ name: "Live Name", _deletedAt: null })).not.toBeNull();
     });
   });
+
+  // ── GH #969: the dot-key settings merge (#950.8b) preserves omitted keys but
+  //    no longer wipes a stale variant override that now matches the parent.
+  //    `buildIniUpdate` restores that self-heal with per-key `settings.<k>`
+  //    $unsets, disjoint from the merge's $set dot-keys. ──────────────────────
+  describe("variant settings self-heal (GH #969)", () => {
+    const variantSection = (
+      name: string,
+      settings: Record<string, string>,
+    ): CollapsedFilamentData => ({ name, settings, inherits: null });
+
+    it("unsets a stale override that now matches the parent, preserves an omitted key", async () => {
+      const parent = await Filament.create({
+        name: "SH Parent",
+        vendor: "Acme",
+        type: "PLA",
+        settings: { cooling: "1" },
+      });
+      const variant = await Filament.create({
+        name: "SH Variant",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#cc0000",
+        parentId: parent._id,
+        settings: { cooling: "0", keep_me: "v" },
+      });
+      const outcome = await upsertIniFilament(variantSection("SH Variant", { cooling: "1" }));
+      expect(outcome).toBe("updated");
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.settings.cooling).toBeUndefined(); // self-healed → inherits parent "1"
+      expect(fresh.settings.keep_me).toBe("v"); // omitted key preserved (merge, not replace)
+    });
+
+    it("writes a differing key while leaving a matching-but-unowned key to inherit", async () => {
+      const parent = await Filament.create({
+        name: "Diff Parent",
+        vendor: "Acme",
+        type: "PLA",
+        settings: { fan: "50", theme: "dark" },
+      });
+      const variant = await Filament.create({
+        name: "Diff Variant",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#00cc00",
+        parentId: parent._id,
+        settings: { extra: "old" }, // a variant-only key absent from the parent
+      });
+      // fan differs from parent → written; theme matches parent AND the variant
+      // has no local override → neither set nor unset (keeps inheriting); extra is
+      // absent from the parent → a genuine override, written through (not unset).
+      const outcome = await upsertIniFilament(
+        variantSection("Diff Variant", { fan: "80", theme: "dark", extra: "new" }),
+      );
+      expect(outcome).toBe("updated");
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh.settings.fan).toBe("80"); // divergent value written through
+      expect(fresh.settings.theme).toBeUndefined(); // matches parent, unowned → inherits
+      expect(fresh.settings.extra).toBe("new"); // absent from parent → override written, not healed
+    });
+
+    it("clears a parent-EQUAL local override so a future parent edit propagates (GH #969 round 2)", async () => {
+      const parent = await Filament.create({
+        name: "Eq Parent",
+        vendor: "Acme",
+        type: "PLA",
+        settings: { cooling: "1" },
+      });
+      const variant = await Filament.create({
+        name: "Eq Variant",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#cc00cc",
+        parentId: parent._id,
+        // Local override that ALREADY equals the parent — functionally
+        // inheriting now, but pinned: a future parent edit wouldn't propagate.
+        settings: { cooling: "1" },
+      });
+      const outcome = await upsertIniFilament(variantSection("Eq Variant", { cooling: "1" }));
+      expect(outcome).toBe("updated");
+      const fresh = await Filament.findById(variant._id).lean();
+      // Pin cleared → the key is truly inherited now.
+      expect(fresh.settings.cooling).toBeUndefined();
+      // Prove propagation: edit the parent, the variant now tracks it.
+      await Filament.updateOne({ _id: parent._id }, { $set: { "settings.cooling": "2" } });
+      const { resolveFilament } = await import("@/lib/resolveFilament");
+      const freshParent = await Filament.findById(parent._id).lean();
+      const freshVariant = await Filament.findById(variant._id).lean();
+      expect(resolveFilament(freshVariant, freshParent).settings.cooling).toBe("2");
+    });
+
+    it("self-heals on the RESURRECT path — a trashed variant's pin is cleared alongside the tombstone (phase 2)", async () => {
+      const parent = await Filament.create({
+        name: "Res Parent",
+        vendor: "Acme",
+        type: "PLA",
+        settings: { cooling: "1" },
+      });
+      // A TRASHED variant with a parent-equal pin — resurrected by the import.
+      const variant = await Filament.create({
+        name: "Res Variant",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#cccc00",
+        parentId: parent._id,
+        settings: { cooling: "1" },
+        _deletedAt: new Date(),
+      });
+      const outcome = await upsertIniFilament(variantSection("Res Variant", { cooling: "1" }));
+      expect(outcome).toBe("updated");
+      const fresh = await Filament.findById(variant._id).lean();
+      expect(fresh._deletedAt).toBeNull(); // resurrected
+      expect(fresh.settings.cooling).toBeUndefined(); // pin cleared on resurrect ($unset rode along)
+    });
+
+    it("does not throw when the variant carries no settings at all", async () => {
+      const parent = await Filament.create({
+        name: "NoSet Parent",
+        vendor: "Acme",
+        type: "PLA",
+        settings: { cooling: "1" },
+      });
+      const variant = await Filament.create({
+        name: "NoSet Variant",
+        vendor: "Acme",
+        type: "PLA",
+        color: "#0000cc",
+        parentId: parent._id,
+        // no settings field
+      });
+      const outcome = await upsertIniFilament(variantSection("NoSet Variant", { cooling: "1" }));
+      expect(outcome).toBe("updated");
+      const fresh = await Filament.findById(variant._id).lean();
+      // Nothing to heal; the matching key keeps inheriting (no phantom local write).
+      expect(fresh.settings?.cooling).toBeUndefined();
+    });
+  });
 });
