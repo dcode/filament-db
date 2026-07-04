@@ -48,6 +48,70 @@ export function isNtagSizeName(v: unknown): v is NtagSizeName {
   return v === "NTAG213" || v === "NTAG215" || v === "NTAG216";
 }
 
+/** Largest real NTAG (NTAG216) NDEF capacity — the hard write ceiling. */
+export const NTAG216_MAX_NDEF_BYTES = 872;
+/** NTAG213 extent — the conservative capacity safe to write on ANY NTAG (its
+ *  lock/config pages sit above its 144-byte user area). */
+export const NTAG213_NDEF_BYTES = 144;
+
+/** Outcome of {@link resolveNtagWriteSize}. */
+export type NtagWriteSizeDecision =
+  | { ok: true; ndefBytes: number; needsFormat: boolean }
+  | { ok: false; error: "size_unknown" };
+
+/**
+ * Decide the NDEF byte capacity to write + whether to (re)write the tag's
+ * Capability Container, from the page-3 CC state, the GET_VERSION result (null
+ * when the reader can't answer it — e.g. the ACR1552U rejects GET_VERSION with
+ * SW 0x6900, GH #973), and an optional user-declared size.
+ *
+ * Pure + unit-tested on purpose: the electron write path isn't exercised by CI,
+ * and this is the safety-critical decision — a size larger than the physical
+ * chip would drive a write into a smaller NTAG's lock/config pages (a permanent
+ * brick the page-address bound can't catch). The caller pairs this with a
+ * page-read probe of the resulting top page to prove the chip is physically big
+ * enough before any write.
+ *
+ * Rules:
+ *  - Formatted (CC 0xE1) + GET_VERSION confirmed → GET_VERSION is authoritative
+ *    for the chip's TRUE size, so use it directly (not min(CC, verSize)) and
+ *    REWRITE the CC when it disagrees. This corrects a wrong CC in BOTH
+ *    directions: an inflated CC (a real 213 claiming 215) shrinks to the real
+ *    size, and an under-sized CC (a real 215 stamped 144 by a prior bad write)
+ *    grows back so its Extended image isn't wrongly rejected as TAG_TOO_SMALL.
+ *    The caller's page-read probe guards against a mis-reported (too-large) size.
+ *  - Formatted + GET_VERSION unavailable + user size → the USER SIZE is
+ *    authoritative and the CC is REWRITTEN to it (needsFormat=true) — this
+ *    corrects a tag an earlier failed write mis-sized on a GET_VERSION-dead
+ *    reader (e.g. a real 215 stamped with a 144-byte CC stuck at NTAG213).
+ *  - Formatted + neither → conservative min(CC, 144), no reformat (legacy).
+ *  - Blank (CC 0x00) + a size (GET_VERSION or user) → that size, reformat.
+ *  - Blank + neither → { ok:false, size_unknown } — never guess.
+ */
+export function resolveNtagWriteSize(opts: {
+  ccMagic: number;
+  ccSizeByte: number;
+  verSize: number | null;
+  hintBytes: number | null;
+}): NtagWriteSizeDecision {
+  const { ccMagic, ccSizeByte, verSize, hintBytes } = opts;
+  // Clamp the CC size byte to [0, 872] and treat a non-finite value as 0 — in
+  // production it's always a Uint8Array byte (0–255), but this keeps the bound
+  // total (no NaN can leak into ndefBytes).
+  const safeCcByte = Number.isFinite(ccSizeByte) ? Math.trunc(ccSizeByte) : 0;
+  const ccBytes = Math.min(Math.max(0, safeCcByte * 8), NTAG216_MAX_NDEF_BYTES);
+  if (ccMagic === 0xe1) {
+    // GET_VERSION is authoritative for the true chip size: use it directly and
+    // rewrite the CC when it disagrees (fixes an under-sized OR inflated CC).
+    if (verSize != null) return { ok: true, ndefBytes: verSize, needsFormat: ccBytes !== verSize };
+    if (hintBytes != null) return { ok: true, ndefBytes: hintBytes, needsFormat: true };
+    return { ok: true, ndefBytes: Math.min(ccBytes, NTAG213_NDEF_BYTES), needsFormat: false };
+  }
+  const resolved = verSize ?? hintBytes;
+  if (resolved == null) return { ok: false, error: "size_unknown" };
+  return { ok: true, ndefBytes: resolved, needsFormat: true };
+}
+
 /**
  * The full 8-byte NXP NTAG21x GET_VERSION version block:
  *   [0]=0x00 header  [1]=0x04 vendor(NXP)  [2]=0x04 product(NTAG)
