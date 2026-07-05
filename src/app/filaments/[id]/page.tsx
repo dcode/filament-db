@@ -26,7 +26,7 @@ import { deriveFinish } from "@/lib/filamentFinish";
 import { deriveArrangement } from "@/lib/filamentColors";
 import type { FilamentDetail, FilamentCalibration } from "@/types/filament";
 import { useTranslation } from "@/i18n/TranslationProvider";
-import { formatDate } from "@/lib/dateFormat";
+import { useDateFormat } from "@/hooks/useDateFormat";
 import { formatGrams } from "@/lib/formatWeight";
 
 type Filament = FilamentDetail;
@@ -2463,7 +2463,8 @@ function SpoolCard({
   onRegenerateInstanceId,
   highlight,
 }: SpoolCardProps) {
-  const { t, locale } = useTranslation();
+  const { t } = useTranslation();
+  const { formatDate } = useDateFormat();
   const [weightInput, setWeightInput] = useState("");
   const [saving, setSaving] = useState(false);
   const [editingLabel, setEditingLabel] = useState(false);
@@ -3008,7 +3009,7 @@ function SpoolCard({
             {spool.dryCycles && spool.dryCycles.length > 0 && (
               <p className="text-xs text-gray-400 mt-1">
                 {t("detail.spool.lastDried", {
-                  date: formatDate(spool.dryCycles[spool.dryCycles.length - 1].date, locale),
+                  date: formatDate(spool.dryCycles[spool.dryCycles.length - 1].date),
                 })}
               </p>
             )}
@@ -3056,7 +3057,6 @@ function SpoolCard({
                             UTC (#941 / Codex review). */}
                         {formatDate(
                           u.date,
-                          locale,
                           isUtcMidnight(u.date) ? { timeZone: "UTC" } : undefined,
                         )}
                       </span>
