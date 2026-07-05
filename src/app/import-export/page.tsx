@@ -6,6 +6,7 @@ import { useToast } from "@/components/Toast";
 import ImportAtlasDialog from "@/components/ImportAtlasDialog";
 import PrusamentImportDialog from "@/components/PrusamentImportDialog";
 import SpoolCsvImportDialog from "@/components/SpoolCsvImportDialog";
+import OrcaLibraryImportDialog from "@/components/OrcaLibraryImportDialog";
 import { useTranslation } from "@/i18n/TranslationProvider";
 
 /**
@@ -25,6 +26,7 @@ export default function ImportExportPage() {
   const [showAtlas, setShowAtlas] = useState(false);
   const [showPrusament, setShowPrusament] = useState(false);
   const [showSpoolCsv, setShowSpoolCsv] = useState(false);
+  const [showOrcaLibrary, setShowOrcaLibrary] = useState(false);
   const [importingFile, setImportingFile] = useState(false);
   const [importingBambu, setImportingBambu] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -163,6 +165,12 @@ export default function ImportExportPage() {
           className="hidden"
           onChange={handleBambuImport}
         />
+        <Tile
+          dot="bg-cyan-500"
+          label={t("orcaImport.tileLabel")}
+          desc={t("orcaImport.tileDesc")}
+          onClick={() => setShowOrcaLibrary(true)}
+        />
       </Section>
 
       {/* Import spools */}
@@ -236,6 +244,16 @@ export default function ImportExportPage() {
           onImported={(message) => {
             toast(message, "success");
             setShowPrusament(false);
+          }}
+        />
+      )}
+      {showOrcaLibrary && (
+        <OrcaLibraryImportDialog
+          onClose={() => setShowOrcaLibrary(false)}
+          onImported={(message) => {
+            toast(message, "success");
+            // Keep the dialog open — it shows per-profile results/errors;
+            // the user closes it when done reviewing.
           }}
         />
       )}

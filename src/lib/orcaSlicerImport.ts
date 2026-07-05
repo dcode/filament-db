@@ -159,6 +159,72 @@ export function isConcreteOrcaProfile(raw: Record<string, unknown>): boolean {
 }
 
 /**
+ * True when a parsed JSON file looks like an OrcaSlicer FILAMENT preset —
+ * used by the folder-scan UI to drop machine/process profiles when the
+ * user picks a directory above `filament/`. Lenient on a MISSING `type`
+ * (hand-rolled presets may omit it) but rejects an explicit non-filament
+ * one.
+ */
+export function isOrcaFilamentPreset(raw: unknown): raw is Record<string, unknown> {
+  if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const type = unwrapString((raw as Record<string, unknown>).type);
+  return type == null || type === "filament";
+}
+
+/**
+ * Display metadata for the picker UI — vendor + material, falling back up
+ * the `inherits` chain when the profile doesn't carry the key itself (the
+ * canonical library's "Generic PLA @System" gets its PLA type from the
+ * abstract template; without the walk the material filter would silently
+ * miss it). Cycle-safe; missing ancestors just stop the walk.
+ */
+export function orcaProfileMeta(
+  node: OrcaProfileNode,
+  byName?: Map<string, OrcaProfileNode>,
+): {
+  vendor?: string;
+  material?: string;
+} {
+  let vendor: string | undefined;
+  let material: string | undefined;
+  const visited = new Set<string>();
+  let cur: OrcaProfileNode | undefined = node;
+  while (cur && !visited.has(cur.name)) {
+    visited.add(cur.name);
+    vendor = vendor ?? unwrapString(cur.raw.filament_vendor);
+    material = material ?? unwrapString(cur.raw.filament_type);
+    if ((vendor && material) || !byName) break;
+    cur = cur.inheritsName ? byName.get(cur.inheritsName) : undefined;
+  }
+  return { vendor, material };
+}
+
+/**
+ * Collect the raw preset objects the API needs for a selection: the
+ * selected profiles plus every ancestor reachable through `inherits`
+ * (deduped). Missing ancestors and unknown selected names are simply
+ * omitted — the server reports them per-profile, and failing here would
+ * block the profiles that ARE resolvable. Cycle-safe via the visited set.
+ */
+export function collectOrcaClosure(
+  selectedNames: string[],
+  byName: Map<string, OrcaProfileNode>,
+): Record<string, unknown>[] {
+  const visited = new Set<string>();
+  const out: Record<string, unknown>[] = [];
+  const visit = (name: string) => {
+    if (visited.has(name)) return;
+    visited.add(name);
+    const node = byName.get(name);
+    if (!node) return;
+    out.push(node.raw);
+    if (node.inheritsName) visit(node.inheritsName);
+  };
+  for (const name of selectedNames) visit(name);
+  return out;
+}
+
+/**
  * Index raw preset JSONs by `name`. Malformed entries (non-objects,
  * nameless profiles, duplicate names) are reported in `errors` and skipped
  * — one bad file must not sink the batch. On a duplicate name the FIRST

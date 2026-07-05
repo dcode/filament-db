@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   indexOrcaProfiles,
   isConcreteOrcaProfile,
+  isOrcaFilamentPreset,
+  orcaProfileMeta,
+  collectOrcaClosure,
   resolveOrcaChain,
   flattenOrcaProfile,
   diffOrcaRaw,
@@ -119,6 +122,85 @@ describe("isConcreteOrcaProfile", () => {
     expect(isConcreteOrcaProfile({ instantiation: "true" })).toBe(true);
     expect(isConcreteOrcaProfile({ instantiation: ["true"] })).toBe(true);
     expect(isConcreteOrcaProfile({})).toBe(true);
+  });
+});
+
+describe("isOrcaFilamentPreset", () => {
+  it("accepts filament presets and presets without a type", () => {
+    expect(isOrcaFilamentPreset({ type: "filament", name: "X" })).toBe(true);
+    expect(isOrcaFilamentPreset({ type: ["filament"], name: "X" })).toBe(true);
+    expect(isOrcaFilamentPreset({ name: "X" })).toBe(true);
+  });
+
+  it("rejects machine/process profiles and non-objects", () => {
+    expect(isOrcaFilamentPreset({ type: "machine", name: "X" })).toBe(false);
+    expect(isOrcaFilamentPreset({ type: "process", name: "X" })).toBe(false);
+    expect(isOrcaFilamentPreset(null)).toBe(false);
+    expect(isOrcaFilamentPreset(["filament"])).toBe(false);
+    expect(isOrcaFilamentPreset("filament")).toBe(false);
+  });
+});
+
+describe("orcaProfileMeta", () => {
+  it("returns vendor + material from the profile's own keys", () => {
+    const { byName } = indexOrcaProfiles([GENERIC]);
+    expect(orcaProfileMeta(byName.get("Generic PLA @System")!)).toEqual({
+      vendor: "Generic",
+      material: undefined, // GENERIC's own keys carry no filament_type, no map to walk
+    });
+    const { byName: withType } = indexOrcaProfiles([TEMPLATE]);
+    expect(orcaProfileMeta(withType.get("fdm_filament_pla")!).material).toBe("PLA");
+  });
+
+  it("falls back up the inherits chain for missing vendor/material", () => {
+    const byName = index(TEMPLATE, GENERIC, VENDOR);
+    // GENERIC's material comes from the abstract template
+    expect(orcaProfileMeta(byName.get("Generic PLA @System")!, byName)).toEqual({
+      vendor: "Generic",
+      material: "PLA",
+    });
+    // VENDOR's own vendor wins; material still resolved through the chain
+    expect(orcaProfileMeta(byName.get("Polymaker PolyLite PLA @System")!, byName)).toEqual({
+      vendor: "Polymaker",
+      material: "PLA",
+    });
+  });
+
+  it("is cycle-safe and stops at missing ancestors", () => {
+    const a = { name: "A", instantiation: "true", inherits: "B" };
+    const b = { name: "B", instantiation: "true", inherits: "A", filament_type: ["PLA"] };
+    const byName = index(a, b);
+    expect(orcaProfileMeta(byName.get("A")!, byName).material).toBe("PLA");
+    const orphan = { name: "O", instantiation: "true", inherits: "missing" };
+    expect(orcaProfileMeta(index(orphan).get("O")!, index(orphan)).material).toBeUndefined();
+  });
+});
+
+describe("collectOrcaClosure", () => {
+  it("collects selected profiles plus their ancestor chains, deduped", () => {
+    const byName = index(TEMPLATE, GENERIC, VENDOR);
+    const closure = collectOrcaClosure(
+      ["Polymaker PolyLite PLA @System", "Generic PLA @System"],
+      byName,
+    );
+    expect(closure.map((r) => (r as { name: string }).name)).toEqual([
+      "Polymaker PolyLite PLA @System",
+      "Generic PLA @System",
+      "fdm_filament_pla",
+    ]);
+  });
+
+  it("omits unknown names and missing ancestors instead of throwing", () => {
+    const orphan = { name: "Orphan", instantiation: "true", inherits: "missing" };
+    const closure = collectOrcaClosure(["Orphan", "Ghost"], index(orphan));
+    expect(closure).toEqual([orphan]);
+  });
+
+  it("is cycle-safe", () => {
+    const a = { name: "A", instantiation: "true", inherits: "B" };
+    const b = { name: "B", instantiation: "true", inherits: "A" };
+    const closure = collectOrcaClosure(["A"], index(a, b));
+    expect(closure).toEqual([a, b]);
   });
 });
 
