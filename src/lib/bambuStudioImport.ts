@@ -37,7 +37,12 @@
 // Bambu/Orca use per-plate keys (cool_plate_temp, hot_plate_temp, …)
 // rather than a single bed_temperature. Invert so each plate key tells
 // us which `bedTypeTemps[]` entry it belongs in.
-const BED_PLATE_KEYS: Record<string, { bedType: string; field: "temperature" | "firstLayerTemperature" }> = {
+//
+// Exported for the OrcaSlicer library importer (src/lib/orcaSlicerImport.ts):
+// its variant-diff logic must treat the plate keys as an atomic group
+// (`bedTypeTemps` inherits as a whole array), and sharing the key list here
+// keeps the two sides from drifting.
+export const BED_PLATE_KEYS: Record<string, { bedType: string; field: "temperature" | "firstLayerTemperature" }> = {
   cool_plate_temp: { bedType: "Cool Plate", field: "temperature" },
   cool_plate_temp_initial_layer: { bedType: "Cool Plate", field: "firstLayerTemperature" },
   eng_plate_temp: { bedType: "Engineering Plate", field: "temperature" },
@@ -132,7 +137,11 @@ const STRUCTURED_KEYS = new Set<string>([
 // each through CALIBRATION_KEYS + extract into the right hint field
 // below. Older aliases (`fan_min_speed`, `filament_retract_*`) stay
 // listed as fallbacks so hand-edited / older profiles still work.
-const CALIBRATION_KEYS = new Set<string>([
+// Exported for the OrcaSlicer library importer (src/lib/orcaSlicerImport.ts):
+// like BED_PLATE_KEYS above, the calibration keys form an atomic group in
+// variant diffs — a variant either carries a full calibration row or none,
+// because `calibrations[]` inherits from the parent as a whole array.
+export const CALIBRATION_KEYS = new Set<string>([
   "filament_flow_ratio",
   "filament_extrusion_multiplier",
   "pressure_advance",
