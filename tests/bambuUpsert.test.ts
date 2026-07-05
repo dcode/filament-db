@@ -47,11 +47,17 @@ describe("upsertParsedBambuFilament (three-phase upsert lib)", () => {
     await Filament.create({ name: "QA Upsert PLA", vendor: "Old", type: "PLA" });
     // Phase-1 findOne sees the row, but the guarded findOneAndUpdate misses
     // (simulating a concurrent soft-delete) → phase 2 (nothing trashed) →
-    // phase 3 create throws E11000 (the row actually still exists) → the
-    // race path re-fetches it and converges via a real update.
+    // phase 3 create collides (E11000 mocked — the REAL partial-unique
+    // index builds asynchronously and can lag under a loaded coverage run,
+    // so relying on the DB to throw is flaky) → the race path re-fetches
+    // the row and converges via a real update.
     const spy = vi
       .spyOn(Filament, "findOneAndUpdate")
       .mockImplementationOnce(async () => null);
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      throw e11000;
+    });
     const result = await upsert(parsed());
     expect(spy).toHaveBeenCalled();
     expect(result.ok).toBe(true);
