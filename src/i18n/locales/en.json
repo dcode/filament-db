@@ -249,7 +249,7 @@
   "orcaImport.tileLabel": "OrcaSlicer library (folder)",
   "orcaImport.tileDesc": "Import presets from your OrcaSlicer filament library — inherited base profiles are resolved and linked as parents",
   "orcaImport.dialogTitle": "Import OrcaSlicer filament library",
-  "orcaImport.dialogDescription": "Select your OrcaSlicer filament folder (e.g. system/OrcaFilamentLibrary/filament), then pick the profiles to import. Base profiles referenced via \"inherits\" are imported automatically and linked as parents.",
+  "orcaImport.dialogDescription": "Select your OrcaSlicer filament folder (e.g. system/OrcaFilamentLibrary/filament), then pick the profiles to import. Base profiles referenced via \"inherits\" are imported automatically and linked as parents. Importing your own modified profiles? Select a parent folder that contains both the system library and your user profile folder (e.g. the OrcaSlicer config folder itself) so any base profile they inherit from is found too.",
   "orcaImport.chooseFolder": "Choose folder…",
   "orcaImport.scanning": "Reading folder…",
   "orcaImport.parsedSummary": "{count} filament profiles found ({skipped} files skipped)",

@@ -6,6 +6,7 @@ import { useTranslation } from "@/i18n/TranslationProvider";
 import {
   collectOrcaClosure,
   indexOrcaProfiles,
+  isNonFilamentOrcaPath,
   isOrcaFilamentPreset,
   orcaProfileMeta,
   type OrcaProfileNode,
@@ -45,6 +46,16 @@ const MAX_FILES = 10_000;
  * `/api/filaments/orcaslicer`, which resolves inheritance server-side and
  * links base profiles as parents. Abstract templates never show in the
  * picker — they only merge into their descendants.
+ *
+ * The picker also accepts a directory ABOVE `filament/` — e.g. the whole
+ * `OrcaSlicer` config root — which is useful when a user profile
+ * `inherits` a system-library base: both trees need to be in the parsed
+ * set for `collectOrcaClosure` to resolve the chain (see the module
+ * docblock on `src/lib/orcaSlicerImport.ts`). `webkitdirectory` recurses
+ * into subdirectories, so one folder pick covers `system/` and `user/`
+ * together; `isNonFilamentOrcaPath` + `isOrcaFilamentPreset` filter the
+ * sibling `machine/`/`process/` trees back out so only filament presets
+ * reach the picker.
  */
 export default function OrcaLibraryImportDialog({ onClose, onImported }: Props) {
   const { t } = useTranslation();
@@ -115,24 +126,36 @@ export default function OrcaLibraryImportDialog({ onClose, onImported }: Props) 
   }, [onClose]);
 
   const handleFolder = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = Array.from(e.target.files ?? []).filter((f) =>
+    const allFiles = Array.from(e.target.files ?? []).filter((f) =>
       f.name.toLowerCase().endsWith(".json"),
     );
     if (folderInputRef.current) folderInputRef.current.value = "";
-    if (files.length === 0) {
+    if (allFiles.length === 0) {
       setByName(new Map());
       setScanInfo({ found: 0, skipped: 0 });
       return;
     }
     setScanning(true);
     try {
+      // Drop machine/process directories up front — by PATH, without
+      // parsing — when the user picked a folder above `filament/` (e.g.
+      // the whole OrcaSlicer config directory). Content sniffing alone
+      // can't always tell (some machine/process presets omit `type`).
       let skipped = 0;
+      const files = allFiles.filter((f) => {
+        const relPath = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+        if (isNonFilamentOrcaPath(relPath)) {
+          skipped++;
+          return false;
+        }
+        return true;
+      });
       const raws: unknown[] = [];
       for (const file of files.slice(0, MAX_FILES)) {
         try {
           const parsed: unknown = JSON.parse(await file.text());
-          // Drop machine/process profiles when the user picked a folder
-          // above `filament/` — only filament presets belong in the picker.
+          // Only filament presets belong in the picker — a defense-in-depth
+          // content check for files the path filter above didn't catch.
           if (isOrcaFilamentPreset(parsed)) raws.push(parsed);
           else skipped++;
         } catch {

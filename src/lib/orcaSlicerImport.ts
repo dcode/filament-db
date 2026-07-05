@@ -8,6 +8,19 @@
  * the keys it overrides, so importing one file in isolation loses most of
  * its values — the chain has to be resolved first.
  *
+ * A user's own saved presets live in a SEPARATE tree
+ * (`…/OrcaSlicer/user/<id>/filament/**.json`) and typically `inherits` a
+ * profile from the system tree above. Since the closure resolution below
+ * only sees what the folder-picker UI parsed (`collectOrcaClosure`), a
+ * user preset whose base isn't in the uploaded set fails per-profile with
+ * "inherits ... not found in the submitted set". The picker's
+ * `webkitdirectory` upload recurses into subdirectories, so pointing it at
+ * a directory that's a common PARENT of both `system/` and `user/` (e.g.
+ * the OrcaSlicer config root itself) picks up every file needed to resolve
+ * either tree's chains in one pass — see `isNonFilamentOrcaPath` below for
+ * how the non-filament siblings (`machine/`, `process/`) under that same
+ * parent get filtered back out.
+ *
  * This module owns everything up to (but not including) the database:
  *   - indexing raw preset JSONs by `name` (the key `inherits` references)
  *   - classifying abstract templates (`instantiation: "false"`) vs concrete
@@ -161,14 +174,40 @@ export function isConcreteOrcaProfile(raw: Record<string, unknown>): boolean {
 /**
  * True when a parsed JSON file looks like an OrcaSlicer FILAMENT preset —
  * used by the folder-scan UI to drop machine/process profiles when the
- * user picks a directory above `filament/`. Lenient on a MISSING `type`
- * (hand-rolled presets may omit it) but rejects an explicit non-filament
- * one.
+ * user picks a directory above `filament/`.
+ *
+ * An explicit `type` is authoritative either way. A MISSING `type` (some
+ * hand-rolled/legacy presets omit it) falls back to a POSITIVE filament
+ * signal — an abstract template name (`fdm_filament_*`) or at least one
+ * `filament_*`-prefixed key — rather than accepting the file outright:
+ * real-world machine/nozzle preset JSONs have been observed omitting
+ * `type` too, and blanket-accepting a missing `type` let them leak into
+ * the picker when the user selected a directory above `filament/`.
  */
 export function isOrcaFilamentPreset(raw: unknown): raw is Record<string, unknown> {
   if (raw == null || typeof raw !== "object" || Array.isArray(raw)) return false;
-  const type = unwrapString((raw as Record<string, unknown>).type);
-  return type == null || type === "filament";
+  const obj = raw as Record<string, unknown>;
+  const type = unwrapString(obj.type);
+  if (type != null) return type === "filament";
+  const name = unwrapString(obj.name) ?? "";
+  if (name.startsWith("fdm_filament")) return true;
+  return Object.keys(obj).some((k) => k.startsWith("filament_"));
+}
+
+/**
+ * True when a folder-relative path points into a NON-filament preset
+ * directory in OrcaSlicer's on-disk layout — `.../machine/*.json`
+ * (printer/nozzle presets) or `.../process/*.json` (print presets), the
+ * sibling trees to `.../filament/*.json` in both the bundled system
+ * library and a user's saved-preset folder. Lets the folder-scan UI skip
+ * those files up front — without even parsing them — when the user
+ * points the picker at a directory ABOVE `filament/` (e.g. the whole
+ * `%APPDATA%/OrcaSlicer` tree), which content sniffing alone can't
+ * always catch (some machine/process presets omit `type`).
+ */
+export function isNonFilamentOrcaPath(relativePath: string): boolean {
+  const segments = relativePath.split(/[/\\]/).map((s) => s.toLowerCase());
+  return segments.includes("machine") || segments.includes("process");
 }
 
 /**

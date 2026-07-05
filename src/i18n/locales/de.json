@@ -249,7 +249,7 @@
   "orcaImport.tileLabel": "OrcaSlicer-Bibliothek (Ordner)",
   "orcaImport.tileDesc": "Presets aus der OrcaSlicer-Filamentbibliothek importieren — vererbte Basisprofile werden aufgelöst und als Eltern verknüpft",
   "orcaImport.dialogTitle": "OrcaSlicer-Filamentbibliothek importieren",
-  "orcaImport.dialogDescription": "Wähle deinen OrcaSlicer-Filamentordner (z. B. system/OrcaFilamentLibrary/filament) und dann die zu importierenden Profile. Über \"inherits\" referenzierte Basisprofile werden automatisch importiert und als Eltern verknüpft.",
+  "orcaImport.dialogDescription": "Wähle deinen OrcaSlicer-Filamentordner (z. B. system/OrcaFilamentLibrary/filament) und dann die zu importierenden Profile. Über \"inherits\" referenzierte Basisprofile werden automatisch importiert und als Eltern verknüpft. Möchtest du eigene, angepasste Profile importieren? Wähle einen übergeordneten Ordner, der sowohl die Systembibliothek als auch deinen Benutzerprofil-Ordner enthält (z. B. den OrcaSlicer-Konfigurationsordner selbst), damit auch jedes Basisprofil gefunden wird, von dem sie erben.",
   "orcaImport.chooseFolder": "Ordner wählen…",
   "orcaImport.scanning": "Ordner wird gelesen…",
   "orcaImport.parsedSummary": "{count} Filamentprofile gefunden ({skipped} Dateien übersprungen)",

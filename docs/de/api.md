@@ -448,7 +448,7 @@ Liefert `application/json`: ein Array von OrcaSlicer-Profil-Objekten.
 
 ### POST /api/filaments/orcaslicer
 
-Bulk-Import von OrcaSlicer-Filamentbibliotheks-Presets (die Dateien unter `…/OrcaSlicer/system/OrcaFilamentLibrary/filament`), deren `inherits`-Ketten serverseitig aufgelöst werden. Die Kachel „OrcaSlicer-Bibliothek (Ordner)" auf der Import/Export-Seite bedient diesen Endpunkt per Ordner-Upload.
+Bulk-Import von OrcaSlicer-Filamentbibliotheks-Presets (die Dateien unter `…/OrcaSlicer/system/OrcaFilamentLibrary/filament`), deren `inherits`-Ketten serverseitig aufgelöst werden. Die Kachel „OrcaSlicer-Bibliothek (Ordner)" auf der Import/Export-Seite bedient diesen Endpunkt per Ordner-Upload; die Auswahl durchsucht Unterverzeichnisse rekursiv und filtert Nicht-Filament-Presets heraus, sodass auch ein übergeordnetes Verzeichnis gewählt werden kann, das SOWOHL die Systembibliothek als auch den eigenen Benutzerprofil-Ordner enthält (z. B. der OrcaSlicer-Konfigurationsordner selbst) — nötig, wenn die `inherits`-Kette eines angepassten Benutzerprofils bis in den Systembaum zurückreicht.
 
 Request-Body (`application/json`):
 ```json

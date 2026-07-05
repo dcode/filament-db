@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   indexOrcaProfiles,
   isConcreteOrcaProfile,
+  isNonFilamentOrcaPath,
   isOrcaFilamentPreset,
   orcaProfileMeta,
   collectOrcaClosure,
@@ -126,10 +127,21 @@ describe("isConcreteOrcaProfile", () => {
 });
 
 describe("isOrcaFilamentPreset", () => {
-  it("accepts filament presets and presets without a type", () => {
+  it("accepts an explicit filament type", () => {
     expect(isOrcaFilamentPreset({ type: "filament", name: "X" })).toBe(true);
     expect(isOrcaFilamentPreset({ type: ["filament"], name: "X" })).toBe(true);
-    expect(isOrcaFilamentPreset({ name: "X" })).toBe(true);
+  });
+
+  it("without a type, requires a positive filament signal", () => {
+    // Abstract template name.
+    expect(isOrcaFilamentPreset({ name: "fdm_filament_pla" })).toBe(true);
+    // At least one filament_*-prefixed key.
+    expect(isOrcaFilamentPreset({ name: "X", filament_vendor: ["Generic"] })).toBe(true);
+    // No type and no filament signal — e.g. a machine/process preset that
+    // happens to omit `type` — is no longer accepted by default (GH: OrcaSlicer
+    // library import letting printer/nozzle profiles into the picker).
+    expect(isOrcaFilamentPreset({ name: "X" })).toBe(false);
+    expect(isOrcaFilamentPreset({ name: "X", nozzle_diameter: ["0.4"] })).toBe(false);
   });
 
   it("rejects machine/process profiles and non-objects", () => {
@@ -138,6 +150,21 @@ describe("isOrcaFilamentPreset", () => {
     expect(isOrcaFilamentPreset(null)).toBe(false);
     expect(isOrcaFilamentPreset(["filament"])).toBe(false);
     expect(isOrcaFilamentPreset("filament")).toBe(false);
+  });
+});
+
+describe("isNonFilamentOrcaPath", () => {
+  it("flags machine/ and process/ path segments, case-insensitively", () => {
+    expect(isNonFilamentOrcaPath("Vendor/machine/0.4 nozzle.json")).toBe(true);
+    expect(isNonFilamentOrcaPath("Vendor/Process/0.20mm Standard.json")).toBe(true);
+    expect(isNonFilamentOrcaPath("user\\default\\machine\\Generic.json")).toBe(true);
+  });
+
+  it("leaves filament/ paths and unrelated names alone", () => {
+    expect(isNonFilamentOrcaPath("Vendor/filament/Generic PLA.json")).toBe(false);
+    expect(isNonFilamentOrcaPath("Generic PLA.json")).toBe(false);
+    // "machine" as a substring of a segment, not a whole segment, doesn't count.
+    expect(isNonFilamentOrcaPath("Vendor/machinery/Generic.json")).toBe(false);
   });
 });
 
