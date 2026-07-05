@@ -1,0 +1,386 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import mongoose from "mongoose";
+import { NextRequest } from "next/server";
+import { resolveFilament } from "@/lib/resolveFilament";
+
+/**
+ * Route-level tests for the bulk OrcaSlicer library importer
+ * (`POST /api/filaments/orcaslicer`). The pure inherits-resolution planning
+ * is covered DB-free in tests/orcaSlicerImport.test.ts; here we pin what
+ * actually lands in Mongo: parent/variant linking, diff-only variant docs
+ * that still RESOLVE to full values, the name-collision decision tree, the
+ * three-phase upsert integration (resurrect + E11000 race), calibration
+ * aggregation, and the request guards.
+ *
+ * Schema re-registration in beforeEach is the same pattern as the other
+ * route-level tests (tests/setup.ts wipes mongoose.models between tests).
+ */
+describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  let Filament: any;
+  let Printer: any;
+  let Nozzle: any;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
+
+  beforeEach(async () => {
+    const filMod = await import("@/models/Filament");
+    const prtMod = await import("@/models/Printer");
+    const nozMod = await import("@/models/Nozzle");
+    if (!mongoose.models.Filament) mongoose.model("Filament", filMod.default.schema);
+    if (!mongoose.models.Printer) mongoose.model("Printer", prtMod.default.schema);
+    if (!mongoose.models.Nozzle) mongoose.model("Nozzle", nozMod.default.schema);
+    Filament = mongoose.models.Filament;
+    Printer = mongoose.models.Printer;
+    Nozzle = mongoose.models.Nozzle;
+  });
+
+  const URL_ = "http://localhost/api/filaments/orcaslicer";
+
+  function jsonReq(body: unknown, headers: Record<string, string> = {}) {
+    return new NextRequest(URL_, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body: typeof body === "string" ? body : JSON.stringify(body),
+    });
+  }
+
+  // Fixture shape mirrors real OrcaFilamentLibrary files: an abstract
+  // template, a concrete generic, a vendor leaf.
+  const TEMPLATE = {
+    type: "filament",
+    name: "fdm_filament_pla",
+    from: "system",
+    instantiation: "false",
+    filament_type: ["PLA"],
+    filament_density: ["1.24"],
+    filament_diameter: ["1.75"],
+    nozzle_temperature: ["220"],
+    hot_plate_temp: ["60"],
+  };
+  const GENERIC = {
+    type: "filament",
+    name: "Generic PLA @System",
+    from: "system",
+    instantiation: "true",
+    inherits: "fdm_filament_pla",
+    filament_vendor: ["Generic"],
+    filament_colour: ["#FFFFFF"],
+    filament_cost: ["20"],
+  };
+  const VENDOR = {
+    type: "filament",
+    name: "Polymaker PolyLite PLA @System",
+    from: "system",
+    instantiation: "true",
+    inherits: "Generic PLA @System",
+    filament_vendor: ["Polymaker"],
+    filament_colour: ["#FF0000"],
+    filament_density: ["1.17"],
+  };
+  const ALL = [TEMPLATE, GENERIC, VENDOR];
+
+  async function post(body: unknown, headers: Record<string, string> = {}) {
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+    return POST(jsonReq(body, headers));
+  }
+
+  it("creates the root concrete ancestor + a linked variant carrying only diffs", async () => {
+    const res = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(2);
+    expect(body.updated).toBe(0);
+    expect(body.variants).toBe(1);
+    expect(body.filaments).toEqual([GENERIC.name, VENDOR.name]);
+    expect(body.errors).toBeUndefined();
+
+    // Root: flattened with the abstract template baked in.
+    const parent = await Filament.findOne({ name: GENERIC.name });
+    expect(parent).toBeTruthy();
+    expect(parent.parentId).toBeNull();
+    expect(parent.type).toBe("PLA");
+    expect(parent.vendor).toBe("Generic");
+    expect(parent.density).toBe(1.24);
+    expect(parent.cost).toBe(20);
+    expect(parent.temperatures.nozzle).toBe(220);
+    expect(parent.temperatures.bed).toBe(60);
+
+    // Variant: linked, carries its own diffs…
+    const variant = await Filament.findOne({ name: VENDOR.name });
+    expect(String(variant.parentId)).toBe(String(parent._id));
+    expect(variant.density).toBe(1.17);
+    expect(variant.color).toBe("#FF0000");
+    // …but does NOT pin parent-equal fields (inherits dynamically)…
+    expect(variant.cost).toBeNull();
+    expect(variant.temperatures.nozzle).toBeNull();
+    // …and resolveFilament fills them from the parent.
+    const resolved = resolveFilament(variant.toObject(), parent.toObject());
+    expect(resolved.cost).toBe(20);
+    expect(resolved.temperatures.nozzle).toBe(220);
+    expect(resolved.density).toBe(1.17);
+  });
+
+  it("re-imports idempotently (updated, no duplicates, inheritance stays live)", async () => {
+    const first = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(first.status).toBe(200);
+    const res = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(0);
+    expect(body.updated).toBe(2);
+    expect(body.variants).toBe(1);
+    expect(body.errors).toBeUndefined();
+
+    expect(await Filament.countDocuments({ name: GENERIC.name })).toBe(1);
+    expect(await Filament.countDocuments({ name: VENDOR.name })).toBe(1);
+    const variant = await Filament.findOne({ name: VENDOR.name });
+    expect(variant.cost).toBeNull(); // still inheriting, not pinned
+  });
+
+  it("updates an existing ROOT filament in place with full values — never re-parents", async () => {
+    await Filament.create({
+      name: VENDOR.name,
+      vendor: "Hand Made",
+      type: "PLA",
+      diameter: 1.75,
+    });
+    const res = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(1); // the Generic root
+    expect(body.updated).toBe(1); // the pre-existing row
+    expect(body.variants).toBe(0);
+
+    const row = await Filament.findOne({ name: VENDOR.name });
+    expect(row.parentId).toBeNull(); // NOT re-parented
+    expect(row.vendor).toBe("Polymaker");
+    // Full flattened payload applied (values it would otherwise inherit)
+    expect(row.cost).toBe(20);
+    expect(row.temperatures.nozzle).toBe(220);
+  });
+
+  it("skips an existing variant of a DIFFERENT parent with a per-profile error", async () => {
+    const otherParent = await Filament.create({
+      name: "Some Other Parent",
+      vendor: "X",
+      type: "PLA",
+      diameter: 1.75,
+    });
+    await Filament.create({
+      name: VENDOR.name,
+      vendor: "X",
+      type: "PLA",
+      diameter: 1.75,
+      cost: 42,
+      parentId: otherParent._id,
+    });
+
+    const res = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(1); // Generic root still imports
+    expect(body.updated).toBe(0);
+    expect(body.variants).toBe(0);
+    expect(body.errors).toHaveLength(1);
+    expect(body.errors[0]).toMatch(/already exists as a variant of a different filament/);
+
+    // Row untouched.
+    const row = await Filament.findOne({ name: VENDOR.name });
+    expect(String(row.parentId)).toBe(String(otherParent._id));
+    expect(row.vendor).toBe("X");
+    expect(row.cost).toBe(42);
+  });
+
+  it("resurrects a trashed row of the same name instead of duplicating", async () => {
+    const trashed = await Filament.create({
+      name: GENERIC.name,
+      vendor: "Old",
+      type: "PLA",
+      diameter: 1.75,
+    });
+    await Filament.updateOne({ _id: trashed._id }, { $set: { _deletedAt: new Date() } });
+
+    const res = await post({ selected: [GENERIC.name], profiles: [TEMPLATE, GENERIC] });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.created).toBe(0);
+    expect(body.updated).toBe(1);
+
+    const rows = await Filament.find({ name: GENERIC.name });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]._deletedAt).toBeNull();
+    expect(rows[0].vendor).toBe("Generic");
+  });
+
+  it("recovers from a concurrent create race by updating the racing winner", async () => {
+    // Same pattern as the bambustudio race test: reset the module cache so
+    // the route (and bambuUpsert) bind to the SAME Filament model we spy on.
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const realCreate = Filament.create.bind(Filament);
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const spy = vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      // The racing winner inserts while we were about to create the root.
+      await realCreate({
+        name: GENERIC.name,
+        vendor: "Racing Winner",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      throw e11000;
+    });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      if (res.status !== 200) {
+        throw new Error(`unexpected status ${res.status}: ${JSON.stringify(body)}`);
+      }
+      // Root converged onto the racing winner (updated), variant created.
+      expect(body.created).toBe(1);
+      expect(body.updated).toBe(1);
+      expect(body.variants).toBe(1);
+      const roots = await Filament.find({ name: GENERIC.name });
+      expect(roots).toHaveLength(1);
+      expect(roots[0].vendor).toBe("Generic"); // import overrode the winner
+      const variant = await Filament.findOne({ name: VENDOR.name });
+      expect(String(variant.parentId)).toBe(String(roots[0]._id));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("a profile with a missing base errors individually; siblings still import", async () => {
+    const orphan = {
+      name: "Orphan PLA",
+      instantiation: "true",
+      inherits: "missing_base",
+      filament_vendor: ["X"],
+      filament_type: ["PLA"],
+    };
+    const res = await post({
+      selected: ["Orphan PLA", VENDOR.name],
+      profiles: [...ALL, orphan],
+    });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.errors).toHaveLength(1);
+    expect(body.errors[0]).toMatch(/"Orphan PLA": inherits "missing_base" not found/);
+    expect(body.created).toBe(2);
+    expect(await Filament.findOne({ name: "Orphan PLA" })).toBeNull();
+    expect(await Filament.findOne({ name: VENDOR.name })).toBeTruthy();
+  });
+
+  it("a selected name absent from the profiles is a per-profile error", async () => {
+    const res = await post({ selected: ["Ghost", GENERIC.name], profiles: [TEMPLATE, GENERIC] });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.errors).toEqual([
+      expect.stringMatching(/"Ghost": not found in the submitted profiles/),
+    ]);
+    expect(body.created).toBe(1);
+  });
+
+  describe("calibration hints", () => {
+    const CALIBRATED_VENDOR = {
+      ...VENDOR,
+      printer_settings_id: ["Bambu Lab P1S 0.4 nozzle"],
+      filament_flow_ratio: ["0.978"],
+      pressure_advance: ["0.028"],
+    };
+
+    it("applies calibration to a matching printer + nozzle and reports the aggregate", async () => {
+      const nozzle = await Nozzle.create({ name: "P1S 0.4 Brass", diameter: 0.4, type: "Brass" });
+      await Printer.create({
+        name: "Bambu Lab P1S",
+        manufacturer: "Bambu Lab",
+        printerModel: "P1S",
+        installedNozzles: [nozzle._id],
+      });
+
+      const res = await post({
+        selected: [CALIBRATED_VENDOR.name],
+        profiles: [TEMPLATE, GENERIC, CALIBRATED_VENDOR],
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.calibrationApplied).toBe(1);
+      expect(body.calibrationUnresolved).toBe(0);
+
+      const variant = await Filament.findOne({ name: VENDOR.name });
+      expect(variant.calibrations).toHaveLength(1);
+      expect(variant.calibrations[0].extrusionMultiplier).toBeCloseTo(0.978);
+      expect(variant.calibrations[0].pressureAdvance).toBeCloseTo(0.028);
+    });
+
+    it("reports unresolved when no printer matches the hint", async () => {
+      const res = await post({
+        selected: [CALIBRATED_VENDOR.name],
+        profiles: [TEMPLATE, GENERIC, CALIBRATED_VENDOR],
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.calibrationApplied).toBe(0);
+      expect(body.calibrationUnresolved).toBe(1);
+    });
+  });
+
+  describe("guards and caps", () => {
+    it("rejects a cross-site browser request with 403 (CSRF guard)", async () => {
+      const res = await post(
+        { selected: [GENERIC.name], profiles: [TEMPLATE, GENERIC] },
+        { "sec-fetch-site": "cross-site" },
+      );
+      expect(res.status).toBe(403);
+      expect(await Filament.countDocuments({})).toBe(0);
+    });
+
+    it("rejects an oversized declared Content-Length with 413", async () => {
+      const res = await post(
+        { selected: [GENERIC.name], profiles: [TEMPLATE, GENERIC] },
+        { "content-length": String(11 * 1024 * 1024) },
+      );
+      expect(res.status).toBe(413);
+    });
+
+    it("rejects invalid JSON with 400", async () => {
+      const res = await post("this is not json{");
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/Invalid JSON/);
+    });
+
+    it("rejects a body without selected/profiles with 400", async () => {
+      expect((await post({})).status).toBe(400);
+      expect((await post({ selected: [], profiles: [TEMPLATE] })).status).toBe(400);
+      expect((await post({ selected: [GENERIC.name], profiles: [] })).status).toBe(400);
+      expect((await post({ selected: [123], profiles: [TEMPLATE] })).status).toBe(400);
+      expect((await post([])).status).toBe(400);
+    });
+
+    it("rejects selections beyond the 10k cap with 400", async () => {
+      const res = await post({
+        selected: Array.from({ length: 10_001 }, (_, i) => `P${i}`),
+        profiles: [TEMPLATE],
+      });
+      expect(res.status).toBe(400);
+      expect((await res.json()).error).toMatch(/Import too large/);
+    });
+
+    it("degrades a per-profile upsert failure to an error entry (missing vendor on create)", async () => {
+      const noVendor = {
+        name: "No Vendor PLA",
+        instantiation: "true",
+        filament_type: ["PLA"],
+      };
+      const res = await post({ selected: ["No Vendor PLA"], profiles: [noVendor] });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(0);
+      expect(body.errors).toEqual([
+        expect.stringMatching(/No Vendor PLA: .*filament_vendor/),
+      ]);
+    });
+  });
+});

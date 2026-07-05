@@ -10,6 +10,7 @@ import { POST as sharePost } from "@/app/api/share/route";
 import { POST as scanPublishPost } from "@/app/api/scan/publish/route";
 import { POST as spoolsImportPost } from "@/app/api/spools/import/route";
 import { POST as printHistoryPost } from "@/app/api/print-history/route";
+import { POST as orcaImportPost } from "@/app/api/filaments/orcaslicer/route";
 
 /**
  * GH #252 — trusted-origin guard for destructive admin routes.
@@ -176,6 +177,16 @@ describe("mutating routes — cross-origin CSRF rejection", () => {
 
   it("print-history POST rejects cross-site", async () => {
     const res = await printHistoryPost(csrfReq("http://localhost:3456/api/print-history"));
+    expect(res.status).toBe(403);
+  });
+
+  it("filaments/orcaslicer bulk-import POST rejects cross-site", async () => {
+    // Was the deliberately-unguarded 501 stub pre-implementation; now that
+    // the bulk importer is real it must carry the guard like every other
+    // mutating route.
+    const res = await orcaImportPost(
+      csrfReq("http://localhost:3456/api/filaments/orcaslicer"),
+    );
     expect(res.status).toBe(403);
   });
 
