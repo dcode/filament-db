@@ -453,6 +453,7 @@ Returns:
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/api/filaments/orcaslicer` | Export all filaments as OrcaSlicer-compatible JSON profiles (bundle) |
+| `POST` | `/api/filaments/orcaslicer` | Bulk-import OrcaSlicer library presets with `inherits` resolution |
 | `GET` | `/api/filaments/:id/orcaslicer` | Export a single filament as an OrcaSlicer preset (`.json`) |
 | `POST` | `/api/filaments/:name-or-id/orcaslicer` | Sync filament settings back from OrcaSlicer |
 
@@ -466,6 +467,41 @@ Query parameters:
 - `ids` -- comma-separated list of filament IDs
 
 Returns `application/json`: an array of OrcaSlicer profile objects.
+
+### POST /api/filaments/orcaslicer
+
+Bulk-imports OrcaSlicer filament-library presets (the files under `…/OrcaSlicer/system/OrcaFilamentLibrary/filament`), resolving their `inherits` chains server-side. The Import/Export page's "OrcaSlicer library (folder)" tile drives this endpoint via a directory upload.
+
+Request body (`application/json`):
+```json
+{
+  "selected": ["Polymaker PolyLite PLA @System"],
+  "profiles": [ { "...": "raw OrcaSlicer preset JSONs" } ]
+}
+```
+
+`profiles` must contain the selected presets plus every ancestor their `inherits` chains reference. How the library maps onto Filament DB's parent/variant model:
+
+- Each selected profile's **root concrete ancestor** (the top-most `instantiation: "true"` profile in its chain) is imported as a parent record with its abstract `fdm_filament_*` templates flattened in — auto-included even when not itself selected.
+- The selected profile becomes a **variant** storing only the keys that differ from the parent; everything else inherits dynamically, so editing the parent updates the variant's effective values.
+- Abstract templates (`instantiation: "false"`) are never imported as records.
+- Concrete chains deeper than two levels collapse to the concrete root (Filament DB has one level of inheritance).
+- Name collisions: an existing variant of the same parent is diff-updated (idempotent re-import); an existing root filament is updated in place with full flattened values and never re-parented; an existing variant of a *different* parent is skipped with a per-profile error. Trashed rows of the same name are resurrected.
+
+Calibration values (flow ratio, pressure advance, retraction, fans) auto-attach to a matching printer + nozzle the same way the Bambu Studio importer does. Caps: 10 MB body, 10,000 profiles. Per-profile failures land in `errors` without failing the batch.
+
+Returns:
+```json
+{
+  "created": 2,
+  "updated": 0,
+  "variants": 1,
+  "filaments": ["Generic PLA @System", "Polymaker PolyLite PLA @System"],
+  "calibrationApplied": 0,
+  "calibrationUnresolved": 0,
+  "errors": ["Orphan PLA: inherits \"missing_base\" not found in the submitted set — include the base profile"]
+}
+```
 
 ### POST /api/filaments/:name-or-id/orcaslicer
 

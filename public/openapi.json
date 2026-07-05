@@ -3749,11 +3749,117 @@
         "tags": [
           "OrcaSlicer"
         ],
-        "summary": "Bulk OrcaSlicer import (not yet implemented)",
-        "description": "Returns 501. Bulk OrcaSlicer bundle import is not yet supported; the route exists as a documented placeholder. Use POST /api/filaments/{id}/orcaslicer to sync an individual preset back, or POST /api/filaments/prusaslicer for the PrusaSlicer-INI equivalent (which IS supported).",
+        "summary": "Bulk OrcaSlicer library import",
+        "description": "Imports OrcaSlicer filament-library presets, resolving their `inherits` chains server-side. `profiles` must contain the raw preset JSONs of every `selected` profile plus all ancestors their chains reference. Mapping onto the parent/variant model: each selected profile's ROOT concrete ancestor (top-most `instantiation: \"true\"` in its chain) is imported as a parent record with its abstract `fdm_filament_*` templates flattened in — auto-included even when not selected — and the selected profile becomes a variant storing only its diffs (unset fields inherit dynamically). Abstract templates are never imported as records. Concrete chains deeper than two levels collapse to the concrete root (no variants-of-variants). Name collisions: an existing variant of the same parent is diff-updated (idempotent re-import); an existing root filament is updated in place with full flattened values and never re-parented; an existing variant of a DIFFERENT parent is skipped with a per-profile error. A trashed row of the same name is resurrected. Calibration values auto-attach per the Bambu Studio importer's printer/nozzle detection; the response carries aggregate counts. Per-profile failures (missing base, inheritance cycle, invalid values) land in `errors` without failing the batch. Request size is capped at 10 MB and 10,000 profiles. Requires a same-origin (or non-browser) request.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "selected",
+                  "profiles"
+                ],
+                "properties": {
+                  "selected": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "string"
+                    },
+                    "description": "`name` values of the concrete profiles to import. Selecting an abstract template is a per-profile error."
+                  },
+                  "profiles": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object"
+                    },
+                    "description": "Raw OrcaSlicer preset JSONs — the selected profiles plus the full ancestor closure of their `inherits` chains."
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
-          "501": {
-            "description": "Not implemented",
+          "200": {
+            "description": "Import summary. Per-profile failures are reported in `errors`; the batch itself still succeeds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "created",
+                    "updated",
+                    "variants",
+                    "filaments",
+                    "calibrationApplied",
+                    "calibrationUnresolved"
+                  ],
+                  "properties": {
+                    "created": {
+                      "type": "integer",
+                      "description": "Filament records created (roots + variants)."
+                    },
+                    "updated": {
+                      "type": "integer",
+                      "description": "Existing records updated (including resurrected trashed rows and in-place root updates)."
+                    },
+                    "variants": {
+                      "type": "integer",
+                      "description": "How many of the written records were created as / confirmed to be variants linked to an imported parent."
+                    },
+                    "filaments": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Names of the records written, roots first."
+                    },
+                    "calibrationApplied": {
+                      "type": "integer",
+                      "description": "Records where a calibrations[] row resolved to a printer + nozzle."
+                    },
+                    "calibrationUnresolved": {
+                      "type": "integer",
+                      "description": "Records carrying per-nozzle calibration hints that could not be matched to a printer/nozzle."
+                    },
+                    "errors": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      },
+                      "description": "Per-profile failures, each prefixed with the profile name. Omitted when empty."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed body (missing/empty selected or profiles, invalid JSON) or profile count over the 10,000 cap",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Cross-origin browser request rejected by the trusted-origin guard",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request body exceeds the 10 MB cap",
             "content": {
               "application/json": {
                 "schema": {

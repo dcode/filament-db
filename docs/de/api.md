@@ -431,6 +431,7 @@ Liefert:
 | Methode | Endpunkt | Beschreibung |
 |--------|----------|-------------|
 | `GET` | `/api/filaments/orcaslicer` | Exportiert alle Filamente als OrcaSlicer-kompatible JSON-Profile (Bundle) |
+| `POST` | `/api/filaments/orcaslicer` | Bulk-Import von OrcaSlicer-Bibliotheks-Presets mit `inherits`-Auflösung |
 | `GET` | `/api/filaments/:id/orcaslicer` | Exportiert ein einzelnes Filament als OrcaSlicer-Preset (`.json`) |
 | `POST` | `/api/filaments/:name-or-id/orcaslicer` | Synchronisiert Filament-Settings zurück aus OrcaSlicer |
 
@@ -444,6 +445,41 @@ Query-Parameter:
 - `ids` -- kommagetrennte Liste von Filament-IDs
 
 Liefert `application/json`: ein Array von OrcaSlicer-Profil-Objekten.
+
+### POST /api/filaments/orcaslicer
+
+Bulk-Import von OrcaSlicer-Filamentbibliotheks-Presets (die Dateien unter `…/OrcaSlicer/system/OrcaFilamentLibrary/filament`), deren `inherits`-Ketten serverseitig aufgelöst werden. Die Kachel „OrcaSlicer-Bibliothek (Ordner)" auf der Import/Export-Seite bedient diesen Endpunkt per Ordner-Upload.
+
+Request-Body (`application/json`):
+```json
+{
+  "selected": ["Polymaker PolyLite PLA @System"],
+  "profiles": [ { "...": "rohe OrcaSlicer-Preset-JSONs" } ]
+}
+```
+
+`profiles` muss die ausgewählten Presets plus alle Vorfahren enthalten, die ihre `inherits`-Ketten referenzieren. So wird die Bibliothek auf das Eltern-/Varianten-Modell von Filament DB abgebildet:
+
+- Der **oberste konkrete Vorfahr** jedes ausgewählten Profils (das oberste Profil mit `instantiation: "true"` in seiner Kette) wird als Eltern-Datensatz importiert, mit den abstrakten `fdm_filament_*`-Templates eingerechnet — automatisch mit importiert, auch wenn nicht selbst ausgewählt.
+- Das ausgewählte Profil wird eine **Variante**, die nur die vom Eltern-Datensatz abweichenden Schlüssel speichert; alles andere wird dynamisch geerbt — eine Änderung am Eltern-Datensatz aktualisiert die effektiven Werte der Variante.
+- Abstrakte Templates (`instantiation: "false"`) werden nie als Datensätze importiert.
+- Konkrete Ketten mit mehr als zwei Ebenen kollabieren auf die konkrete Wurzel (Filament DB hat eine Vererbungsebene).
+- Namenskollisionen: Eine bestehende Variante desselben Eltern-Datensatzes wird per Diff aktualisiert (idempotenter Re-Import); ein bestehendes Wurzel-Filament wird an Ort und Stelle mit vollen aufgelösten Werten aktualisiert und nie umgehängt; eine bestehende Variante eines *anderen* Eltern-Datensatzes wird mit einem Fehler pro Profil übersprungen. Gelöschte (Papierkorb-)Zeilen gleichen Namens werden wiederhergestellt.
+
+Kalibrierungswerte (Flussfaktor, Pressure Advance, Retraction, Lüfter) werden wie beim Bambu-Studio-Import automatisch dem passenden Drucker + Düsenpaar zugeordnet. Limits: 10-MB-Body, 10.000 Profile. Fehler pro Profil landen in `errors`, ohne den Batch scheitern zu lassen.
+
+Liefert:
+```json
+{
+  "created": 2,
+  "updated": 0,
+  "variants": 1,
+  "filaments": ["Generic PLA @System", "Polymaker PolyLite PLA @System"],
+  "calibrationApplied": 0,
+  "calibrationUnresolved": 0,
+  "errors": ["Orphan PLA: inherits \"missing_base\" not found in the submitted set — include the base profile"]
+}
+```
 
 ### POST /api/filaments/:name-or-id/orcaslicer
 
