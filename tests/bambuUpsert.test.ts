@@ -93,6 +93,74 @@ describe("upsertParsedBambuFilament (three-phase upsert lib)", () => {
     expect(result).toEqual({ ok: false, status: 400, error: "density is negative" });
   });
 
+  it("returns the pre-write payload failure on the resurrect path (PR #985)", async () => {
+    // Incoming min 300 alone isn't inverted; merged with the trashed row's
+    // stored max 250 it is — so the failure fires at the phase-2
+    // `bambuPayloadFailure` gate, BEFORE any write (not via a thrown
+    // validator, which the earlier test covers).
+    const trashed = await Filament.create({
+      name: "QA Upsert PLA",
+      vendor: "Old",
+      type: "PLA",
+      temperatures: { nozzleRangeMax: 250 },
+    });
+    await Filament.updateOne({ _id: trashed._id }, { $set: { _deletedAt: new Date() } });
+
+    const result = await upsert(parsed({ nozzle_temperature_range_low: ["300"] }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(400);
+      expect(result.error).toMatch(/minimum temperature/i);
+    }
+    // Nothing was written — the row is still trashed and untouched.
+    const row = await Filament.findOne({ name: "QA Upsert PLA" });
+    expect(row._deletedAt).not.toBeNull();
+    expect(row.vendor).toBe("Old");
+  });
+
+  it("returns the pre-write payload failure on the race-recovery path (PR #985)", async () => {
+    // The create gate checks the payload against a NULL existing (min 300,
+    // no max → not inverted), so only the race-recovery gate — recomputed
+    // against the racing winner's stored max 250 — can catch this one.
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const realCreate = Filament.create.bind(Filament);
+    vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      await realCreate({
+        name: "QA Upsert PLA",
+        vendor: "Winner",
+        type: "PLA",
+        temperatures: { nozzleRangeMax: 250 },
+      });
+      throw e11000;
+    });
+
+    const result = await upsert(parsed({ nozzle_temperature_range_low: ["300"] }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(400);
+      expect(result.error).toMatch(/minimum temperature/i);
+    }
+    // The racing winner was not touched.
+    const row = await Filament.findOne({ name: "QA Upsert PLA" });
+    expect(row.vendor).toBe("Winner");
+  });
+
+  it("tolerates a minimal legacy existing-doc shape in augmentExistingWithParent (PR #985)", async () => {
+    // A hydrated Mongoose doc always materialises the optional paths
+    // (defaults / [] arrays), so the `?? null` fallbacks are unreachable
+    // through the real model — feed phase 1 a plain object with them
+    // absent, as a defensive-shape pin.
+    const real = await Filament.create({ name: "QA Upsert PLA", vendor: "Old", type: "PLA" });
+    vi.spyOn(Filament, "findOne").mockImplementationOnce(
+      async () => ({ _id: real._id, name: real.name, type: "PLA", vendor: "Old" }),
+    );
+    const result = await upsert(parsed());
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.created).toBe(false);
+    const row = await Filament.findOne({ name: "QA Upsert PLA" });
+    expect(row.vendor).toBe("QA Labs"); // the phase-1 update still applied
+  });
+
   it("maps a non-duplicate create failure to a 500 result with detail", async () => {
     vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
       throw new Error("boom");

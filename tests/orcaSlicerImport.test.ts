@@ -342,6 +342,20 @@ describe("diffOrcaRaw", () => {
     expect(diff.setting_id).toBe("GFSL05");
   });
 
+  it("keeps filament_diameter even when equal to the parent (PR #985 Codex P2)", () => {
+    // The Filament schema defaults `diameter` to 1.75 on create, so a
+    // variant doc created WITHOUT the key would get a pinned wrong default
+    // instead of inheriting — a 2.85 mm child of a 2.85 mm parent would
+    // import as 1.75 mm. The diff must always carry the key.
+    const template285 = { ...TEMPLATE, filament_diameter: ["2.85"] };
+    const byName285 = index(template285, GENERIC, VENDOR);
+    const diff = diffOrcaRaw(
+      flattenOrcaProfile("Polymaker PolyLite PLA @System", byName285),
+      flattenOrcaProfile("Generic PLA @System", byName285),
+    );
+    expect(diff.filament_diameter).toEqual(["2.85"]);
+  });
+
   it("keeps ALL bed-plate keys when any one differs (whole-array inheritance)", () => {
     const hotterBed = {
       ...VENDOR,

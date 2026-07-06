@@ -486,7 +486,7 @@ Request body (`application/json`):
 - The selected profile becomes a **variant** storing only the keys that differ from the parent; everything else inherits dynamically, so editing the parent updates the variant's effective values.
 - Abstract templates (`instantiation: "false"`) are never imported as records.
 - Concrete chains deeper than two levels collapse to the concrete root (Filament DB has one level of inheritance).
-- Name collisions: an existing variant of the same parent is diff-updated (idempotent re-import); an existing root filament is updated in place with full flattened values and never re-parented; an existing variant of a *different* parent is skipped with a per-profile error. Trashed rows of the same name are resurrected.
+- Name collisions — active or trashed rows alike (a trashed row of the same name is resurrected the same way an active one would be updated): an existing variant of the same parent is diff-updated/diff-resurrected keeping its parent link (idempotent re-import); an existing root filament is updated or resurrected in place with full flattened values and never re-parented; an existing variant of a *different* parent is skipped with a per-profile error. An imported *root* whose name belongs to an existing variant is also skipped with a per-profile error (updating it would make its planned children variants-of-variants).
 
 Calibration values (flow ratio, pressure advance, retraction, fans) auto-attach to a matching printer + nozzle the same way the Bambu Studio importer does. Caps: 10 MB body, 10,000 profiles. Per-profile failures land in `errors` without failing the batch.
 
@@ -499,7 +499,7 @@ Returns:
   "filaments": ["Generic PLA @System", "Polymaker PolyLite PLA @System"],
   "calibrationApplied": 0,
   "calibrationUnresolved": 0,
-  "errors": ["Orphan PLA: inherits \"missing_base\" not found in the submitted set — include the base profile"]
+  "errors": ["\"Orphan PLA\": inherits \"missing_base\" not found in the submitted set — include the base profile"]
 }
 ```
 

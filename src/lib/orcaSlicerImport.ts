@@ -134,6 +134,13 @@ const NON_INHERITED_KEYS = new Set<string>([
  *   - `filament_colour` / `filament_color` — `color` is variant-only in
  *     resolveFilament (never inherited), so dropping it would leave the
  *     variant at the gray default, not at the parent's color.
+ *   - `filament_diameter` — the Filament schema defaults `diameter` to
+ *     1.75 on create, so a variant created without the key gets a PINNED
+ *     wrong default rather than inheriting the parent's value (a 2.85 mm
+ *     child of a 2.85 mm parent would import as 1.75 mm — Codex P2 on
+ *     PR #985). Keeping it pins the correct value; on re-import of an
+ *     existing variant the GH #403 machinery $unsets a value equal to the
+ *     parent, so inheritance still goes live where it can.
  *   - `filament_id` / `setting_id` — the vendor-catalog identity of THIS
  *     preset; inheriting the parent's via the settings bag would mislabel
  *     the variant.
@@ -144,6 +151,7 @@ const DIFF_ALWAYS_KEEP = new Set<string>([
   "filament_vendor",
   "filament_colour",
   "filament_color",
+  "filament_diameter",
   "filament_id",
   "setting_id",
 ]);

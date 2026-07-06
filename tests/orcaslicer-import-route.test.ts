@@ -120,6 +120,35 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
     expect(resolved.density).toBe(1.17);
   });
 
+  it("pins the variant's diameter instead of letting the 1.75 schema default mis-pin it (PR #985)", async () => {
+    // 2.85 mm chain: parent and child share the diameter, so the diff
+    // would drop the key without the DIFF_ALWAYS_KEEP entry — and the
+    // Filament schema's `default: 1.75` would pin the WRONG diameter on
+    // the created variant doc (Codex P2 on PR #985).
+    const template285 = {
+      ...TEMPLATE,
+      name: "fdm_filament_pla_285",
+      filament_diameter: ["2.85"],
+    };
+    const generic285 = {
+      ...GENERIC,
+      name: "Generic PLA 2.85 @System",
+      inherits: template285.name,
+    };
+    const vendor285 = {
+      ...VENDOR,
+      name: "Polymaker PolyLite PLA 2.85 @System",
+      inherits: generic285.name,
+    };
+    const res = await post({
+      selected: [vendor285.name],
+      profiles: [template285, generic285, vendor285],
+    });
+    expect(res.status).toBe(200);
+    const variant = await Filament.findOne({ name: vendor285.name });
+    expect(variant.diameter).toBe(2.85);
+  });
+
   it("re-imports idempotently (updated, no duplicates, inheritance stays live)", async () => {
     const first = await post({ selected: [VENDOR.name], profiles: ALL });
     expect(first.status).toBe(200);
@@ -210,6 +239,166 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]._deletedAt).toBeNull();
     expect(rows[0].vendor).toBe("Generic");
+  });
+
+  describe("trashed-row collisions (PR #985)", () => {
+    it("diff-resurrects a trashed variant of the same parent, keeping its link", async () => {
+      const first = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(first.status).toBe(200);
+      const variantBefore = await Filament.findOne({ name: VENDOR.name });
+      await Filament.updateOne(
+        { _id: variantBefore._id },
+        { $set: { _deletedAt: new Date() } },
+      );
+
+      const res = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.updated).toBe(2); // root updated + variant resurrected
+      expect(body.variants).toBe(1);
+      expect(body.errors).toBeUndefined();
+
+      const rows = await Filament.find({ name: VENDOR.name });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]._deletedAt).toBeNull();
+      const parent = await Filament.findOne({ name: GENERIC.name });
+      expect(String(rows[0].parentId)).toBe(String(parent._id)); // link survived
+      expect(rows[0].cost).toBeNull(); // diff payload — still inheriting
+    });
+
+    it("resurrects a trashed ROOT row named like a planned variant with FULL values (hyiger P2)", async () => {
+      // Pre-fix, this branch sent the diff payload + parentId to the
+      // upsert, whose phase-2 resurrect ignores parentId and $sets only
+      // the diff keys — an orphaned, half-populated row reported as
+      // updated.
+      const trashed = await Filament.create({
+        name: VENDOR.name,
+        vendor: "Hand Made",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      await Filament.updateOne({ _id: trashed._id }, { $set: { _deletedAt: new Date() } });
+
+      const res = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(1); // the Generic root
+      expect(body.updated).toBe(1); // the resurrected row
+      expect(body.variants).toBe(0); // unlinked → not counted as a variant
+      expect(body.errors).toBeUndefined();
+
+      const row = await Filament.findOne({ name: VENDOR.name });
+      expect(row._deletedAt).toBeNull();
+      expect(row.parentId).toBeNull(); // a resurrect never re-parents
+      expect(row.vendor).toBe("Polymaker");
+      // FULL flattened payload applied — fields a linked variant would
+      // inherit are pinned instead of missing/stale.
+      expect(row.cost).toBe(20);
+      expect(row.temperatures.nozzle).toBe(220);
+    });
+
+    it("skips a trashed variant of a DIFFERENT parent with a per-profile error", async () => {
+      const otherParent = await Filament.create({
+        name: "Some Other Parent",
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      const v = await Filament.create({
+        name: VENDOR.name,
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+        parentId: otherParent._id,
+      });
+      await Filament.updateOne({ _id: v._id }, { $set: { _deletedAt: new Date() } });
+
+      const res = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(1); // Generic root still imports
+      expect(body.errors).toEqual([
+        expect.stringMatching(
+          /"Polymaker PolyLite PLA @System": already exists as a variant of a different filament/,
+        ),
+      ]);
+
+      const row = await Filament.findOne({ name: VENDOR.name });
+      expect(row._deletedAt).not.toBeNull(); // untouched — stays trashed
+      expect(String(row.parentId)).toBe(String(otherParent._id));
+      expect(row.vendor).toBe("X");
+    });
+
+    it("skips a planned ROOT whose name belongs to an existing ACTIVE variant (Codex P2)", async () => {
+      // Pre-fix, the upsert updated the variant in place (keeping its
+      // parentId) and the route registered that variant's _id as the
+      // parent for every planned child — variants-of-variants, which the
+      // app resolves only one level deep.
+      const otherParent = await Filament.create({
+        name: "Some Other Parent",
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      await Filament.create({
+        name: GENERIC.name,
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+        cost: 42,
+        parentId: otherParent._id,
+      });
+
+      const res = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(0);
+      expect(body.updated).toBe(0);
+      expect(body.variants).toBe(0);
+      expect(body.errors).toEqual([
+        expect.stringMatching(
+          /"Generic PLA @System": already exists as a variant of another filament/,
+        ),
+        expect.stringMatching(
+          /"Polymaker PolyLite PLA @System": parent "Generic PLA @System" failed to import/,
+        ),
+      ]);
+
+      // The existing variant is untouched and nothing got created under it.
+      const row = await Filament.findOne({ name: GENERIC.name });
+      expect(String(row.parentId)).toBe(String(otherParent._id));
+      expect(row.vendor).toBe("X");
+      expect(row.cost).toBe(42);
+      expect(await Filament.findOne({ name: VENDOR.name })).toBeNull();
+    });
+
+    it("skips a planned ROOT whose name belongs to a TRASHED variant", async () => {
+      const otherParent = await Filament.create({
+        name: "Some Other Parent",
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+      });
+      const v = await Filament.create({
+        name: GENERIC.name,
+        vendor: "X",
+        type: "PLA",
+        diameter: 1.75,
+        parentId: otherParent._id,
+      });
+      await Filament.updateOne({ _id: v._id }, { $set: { _deletedAt: new Date() } });
+
+      const res = await post({ selected: [VENDOR.name], profiles: ALL });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(0);
+      expect(body.errors).toHaveLength(2);
+      expect(body.errors[0]).toMatch(/already exists as a variant of another filament/);
+
+      const row = await Filament.findOne({ name: GENERIC.name });
+      expect(row._deletedAt).not.toBeNull(); // stays trashed — no resurrect
+      expect(String(row.parentId)).toBe(String(otherParent._id));
+    });
   });
 
   it("recovers from a concurrent create race by updating the racing winner", async () => {
@@ -345,6 +534,33 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
       expect(res.status).toBe(413);
     });
 
+    it("rejects an oversized body past the post-read byte check with 413 (PR #985)", async () => {
+      // A lying Content-Length sails through checkContentLength; the body is
+      // 6M chars but 12 MB of UTF-8 BYTES, so only the post-read
+      // Buffer.byteLength branch (the #685 byte-not-char semantics) can
+      // catch it.
+      const big = "é".repeat(6 * 1024 * 1024);
+      const res = await post(big, { "content-length": "100" });
+      expect(res.status).toBe(413);
+      expect((await res.json()).error).toMatch(/too large/i);
+    });
+
+    it("surfaces indexOrcaProfiles errors (duplicate + malformed entries) alongside successful imports (PR #985)", async () => {
+      const res = await post({
+        selected: [GENERIC.name],
+        profiles: [TEMPLATE, GENERIC, GENERIC, "not an object", { instantiation: "true" }],
+      });
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.created).toBe(1); // the selected Generic still imports
+      expect(body.errors).toEqual([
+        expect.stringMatching(/duplicate profile name "Generic PLA @System"/),
+        expect.stringMatching(/profile at index 3 is not a JSON object/),
+        expect.stringMatching(/profile at index 4 has no "name"/),
+      ]);
+      expect(await Filament.countDocuments({ name: GENERIC.name })).toBe(1);
+    });
+
     it("rejects invalid JSON with 400", async () => {
       const res = await post("this is not json{");
       expect(res.status).toBe(400);
@@ -379,7 +595,7 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
       const body = await res.json();
       expect(body.created).toBe(0);
       expect(body.errors).toEqual([
-        expect.stringMatching(/No Vendor PLA: .*filament_vendor/),
+        expect.stringMatching(/"No Vendor PLA": .*filament_vendor/),
       ]);
     });
   });
