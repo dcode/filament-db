@@ -3,7 +3,7 @@
   "info": {
     "title": "Filament DB API",
     "description": "REST API for managing 3D printing filament profiles, spools, nozzles, printers, bed types, locations, print history, sharing, slicer integrations, and OpenPrintTag imports.",
-    "version": "1.65.0",
+    "version": "1.66.0",
     "license": {
       "name": "AGPL-3.0-or-later",
       "url": "https://www.gnu.org/licenses/agpl-3.0.html"
@@ -2402,7 +2402,7 @@
           "Spools"
         ],
         "summary": "Add spool to filament",
-        "description": "Adds a new spool subdoc to the filament. At least one of label, totalWeight, lotNumber, purchaseDate, openedDate, locationId, photoDataUrl, or retired must be supplied — an empty body returns 400 (GH #203).",
+        "description": "Adds a new spool subdoc to the filament. At least one of label, totalWeight, lotNumber, purchaseDate, openedDate, locationId, photoDataUrl, instanceId, or retired must be supplied — an empty body returns 400 (GH #203).",
         "parameters": [
           {
             "$ref": "#/components/parameters/FilamentId"
@@ -2448,7 +2448,7 @@
                   "photoDataUrl": {
                     "type": "string",
                     "nullable": true,
-                    "description": "Inline base64 image (JPEG/PNG/GIF/WebP/AVIF/HEIC; SVG rejected)"
+                    "description": "Inline base64 image (JPEG/PNG/GIF/WebP/AVIF/HEIC/HEIF; SVG rejected)"
                   },
                   "retired": {
                     "type": "boolean",
@@ -6055,6 +6055,16 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Cross-origin request rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       },
@@ -6076,6 +6086,16 @@
                       "type": "boolean"
                     }
                   }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Cross-origin request rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -6143,8 +6163,38 @@
               }
             }
           },
+          "400": {
+            "description": "Missing url/file, or invalid client input",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
           "401": {
             "description": "API key not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Cross-origin request rejected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "File exceeds the 10 MB limit",
             "content": {
               "application/json": {
                 "schema": {
