@@ -13,6 +13,8 @@ import {
   type ValidationError,
 } from "@/lib/customCurrency";
 import { useTranslation } from "@/i18n/TranslationProvider";
+import { useNumberFormat } from "@/hooks/useNumberFormat";
+import { formatWithSeparators } from "@/lib/numberFormatPref";
 
 /**
  * Built-in currencies. v1.12 expanded the list from 4 to 13 to cover the
@@ -105,6 +107,12 @@ export function useCurrency() {
   // grouping/decimals follow it (the GH #447 intent), matching the locale-aware
   // dateFormat. Callers can still pass an explicit override to format().
   const { locale } = useTranslation();
+  // The number-format preference also governs currency grouping/decimals.
+  // `separators` is null in system mode (and pre-hydration), where currency
+  // keeps its locale-aware Intl formatting unchanged.
+  const { separators, systemLocale } = useNumberFormat();
+  const numGroup = separators?.group;
+  const numDecimal = separators?.decimal;
   const [customCurrencies, setCustomCurrenciesState] = useState<CustomCurrency[]>([]);
   const [currency, setCurrencyState] = useState<string>(DEFAULT_CURRENCY);
 
@@ -262,29 +270,66 @@ export function useCurrency() {
    */
   const format = useCallback(
     (value: number, localeOverride?: string): string => {
-      // Default to the app's i18n locale; an explicit arg still wins. (#821)
-      const effectiveLocale = localeOverride ?? locale ?? undefined;
+      // Number-format modes (Codex P2 ×3):
+      //  - preset/custom pair active  → keep the APP locale for currency symbol
+      //    placement (#821) and swap ONLY the group/decimal separators.
+      //  - System mode (post-hydration) → use the DEVICE locale so currency
+      //    grouping/placement matches weights/counts (`systemLocale`).
+      //  - pre-hydration → app locale / toFixed(2), matching the server.
+      const hasPreset = numGroup !== undefined && numDecimal !== undefined;
+      const baseLocale =
+        localeOverride ?? (hasPreset ? locale : systemLocale ?? locale) ?? undefined;
       const isBuiltin = CURRENCIES.some((c) => c.code === currency);
       if (isBuiltin) {
         try {
-          return new Intl.NumberFormat(effectiveLocale, {
+          const fmt = new Intl.NumberFormat(baseLocale, {
             style: "currency",
             currency,
-          }).format(value);
+          });
+          // formatToParts swap preserves Intl's per-currency decimal count
+          // (JPY=0, BHD=3) and app-locale symbol placement.
+          if (hasPreset) {
+            return fmt
+              .formatToParts(value)
+              .map((p) =>
+                p.type === "group"
+                  ? numGroup
+                  : p.type === "decimal"
+                    ? numDecimal
+                    : p.value,
+              )
+              .join("");
+          }
+          return fmt.format(value);
         } catch {
           // fall through
         }
       }
-      // Custom-currency fallback: match the legacy `${symbol}${toFixed(2)}`
-      // shape so a user who selected a custom code doesn't suddenly see
-      // raw decimals (e.g. `¤12.5` for 12.5 or `¤1.234567` for an
-      // analytics total). Codex flagged this on PR #470 — the round-1
-      // migration of cost render sites would have left custom-currency
-      // users with unformatted amounts. Locale-aware Intl is reserved
-      // for the built-in ISO 4217 codes above.
+      // Custom (non-ISO) currency code — Intl.NumberFormat rejects it, so
+      // compose `${symbol}${number}`. Match the legacy 2-decimal shape so a
+      // custom code never renders raw decimals (Codex on PR #470).
+      if (hasPreset) {
+        return `${symbol}${formatWithSeparators(
+          value,
+          { group: numGroup, decimal: numDecimal },
+          { minDecimals: 2, maxDecimals: 2, trimTrailingZeros: false },
+        )}`;
+      }
+      if (systemLocale !== undefined) {
+        // System mode (post-hydration): group the number per the device locale
+        // so custom-code amounts match weights/counts, not raw toFixed.
+        try {
+          return `${symbol}${new Intl.NumberFormat(systemLocale, {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          }).format(value)}`;
+        } catch {
+          // fall through to the plain shape
+        }
+      }
       return `${symbol}${value.toFixed(2)}`;
     },
-    [currency, symbol, locale],
+    [currency, symbol, locale, systemLocale, numGroup, numDecimal],
   );
 
   return {
