@@ -135,16 +135,24 @@ const MAX_IMPORT_PROFILES = 10_000;
  * Each planned record runs through `parseBambuStudioProfile` (OrcaSlicer
  * JSON ≡ Bambu Studio JSON) and the shared three-phase upsert in
  * `src/lib/bambuUpsert.ts`. Parents (roots) are written first so variants
- * can link to them. Name collisions with existing rows:
- *   - existing variant of the SAME parent → diff update (idempotent
+ * can link to them. Name collisions with existing rows — ACTIVE or TRASHED
+ * alike (a trashed non-purged row is resurrected by the upsert's phase 2,
+ * so it collides exactly like an active row; PR #985 P2):
+ *   - existing variant of the SAME parent → diff update, or diff resurrect
+ *     (phase 2 never touches parentId, so the link survives; idempotent
  *     re-import; GH #403 pruning keeps inheritance live)
- *   - existing ROOT filament → updated in place with the FULL flattened
- *     payload; it is never re-parented
+ *   - existing ROOT filament → updated/resurrected in place with the FULL
+ *     flattened payload (a diff-only resurrect would leave every inherited
+ *     field missing/stale); it is never re-parented
  *   - existing variant of a DIFFERENT parent → skipped with a per-profile
  *     error (a full-payload update would sever its inheritance — the OPT
  *     variant importer's refuse-collision posture)
- * A trashed row of the same name is resurrected (keeping its old parent
- * state — updates never touch parentId).
+ *   - a ROOT entry colliding with an existing VARIANT (of anything) →
+ *     skipped with a per-profile error, and its planned variants fail with
+ *     "parent failed to import": the upsert would keep the row's parentId,
+ *     and registering that _id as a parent would create
+ *     variants-of-variants, which the app resolves only one level deep
+ *     (Codex P2 on PR #985).
  *
  * Calibration hints in the presets are applied exactly like the Bambu
  * importer (printer/nozzle auto-detect via `printer_settings_id`;
@@ -230,40 +238,69 @@ export async function POST(request: NextRequest) {
         let createParentId: string | null = null;
         let intendsVariant = false;
 
-        if (entry.kind === "variant") {
-          const parentDocId = parentIds.get(entry.parentName!);
-          if (!parentDocId) {
-            errors.push(`${entry.name}: parent "${entry.parentName}" failed to import`);
+        // Advisory pre-check for the collision trees below — the atomic
+        // phases in upsertParsedBambuFilament are what actually protect the
+        // write (updates never $set parentId, so a re-parent can't slip
+        // through a TOCTOU window; worst case a racing delete/trash demotes
+        // a collision case to the create or resurrect path). Resolution
+        // order mirrors the upsert's own: an ACTIVE row first (phase 1),
+        // else a TRASHED non-purged row (phase 2 resurrects it, so it
+        // collides exactly like an active row — PR #985 P2).
+        const findCollision = async () =>
+          ((await Filament.findOne({ name: entry.name, _deletedAt: null })
+            .select("parentId")
+            .lean()) ??
+            (await Filament.findOne({
+              name: entry.name,
+              _deletedAt: { $ne: null },
+              _purged: { $ne: true },
+            })
+              .select("parentId")
+              .lean())) as { parentId?: unknown } | null;
+
+        if (entry.kind === "root") {
+          // A root name colliding with an existing VARIANT is refused: the
+          // upsert would update/resurrect it without touching parentId, and
+          // registering its _id in parentIds below would then create
+          // variants-of-variants — the app resolves inheritance one level
+          // deep only (Codex P2 on PR #985).
+          const existing = await findCollision();
+          if (existing?.parentId) {
+            errors.push(
+              `"${entry.name}": already exists as a variant of another filament — skipped`,
+            );
             continue;
           }
-          // Advisory pre-check for the collision tree — the atomic phases in
-          // upsertParsedBambuFilament are what actually protect the write
-          // (updates never $set parentId, so a re-parent can't slip through
-          // a TOCTOU window; worst case a racing delete demotes case 2/3 to
-          // the create path, which links correctly).
-          const existing = (await Filament.findOne({
-            name: entry.name,
-            _deletedAt: null,
-          })
-            .select("parentId")
-            .lean()) as { parentId?: unknown } | null;
+        } else {
+          const parentDocId = parentIds.get(entry.parentName!);
+          if (!parentDocId) {
+            errors.push(`"${entry.name}": parent "${entry.parentName}" failed to import`);
+            continue;
+          }
+          const existing = await findCollision();
           if (!existing) {
-            // No active row: create as a variant carrying only its diffs.
+            // No same-name row at all: create as a variant carrying only
+            // its diffs.
             rawPayload = entry.diffRaw!;
             createParentId = parentDocId;
             intendsVariant = true;
           } else if (existing.parentId && String(existing.parentId) === parentDocId) {
-            // Already a variant of the same parent: idempotent diff update.
+            // Variant of the same parent — active (diff update) or trashed
+            // (diff resurrect; phase 2 keeps its parentId, so the link
+            // survives): idempotent re-import either way.
             rawPayload = entry.diffRaw!;
             intendsVariant = true;
           } else if (!existing.parentId) {
-            // Existing standalone/root filament: update it in place with the
-            // FULL flattened payload — never silently re-parent a record the
-            // user may have created by hand.
+            // Existing standalone/root filament — active or trashed: update
+            // or resurrect it in place with the FULL flattened payload. A
+            // diff-only resurrect would leave every inherited field
+            // missing/stale on an unlinked row (hyiger P2 on PR #985), and
+            // we never silently re-parent a record the user may have
+            // created by hand.
             rawPayload = entry.flattenedRaw;
           } else {
             errors.push(
-              `${entry.name}: already exists as a variant of a different filament — skipped`,
+              `"${entry.name}": already exists as a variant of a different filament — skipped`,
             );
             continue;
           }
@@ -275,7 +312,7 @@ export async function POST(request: NextRequest) {
         });
         if (!result.ok) {
           errors.push(
-            `${entry.name}: ${result.error}${result.detail ? ` (${result.detail})` : ""}`,
+            `"${entry.name}": ${result.error}${result.detail ? ` (${result.detail})` : ""}`,
           );
           continue;
         }
@@ -295,7 +332,7 @@ export async function POST(request: NextRequest) {
         if (result.payload.calibrationOutcome.unresolved) calibrationUnresolved++;
       } catch (entryErr) {
         const msg = entryErr instanceof Error ? entryErr.message : String(entryErr);
-        errors.push(`${entry.name}: ${msg}`);
+        errors.push(`"${entry.name}": ${msg}`);
       }
     }
 
