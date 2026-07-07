@@ -166,6 +166,46 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
     expect(variant.cost).toBeNull(); // still inheriting, not pinned
   });
 
+  it("clears a stale variant override when the profile goes back to inheriting the parent (Codex P2 on PR #985)", async () => {
+    // First import: the child profile genuinely overrides cost + nozzle
+    // temp, so the diff pins both on the variant.
+    const vendorPinned = {
+      ...VENDOR,
+      filament_cost: ["30"],
+      nozzle_temperature: ["235"],
+    };
+    const first = await post({
+      selected: [VENDOR.name],
+      profiles: [TEMPLATE, GENERIC, vendorPinned],
+    });
+    expect(first.status).toBe(200);
+    let variant = await Filament.findOne({ name: VENDOR.name });
+    expect(variant.cost).toBe(30);
+    expect(variant.temperatures.nozzle).toBe(235);
+
+    // Second import: the child profile dropped both overrides and now
+    // inherits the parent's cost (20) and nozzle temp (220). The diff
+    // omits the now-equal keys, so pre-fix the stale 30/235 pins survived
+    // forever; the parent-equal prunable keys riding the update payload
+    // let the GH #403 pruning clear them.
+    const res = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(res.status).toBe(200);
+    const body = await res.json();
+    expect(body.updated).toBe(2);
+    expect(body.errors).toBeUndefined();
+
+    variant = await Filament.findOne({ name: VENDOR.name });
+    expect(variant.cost).toBeNull(); // $unset — inheriting again
+    expect(variant.temperatures.nozzle).toBeNull(); // dropped from the subdoc
+    // …and the variant's own diffs are untouched.
+    expect(variant.density).toBe(1.17);
+    expect(variant.color).toBe("#FF0000");
+    const parent = await Filament.findOne({ name: GENERIC.name });
+    const resolved = resolveFilament(variant.toObject(), parent.toObject());
+    expect(resolved.cost).toBe(20);
+    expect(resolved.temperatures.nozzle).toBe(220);
+  });
+
   it("updates an existing ROOT filament in place with full values — never re-parents", async () => {
     await Filament.create({
       name: VENDOR.name,

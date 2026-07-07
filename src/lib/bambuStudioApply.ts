@@ -336,13 +336,35 @@ export function buildStructuredUpdate(
 
   // Temperatures: merge with whatever's already on the doc so we don't
   // clobber e.g. nozzleRangeMin when the import only carries `nozzle`.
+  //
+  // GH #403 / Codex P2 on PR #985: `temperatures.*` inherit per-key via
+  // resolveFilament exactly like the scalars above, so a variant gets the
+  // same parent-equality treatment. A parsed temp equal to the parent's is
+  // NOT pinned onto the variant; and when the variant carries a stale
+  // DIVERGING local value for that key, it's dropped from the replacement
+  // object — `temperatures` is $set as a whole subdocument, so omission
+  // clears the override and inheritance resumes (the subdoc equivalent of
+  // the scalar `$unset`). A parent-equal LOCAL value is left in place,
+  // mirroring the scalar branch's divergence gate.
   const t = parsed.temperatures;
   const tempKeys = Object.entries(t).filter(([, v]) => v != null);
   if (tempKeys.length > 0) {
-    u.temperatures = {
+    const parentTemps = isVariantWithParent
+      ? ((parent?.temperatures as Record<string, unknown> | undefined) ?? null)
+      : null;
+    const mergedTemps: Record<string, unknown> = {
       ...((existing?.temperatures as Record<string, unknown>) || {}),
-      ...Object.fromEntries(tempKeys),
     };
+    for (const [key, parsedVal] of tempKeys) {
+      if (parentTemps && parentTemps[key] === parsedVal) {
+        if (mergedTemps[key] != null && mergedTemps[key] !== parsedVal) {
+          delete mergedTemps[key];
+        }
+        continue;
+      }
+      mergedTemps[key] = parsedVal;
+    }
+    u.temperatures = mergedTemps;
   }
 
   if (parsed.bedTypeTemps.length > 0) {

@@ -14,7 +14,11 @@ import {
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { parseBambuStudioProfile } from "@/lib/bambuStudioImport";
 import { upsertParsedBambuFilament } from "@/lib/bambuUpsert";
-import { indexOrcaProfiles, planOrcaImport } from "@/lib/orcaSlicerImport";
+import {
+  indexOrcaProfiles,
+  planOrcaImport,
+  variantUpdateRaw,
+} from "@/lib/orcaSlicerImport";
 
 /** 24-hex ObjectId, for validating user-supplied `?ids=` before a `$in`. */
 const OBJECT_ID_RE = /^[a-f0-9]{24}$/i;
@@ -140,7 +144,11 @@ const MAX_IMPORT_PROFILES = 10_000;
  * so it collides exactly like an active row; PR #985 P2):
  *   - existing variant of the SAME parent → diff update, or diff resurrect
  *     (phase 2 never touches parentId, so the link survives; idempotent
- *     re-import; GH #403 pruning keeps inheritance live)
+ *     re-import). The parent-equal prunable keys (`PRUNABLE_RAW_KEYS`)
+ *     ride the payload so the GH #403 pruning can clear a stale local
+ *     override the profile no longer carries (Codex P2 on PR #985);
+ *     everything else stays diff-only so parent-equal values aren't
+ *     pinned.
  *   - existing ROOT filament → updated/resurrected in place with the FULL
  *     flattened payload (a diff-only resurrect would leave every inherited
  *     field missing/stale); it is never re-parented
@@ -287,8 +295,16 @@ export async function POST(request: NextRequest) {
           } else if (existing.parentId && String(existing.parentId) === parentDocId) {
             // Variant of the same parent — active (diff update) or trashed
             // (diff resurrect; phase 2 keeps its parentId, so the link
-            // survives): idempotent re-import either way.
-            rawPayload = entry.diffRaw!;
+            // survives): idempotent re-import either way. The payload is
+            // the diff PLUS the parent-equal PRUNABLE_RAW_KEYS from the
+            // flattened child — riding those along is what lets the GH
+            // #403 pruning in buildStructuredUpdate clear a stale local
+            // override the profile no longer carries, instead of leaving
+            // the variant stuck on it forever (Codex P2 on PR #985). The
+            // groups with no apply-side pruning (settings bag, bed-plate,
+            // calibrations) stay diff-only so parent-equal values aren't
+            // pinned.
+            rawPayload = variantUpdateRaw(entry);
             intendsVariant = true;
           } else if (!existing.parentId) {
             // Existing standalone/root filament — active or trashed: update

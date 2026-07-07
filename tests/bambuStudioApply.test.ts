@@ -110,6 +110,70 @@ describe("buildStructuredUpdate", () => {
       );
       expect(update.temperatures).toEqual({ nozzle: 220 });
     });
+
+    // GH #403 / Codex P2 on PR #985: temperatures inherit per-key via
+    // resolveFilament like the scalars, so a variant gets the same
+    // parent-equality treatment. `temperatures` is $set as a whole
+    // subdocument, so "unset" here means the key is OMITTED from the
+    // replacement object.
+    describe("variant-aware parent-equality pruning", () => {
+      it("does NOT pin a parsed temp equal to the parent's onto the variant", () => {
+        const existing: ExistingFilamentForApply = {
+          parentId: "parent-id",
+          parent: { temperatures: { nozzle: 220 } },
+          temperatures: {},
+        };
+        const { set: update } = buildStructuredUpdate(
+          makeParsed({ temperatures: { nozzle: 220, bed: 65 } }),
+          existing,
+        );
+        // bed (65) differs from the parent (absent) → pinned; nozzle skipped.
+        expect(update.temperatures).toEqual({ bed: 65 });
+      });
+
+      it("drops a stale DIVERGING local temp when the parsed value matches the parent", () => {
+        const existing: ExistingFilamentForApply = {
+          parentId: "parent-id",
+          parent: { temperatures: { nozzle: 220 } },
+          // Stale pin from an older import — the profile has since gone
+          // back to inheriting the parent's 220.
+          temperatures: { nozzle: 235, bed: 60 },
+        };
+        const { set: update } = buildStructuredUpdate(
+          makeParsed({ temperatures: { nozzle: 220 } }),
+          existing,
+        );
+        // nozzle omitted from the replacement → the $set clears the
+        // override and inheritance resumes; unrelated keys survive.
+        expect(update.temperatures).toEqual({ bed: 60 });
+      });
+
+      it("keeps a parent-equal LOCAL temp in place (divergence gate, mirrors the scalar branch)", () => {
+        const existing: ExistingFilamentForApply = {
+          parentId: "parent-id",
+          parent: { temperatures: { nozzle: 220 } },
+          temperatures: { nozzle: 220 },
+        };
+        const { set: update } = buildStructuredUpdate(
+          makeParsed({ temperatures: { nozzle: 220 } }),
+          existing,
+        );
+        expect(update.temperatures).toEqual({ nozzle: 220 });
+      });
+
+      it("pins normally on a root filament — no parent to inherit from", () => {
+        const existing: ExistingFilamentForApply = {
+          parentId: null,
+          parent: null,
+          temperatures: { nozzle: 235 },
+        };
+        const { set: update } = buildStructuredUpdate(
+          makeParsed({ temperatures: { nozzle: 220 } }),
+          existing,
+        );
+        expect(update.temperatures).toEqual({ nozzle: 220 });
+      });
+    });
   });
 
   describe("bedTypeTemps: merge by bedType name", () => {

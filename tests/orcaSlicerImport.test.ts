@@ -10,6 +10,7 @@ import {
   flattenOrcaProfile,
   diffOrcaRaw,
   planOrcaImport,
+  variantUpdateRaw,
   type OrcaProfileNode,
 } from "@/lib/orcaSlicerImport";
 
@@ -545,5 +546,57 @@ describe("planOrcaImport", () => {
       byName,
     );
     expect(entries).toHaveLength(2); // one root + one variant
+  });
+});
+
+describe("variantUpdateRaw", () => {
+  // Codex P2 on PR #985: the payload for an EXISTING same-parent variant
+  // must carry the parent-equal prunable keys (inheritable scalars +
+  // nozzle temps) on top of the diff, so the apply-side GH #403 pruning
+  // can clear a stale local override the profile no longer carries. The
+  // groups with no apply-side pruning (settings bag, bed-plate group,
+  // calibration group) must stay diff-only.
+  const byName = index(TEMPLATE, GENERIC, VENDOR);
+  const entry = planOrcaImport([VENDOR.name], byName).entries.find(
+    (e) => e.name === VENDOR.name,
+  )!;
+
+  it("rides parent-equal prunable scalars and nozzle temps along with the diff", () => {
+    const raw = variantUpdateRaw(entry);
+    // Parent-equal, dropped from the diff — but prunable, so they ride:
+    expect(entry.diffRaw!.filament_cost).toBeUndefined();
+    expect(raw.filament_cost).toEqual(["20"]);
+    expect(entry.diffRaw!.nozzle_temperature_range_low).toBeUndefined();
+    expect(raw.nozzle_temperature_range_low).toEqual(["190"]);
+    expect(raw.nozzle_temperature_range_high).toEqual(["240"]);
+  });
+
+  it("keeps the diff's own (differing) values — flattened values never win", () => {
+    const raw = variantUpdateRaw(entry);
+    expect(raw.filament_density).toEqual(["1.17"]);
+    expect(raw.nozzle_temperature).toEqual(["215"]);
+    expect(raw.filament_colour).toEqual(["#FF0000"]);
+  });
+
+  it("does NOT ride parent-equal bed-plate, calibration, or settings-bag keys", () => {
+    const raw = variantUpdateRaw(entry);
+    // bedTypeTemps[] and calibrations[] inherit as whole arrays and the
+    // settings bag merge is additive — no apply-side pruning exists for
+    // them, so a parent-equal value would be PINNED, not cleared.
+    expect(raw.hot_plate_temp).toBeUndefined();
+    expect(raw.cool_plate_temp).toBeUndefined();
+    expect(raw.fan_max_speed).toBeUndefined();
+  });
+
+  it("skips prunable keys absent from the flattened child", () => {
+    const raw = variantUpdateRaw(entry);
+    expect("filament_max_volumetric_speed" in raw).toBe(false);
+    expect("filament_shrink" in raw).toBe(false);
+  });
+
+  it("does not mutate the entry's diffRaw", () => {
+    const before = JSON.stringify(entry.diffRaw);
+    variantUpdateRaw(entry);
+    expect(JSON.stringify(entry.diffRaw)).toBe(before);
   });
 });

@@ -169,6 +169,59 @@ const CALIBRATION_CONTEXT_KEYS = [
 ];
 
 /**
+ * Raw keys whose DB homes are per-key inheritable AND covered by the
+ * variant-aware parent-equality pruning in `buildStructuredUpdate`
+ * (src/lib/bambuStudioApply.ts): the GH #403 inheritable scalars plus the
+ * nozzle-temperature keys. `variantUpdateRaw` rides these along on an
+ * EXISTING same-parent variant update even when equal to the parent —
+ * that equality is exactly the signal that lets the pruning clear a stale
+ * local override so inheritance resumes (Codex P2 on PR #985: a variant
+ * stuck at cost 30 after its profile went back to inheriting the parent's
+ * 20, because the diff omitted the now-equal key).
+ *
+ * Deliberately NOT the whole flattened profile: the settings bag, the
+ * bed-plate group (`bedTypeTemps[]` — whole-array inherit) and the
+ * calibration group (`calibrations[]`) have NO parent-equality pruning on
+ * the apply side, so feeding them parent-equal values would PIN them on
+ * the variant and sever inheritance rather than restore it.
+ * (`filament_max_volumetric_speed` is safe despite being a calibration
+ * key: it's excluded from `hasAnyHint`, so riding it alone never
+ * fabricates a calibrations[] row — it only feeds the top-level field's
+ * pruning.)
+ */
+export const PRUNABLE_RAW_KEYS: readonly string[] = [
+  // → the GH #403 scalar pruning (setIfNotInherited)
+  "filament_density",
+  "filament_cost",
+  "filament_max_volumetric_speed",
+  "filament_shrink",
+  "filament_shrinkage_compensation_z",
+  // → the temperature-merge pruning (temperatures.* inherit per-key)
+  "nozzle_temperature",
+  "nozzle_temperature_initial_layer",
+  "nozzle_temperature_range_low",
+  "nozzle_temperature_range_high",
+];
+
+/**
+ * The update payload for an EXISTING variant of the same planned parent:
+ * the diff plus any parent-equal PRUNABLE_RAW_KEYS from the flattened
+ * child (keys the diff kept — i.e. genuinely differing values — win).
+ * Fresh creates keep the bare diff: the create path has no existing doc,
+ * so the pruning can't run there and a parent-equal key would be pinned
+ * at birth instead of inheriting.
+ */
+export function variantUpdateRaw(entry: OrcaImportPlanEntry): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...entry.diffRaw };
+  for (const key of PRUNABLE_RAW_KEYS) {
+    if (!(key in out) && key in entry.flattenedRaw) {
+      out[key] = entry.flattenedRaw[key];
+    }
+  }
+  return out;
+}
+
+/**
  * `instantiation: "false"` (string, possibly array-wrapped) marks an
  * abstract template. Anything else — including a missing key — counts as
  * concrete (library leaves always say "true", but hand-rolled presets may
