@@ -245,6 +245,22 @@ export async function POST(request: NextRequest) {
         let rawPayload = entry.flattenedRaw;
         let createParentId: string | null = null;
         let intendsVariant = false;
+        // Set only by the same-parent-variant-update branch below — an
+        // update/resurrect there always counts toward `variants`, unlike
+        // the fresh-create branch which only counts when the write actually
+        // created (see the `variants++` guard below).
+        let sameParentVariantUpdate = false;
+        // Set by every branch below — asserts the branch's parent
+        // expectation atomically at write time via
+        // upsertParsedBambuFilament's expectedParentId option: `null` means
+        // "must currently be a root/standalone", a string means "must
+        // currently be a variant of exactly this parent". A concurrent
+        // write that changes the row's actual parent between the advisory
+        // findCollision() above and the atomic write now fails closed
+        // (falls through to the E11000 race-recovery merge, which rejects
+        // the mismatch) instead of silently applying a payload baselined
+        // against the wrong parent.
+        let expectedParentId: string | null | undefined;
 
         // Advisory pre-check for the collision trees below — the atomic
         // phases in upsertParsedBambuFilament are what actually protect the
@@ -279,6 +295,16 @@ export async function POST(request: NextRequest) {
             );
             continue;
           }
+          // We just observed no VARIANT at this name (either nothing at
+          // all, or a standalone/root row). Assert "must currently be a
+          // root/standalone" atomically at write time too, using the exact
+          // same expectedParentId machinery the same-parent-variant branch
+          // below already relies on — a concurrent write that turns this
+          // name into a variant between this check and the atomic write
+          // now fails closed (falls through to the E11000 race-recovery
+          // merge, which rejects the parent mismatch) instead of landing
+          // on the wrong-parent row.
+          expectedParentId = null;
         } else {
           const parentDocId = parentIds.get(entry.parentName!);
           if (!parentDocId) {
@@ -292,6 +318,14 @@ export async function POST(request: NextRequest) {
             rawPayload = entry.diffRaw!;
             createParentId = parentDocId;
             intendsVariant = true;
+            // We intend a fresh create under `parentDocId`. Asserting that
+            // expectation costs nothing extra — the E11000 race-recovery
+            // merge already unconditionally re-fetches the racing doc on a
+            // collision, so this reuses that same fetch to reject a
+            // wrong-parent collision instead of silently applying our diff
+            // (baselined against parentDocId) onto a row that actually
+            // belongs to a different parent.
+            expectedParentId = parentDocId;
           } else if (existing.parentId && String(existing.parentId) === parentDocId) {
             // Variant of the same parent — active (diff update) or trashed
             // (diff resurrect; phase 2 keeps its parentId, so the link
@@ -306,6 +340,26 @@ export async function POST(request: NextRequest) {
             // pinned.
             rawPayload = variantUpdateRaw(entry);
             intendsVariant = true;
+            sameParentVariantUpdate = true;
+            // P3 on PR #985 (review round 4): if the row is purged between
+            // this advisory findCollision() and the atomic upsert below,
+            // phase 1/2 both miss and phase 3 falls through to a CREATE —
+            // which only links to a parent when `createParentId` is set.
+            // Setting it here (even though this branch expects an UPDATE)
+            // means a race-triggered fallback create still links to the
+            // parent instead of landing as an orphaned, diff-only root
+            // missing every inherited field. `sameParentVariantUpdate`
+            // (not `createParentId === null`) is what keeps the `variants`
+            // counter below correct for the common non-race update path.
+            createParentId = parentDocId;
+            // We just directly observed
+            // `existing.parentId === parentDocId`, so assert that fact
+            // atomically at write time too — closes the TOCTOU window
+            // where a concurrent write re-homes this row to a different
+            // parent between this check and upsertParsedBambuFilament's
+            // actual write (which would otherwise silently apply a diff
+            // baselined against the WRONG parent).
+            expectedParentId = parentDocId;
           } else if (!existing.parentId) {
             // Existing standalone/root filament — active or trashed: update
             // or resurrect it in place with the FULL flattened payload. A
@@ -314,6 +368,13 @@ export async function POST(request: NextRequest) {
             // we never silently re-parent a record the user may have
             // created by hand.
             rawPayload = entry.flattenedRaw;
+            // Same guard as the other three branches above/below. Without
+            // it, a concurrent write re-parenting this row between the
+            // advisory check and the atomic write would let the write land
+            // anyway (no filter constrains it), leaving the row with
+            // content baselined against ONE lineage while parented under a
+            // completely different one.
+            expectedParentId = null;
           } else {
             errors.push(
               `"${entry.name}": already exists as a variant of a different filament — skipped`,
@@ -325,6 +386,7 @@ export async function POST(request: NextRequest) {
         const parsedPreset = parseBambuStudioProfile(rawPayload);
         const result = await upsertParsedBambuFilament(parsedPreset, {
           parentId: createParentId,
+          expectedParentId,
         });
         if (!result.ok) {
           errors.push(
@@ -333,11 +395,24 @@ export async function POST(request: NextRequest) {
           continue;
         }
 
+        // A root-kind write could once land on a document that turned out
+        // to be a variant of another filament (a race between the advisory
+        // findCollision() above and the atomic write), which would then
+        // get registered as a parent below and create variants-of-variants
+        // for every child planned under it. Every root-kind entry now sets
+        // `expectedParentId = null` above, which upsertParsedBambuFilament
+        // enforces atomically across all three write paths (Phase 1/2
+        // filters + the E11000 race-recovery merge) — a mismatch fails the
+        // WRITE itself with `!result.ok` before this line is ever reached,
+        // so `result.doc.parentId` is unconditionally falsy here for a
+        // root-kind entry. Pinned by the "fails the write closed..."
+        // regression test below.
+
         if (result.created) created++;
         else updated++;
         // A resurrect keeps the trashed row's old parent state, so only a
         // fresh create or a confirmed same-parent update counts as a variant.
-        if (intendsVariant && (result.created || createParentId === null)) {
+        if (intendsVariant && (result.created || createParentId === null || sameParentVariantUpdate)) {
           variants++;
         }
         names.push(result.doc.name);

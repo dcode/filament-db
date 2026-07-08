@@ -166,6 +166,392 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
     expect(variant.cost).toBeNull(); // still inheriting, not pinned
   });
 
+  it("links the fallback create to the parent when the row is purged between the advisory check and the atomic write (P3 review round 4)", async () => {
+    // First import creates the linked parent + variant normally.
+    const first = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(first.status).toBe(200);
+    const parent = await Filament.findOne({ name: GENERIC.name });
+    const existingVariant = await Filament.findOne({ name: VENDOR.name });
+    expect(existingVariant).toBeTruthy();
+    expect(String(existingVariant.parentId)).toBe(String(parent._id));
+
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const realFindOneAndUpdate = Filament.findOneAndUpdate.bind(Filament);
+    const spy = vi
+      .spyOn(Filament, "findOneAndUpdate")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async (filter: any, ...rest: any[]) => {
+        if (filter && String(filter._id) === String(existingVariant._id)) {
+          // Simulate a concurrent soft-delete + purge landing between the
+          // route's advisory findCollision() (already run by the time we
+          // get here) and this atomic write: the row genuinely vanishes
+          // from both the active AND the resurrectable-trashed views, so
+          // this phase-1 write misses (filter's `_deletedAt: null` no
+          // longer matches) and phase 2's own findOne (a real, unmocked
+          // call) won't find it either since it's now `_purged: true`.
+          await Filament.updateOne(
+            { _id: existingVariant._id },
+            { $set: { _deletedAt: new Date(), _purged: true } },
+          );
+          return null;
+        }
+        return realFindOneAndUpdate(filter, ...rest);
+      });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.errors).toBeUndefined();
+
+      // Phase 1 + phase 2 both missed → phase 3 created a NEW row. It must
+      // link to the parent, not land as an orphaned, diff-only root missing
+      // every inherited field (the bug: createParentId stayed null on this
+      // branch pre-fix).
+      const created = await Filament.findOne({
+        name: VENDOR.name,
+        _id: { $ne: existingVariant._id },
+      });
+      expect(created).toBeTruthy();
+      expect(String(created.parentId)).toBe(String(parent._id));
+      const resolved = resolveFilament(created.toObject(), parent.toObject());
+      expect(resolved.temperatures.nozzle).toBe(220);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("fails the write closed (never lands, never cascades) when a race turns a planned root into a variant of another filament", async () => {
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const otherParent = await Filament.create({
+      name: "Unrelated Root",
+      vendor: "Someone Else",
+      type: "PLA",
+      diameter: 1.75,
+    });
+
+    // Captured BEFORE spying so the injected race and the "let it through"
+    // branches always call the true original — never the spy — avoiding
+    // any ordering interaction with the separate `create` spy below.
+    const realFindOne = Filament.findOne.bind(Filament);
+    const realCreate = Filament.create.bind(Filament);
+
+    // Route-level findCollision() for the planned root (GENERIC.name) is
+    // {name, _deletedAt:null} chained with .select().lean() — the FIRST
+    // occurrence of that exact filter shape. upsertParsedBambuFilament's
+    // own phase-1 read is the bare, unchained SECOND occurrence. Keying on
+    // occurrence count (not call order) is robust regardless of how many
+    // OTHER findOne calls (for other entries) interleave.
+    let genericActiveCalls = 0;
+    const findOneSpy = vi
+      .spyOn(Filament, "findOne")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation((filter: any, ...rest: any[]) => {
+        if (filter && filter.name === GENERIC.name && filter._deletedAt === null) {
+          genericActiveCalls++;
+          if (genericActiveCalls === 2) {
+            // This is upsertParsedBambuFilament's phase-1 read. Inject a
+            // concurrent import creating GENERIC.name as a VARIANT of an
+            // unrelated parent right before it resolves — landing in the
+            // TOCTOU window between the route's advisory check (already
+            // run, saw nothing) and this read. Uses realCreate so it can
+            // never be caught by the separate create-spy below.
+            return (async () => {
+              await realCreate({
+                name: GENERIC.name,
+                vendor: "Racing Variant Creator",
+                type: "PLA",
+                diameter: 1.75,
+                parentId: otherParent._id,
+              });
+              return realFindOne(filter, ...rest);
+            })();
+          }
+        }
+        return realFindOne(filter, ...rest);
+      });
+    // Phase 1 now misses (expectedParentId: null doesn't match the
+    // racer's non-null parentId), phase 2 has nothing trashed, so phase 3
+    // attempts a real create — which WOULD collide with the racer's
+    // GENERIC.name via the partial-unique-on-name index, but that index
+    // builds asynchronously and can lag under a loaded test run (same
+    // flakiness the existing bambuUpsert.test.ts race tests avoid by
+    // forcing the E11000 explicitly). Force it here too so the
+    // race-recovery path — where the round-2 expectedParentId check now
+    // also lives — runs deterministically. The racing creation above
+    // bypasses this spy entirely (uses realCreate), so the only call this
+    // spy actually observes is phase 3's genuine attempt.
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const createSpy = vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      throw e11000;
+    });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+
+      // The root entry's write must fail closed BEFORE landing:
+      // expectedParentId: null on the root branch rejects it at the
+      // race-recovery merge — registering it as a parent would create a
+      // variant-of-a-variant for VENDOR.
+      expect(body.errors).toEqual(
+        expect.arrayContaining([
+          expect.stringContaining(`"${GENERIC.name}": Collision`),
+          expect.stringContaining(`"${VENDOR.name}": parent "${GENERIC.name}" failed to import`),
+        ]),
+      );
+
+      // No variant-of-a-variant was created: VENDOR.name was never written.
+      expect(await Filament.countDocuments({ name: VENDOR.name })).toBe(0);
+      // The racing document was never touched by the failed write — its
+      // parentId AND its content (vendor) are exactly as the race left
+      // them, proving the write failed BEFORE landing, not after.
+      const racer = await Filament.findOne({ name: GENERIC.name });
+      expect(String(racer.parentId)).toBe(String(otherParent._id));
+      expect(racer.vendor).toBe("Racing Variant Creator");
+    } finally {
+      findOneSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it("fails closed instead of applying a wrong-baseline diff when a race re-parents the variant mid-write", async () => {
+    const first = await post({ selected: [VENDOR.name], profiles: ALL });
+    expect(first.status).toBe(200);
+    const parent = await Filament.findOne({ name: GENERIC.name });
+    const existingVariant = await Filament.findOne({ name: VENDOR.name });
+    expect(String(existingVariant.parentId)).toBe(String(parent._id));
+    const originalDensity = existingVariant.density;
+
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const otherParent = await Filament.create({
+      name: "Unrelated Root 2",
+      vendor: "Someone Else",
+      type: "PLA",
+      diameter: 1.75,
+    });
+
+    const realFindOneAndUpdate = Filament.findOneAndUpdate.bind(Filament);
+    const findOneAndUpdateSpy = vi
+      .spyOn(Filament, "findOneAndUpdate")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async (filter: any, ...rest: any[]) => {
+        if (filter && String(filter._id) === String(existingVariant._id)) {
+          // Simulate a concurrent actor re-parenting VENDOR between the
+          // route's advisory findCollision() (already run, observed
+          // parentId === GENERIC) and this atomic write. The new
+          // expectedParentId filter should now genuinely fail to match
+          // once this mutation lands — no need to fake a null return.
+          await Filament.updateOne(
+            { _id: existingVariant._id },
+            { $set: { parentId: otherParent._id } },
+          );
+        }
+        return realFindOneAndUpdate(filter, ...rest);
+      });
+    // Phase 1 now misses (filter above), phase 2 has nothing trashed, so
+    // phase 3 attempts a real create — which WOULD collide with VENDOR's
+    // still-active row via the partial-unique-on-name index, but that
+    // index builds asynchronously and can lag under a loaded test run
+    // (same flakiness the existing bambuUpsert.test.ts race tests avoid
+    // by forcing the E11000 explicitly rather than relying on the real
+    // index). Force it here too so the race-recovery path — where the new
+    // expectedParentId check actually lives — runs deterministically.
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    // The only Filament.create() call left in this flow (GENERIC updates
+    // via phase 1 normally; `otherParent` was already created above,
+    // before this spy exists) is phase 3's attempt to create VENDOR.
+    const createSpy = vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      throw e11000;
+    });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.errors).toEqual(
+        expect.arrayContaining([expect.stringContaining(`"${VENDOR.name}": Collision`)]),
+      );
+
+      // The variant's content must NOT have been overwritten with a diff
+      // baselined against the WRONG (no-longer-current) parent.
+      const unchanged = await Filament.findOne({ name: VENDOR.name });
+      expect(unchanged.density).toBe(originalDensity);
+    } finally {
+      findOneAndUpdateSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it("fails closed instead of applying a wrong-baseline diff when a brand-new variant name races under a different parent", async () => {
+    // Import ONLY the root (GENERIC) first — VENDOR.name does not exist
+    // anywhere yet, so the route's advisory findCollision() for it will
+    // genuinely find nothing and intend a fresh CREATE.
+    const rootOnly = await post({ selected: [GENERIC.name], profiles: ALL });
+    expect(rootOnly.status).toBe(200);
+
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const otherParent = await Filament.create({
+      name: "Unrelated Root 3",
+      vendor: "Someone Else",
+      type: "PLA",
+      diameter: 1.75,
+    });
+
+    // Captured BEFORE spying so the injected race and the "let it through"
+    // branches always call the true original — never the spy — avoiding
+    // any ordering interaction with the separate `create` spy below.
+    const realFindOne = Filament.findOne.bind(Filament);
+    const realCreate = Filament.create.bind(Filament);
+
+    // GENERIC already exists (from the root-only import above), so its OWN
+    // advisory findCollision() short-circuits on the FIRST (active) check
+    // and never reaches a trashed check — meaning the number of findOne
+    // calls it consumes isn't fixed at 2 the way a from-scratch root is.
+    // Keying on VENDOR.name specifically (which GENERIC's calls never
+    // match) sidesteps that entirely: VENDOR's own advisory findCollision()
+    // active-check is the FIRST occurrence of {name: VENDOR.name,
+    // _deletedAt: null}; upsertParsedBambuFilament's phase-1 read is the
+    // bare, unchained SECOND occurrence.
+    let vendorActiveCalls = 0;
+    const findOneSpy = vi
+      .spyOn(Filament, "findOne")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation((filter: any, ...rest: any[]) => {
+        if (filter && filter.name === VENDOR.name && filter._deletedAt === null) {
+          vendorActiveCalls++;
+          if (vendorActiveCalls === 2) {
+            return (async () => {
+              await realCreate({
+                name: VENDOR.name,
+                vendor: "Racing Variant Creator 2",
+                type: "PLA",
+                diameter: 1.75,
+                density: 42, // distinguishable from any GENERIC-baselined diff
+                parentId: otherParent._id,
+              });
+              return realFindOne(filter, ...rest);
+            })();
+          }
+        }
+        return realFindOne(filter, ...rest);
+      });
+    // Force the E11000 deterministically (the real partial-unique-on-name
+    // index builds asynchronously and can lag under a loaded test run).
+    // The racing creation above bypasses this spy entirely (uses
+    // realCreate), so the only call this spy actually
+    // observes is phase 3's genuine attempt to create VENDOR.
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const createSpy = vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      throw e11000;
+    });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.errors).toEqual(
+        expect.arrayContaining([expect.stringContaining(`"${VENDOR.name}": Collision`)]),
+      );
+
+      // The racing document must be untouched by our diff (baselined
+      // against GENERIC, not the racer's actual parent) — proving the
+      // write failed BEFORE landing, not silently corrupting it.
+      const racer = await Filament.findOne({ name: VENDOR.name });
+      expect(String(racer.parentId)).toBe(String(otherParent._id));
+      expect(racer.vendor).toBe("Racing Variant Creator 2");
+      expect(racer.density).toBe(42);
+    } finally {
+      findOneSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it("fails closed instead of applying a wrong-baseline diff when a race re-parents an existing standalone collision mid-write", async () => {
+    // A hand-made standalone filament shares VENDOR's name — the "existing
+    // standalone/root" collision branch, distinct from the
+    // same-parent-variant-update branch covered above.
+    const standalone = await Filament.create({
+      name: VENDOR.name,
+      vendor: "Hand Made",
+      type: "PLA",
+      diameter: 1.75,
+    });
+
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const otherParent = await Filament.create({
+      name: "Unrelated Root 4",
+      vendor: "Someone Else",
+      type: "PLA",
+      diameter: 1.75,
+    });
+
+    const realFindOneAndUpdate = Filament.findOneAndUpdate.bind(Filament);
+    const findOneAndUpdateSpy = vi
+      .spyOn(Filament, "findOneAndUpdate")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async (filter: any, ...rest: any[]) => {
+        if (filter && String(filter._id) === String(standalone._id)) {
+          // Simulate a concurrent actor re-parenting the standalone row
+          // between the route's advisory findCollision() (already run,
+          // observed parentId === null) and this atomic write.
+          await Filament.updateOne(
+            { _id: standalone._id },
+            { $set: { parentId: otherParent._id } },
+          );
+        }
+        return realFindOneAndUpdate(filter, ...rest);
+      });
+    // GENERIC doesn't exist yet in this test (only VENDOR does, as the
+    // pre-existing standalone), so it needs a real, unmocked create of its
+    // own — only VENDOR's create attempt (which collides with the
+    // now-re-parented standalone row) should be forced to E11000.
+    const realCreate = Filament.create.bind(Filament);
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const createSpy = vi
+      .spyOn(Filament, "create")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async (doc: any) => {
+        if (doc && doc.name === VENDOR.name) throw e11000;
+        return realCreate(doc);
+      });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.errors).toEqual(
+        expect.arrayContaining([expect.stringContaining(`"${VENDOR.name}": Collision`)]),
+      );
+
+      // The row must NOT have been overwritten with the full flattened
+      // payload (baselined as "this is a standalone") while it actually
+      // now belongs to a different parent — vendor stays "Hand Made".
+      const unchanged = await Filament.findOne({ name: VENDOR.name });
+      expect(unchanged.vendor).toBe("Hand Made");
+      expect(String(unchanged.parentId)).toBe(String(otherParent._id));
+    } finally {
+      findOneAndUpdateSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
   it("clears a stale variant override when the profile goes back to inheriting the parent (Codex P2 on PR #985)", async () => {
     // First import: the child profile genuinely overrides cost + nozzle
     // temp, so the diff pins both on the variant.

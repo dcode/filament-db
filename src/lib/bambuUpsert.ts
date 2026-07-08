@@ -46,13 +46,30 @@ export interface BambuUpsertOptions {
    * this — an existing row is never silently re-parented by an import.
    */
   parentId?: string | null;
+  /**
+   * When set, every UPDATE path (phase 1's atomic filter, phase 2's atomic
+   * filter, AND the E11000 race-recovery merge) additionally requires the
+   * matched row's CURRENT `parentId` to equal this value — `null` means
+   * "must currently be a root/standalone". This closes a TOCTOU window: a
+   * caller that observed a specific parent for this name via its own
+   * advisory pre-check can assert that observation still holds at write
+   * time, instead of silently applying a payload that was computed against
+   * a baseline that may no longer match reality. A filter mismatch on
+   * phase 1/2 falls through exactly like "row deleted mid-flight" already
+   * does; a mismatch on the
+   * race-recovery merge returns a distinct 409 so the caller can surface a
+   * clean per-item error instead of corrupting the row. Omit (the default)
+   * to preserve the original no-expectation behavior — every existing
+   * caller that doesn't pass this is unaffected.
+   */
+  expectedParentId?: string | null;
 }
 
 export type BambuUpsertResult =
   | {
       ok: true;
       created: boolean;
-      doc: { _id: unknown; name: string };
+      doc: { _id: unknown; name: string; parentId?: unknown };
       payload: BambuUpdatePayload;
     }
   | { ok: false; status: number; error: string; detail?: string };
@@ -119,8 +136,15 @@ export async function upsertParsedBambuFilament(
     if (payloadFailure) return payloadFailure;
     delete (payload.update as Record<string, unknown>).spools;
     try {
+      const updateFilter: Record<string, unknown> = {
+        _id: existingActive._id,
+        _deletedAt: null,
+      };
+      if (opts?.expectedParentId !== undefined) {
+        updateFilter.parentId = opts.expectedParentId;
+      }
       const updated = await Filament.findOneAndUpdate(
-        { _id: existingActive._id, _deletedAt: null },
+        updateFilter,
         composeMongoUpdate(payload),
         { runValidators: true, context: "query", returnDocument: "after" },
       );
@@ -130,8 +154,10 @@ export async function upsertParsedBambuFilament(
     } catch (validationErr) {
       return failureFromCaught(validationErr, INVALID_VALUES_MESSAGE);
     }
-    // Phase-1 update returned null → the row was deleted between our
-    // findOne and the atomic write. Fall through to phase 2 / 3.
+    // Phase-1 update returned null → either the row was deleted between
+    // our findOne and the atomic write, OR (when expectedParentId is set)
+    // its parent no longer matches what the caller expected. Fall through
+    // to phase 2 / 3 either way.
   }
 
   // Phase 2 — resurrect a trashed (non-purged) row of the same name
@@ -160,12 +186,16 @@ export async function upsertParsedBambuFilament(
         ...(resurrectUpdate.$set as Record<string, unknown>),
         _deletedAt: null,
       };
+      const resurrectFilter: Record<string, unknown> = {
+        _id: existingTrashed._id,
+        _deletedAt: { $ne: null },
+        _purged: { $ne: true },
+      };
+      if (opts?.expectedParentId !== undefined) {
+        resurrectFilter.parentId = opts.expectedParentId;
+      }
       const resurrected = await Filament.findOneAndUpdate(
-        {
-          _id: existingTrashed._id,
-          _deletedAt: { $ne: null },
-          _purged: { $ne: true },
-        },
+        resurrectFilter,
         resurrectUpdate,
         { runValidators: true, context: "query", returnDocument: "after" },
       );
@@ -175,8 +205,9 @@ export async function upsertParsedBambuFilament(
     } catch (validationErr) {
       return failureFromCaught(validationErr, INVALID_VALUES_MESSAGE);
     }
-    // Phase-2 returned null → the row was purged or restored between
-    // findOne and write. Fall through to phase 3.
+    // Phase-2 returned null → the row was purged/restored between findOne
+    // and write, OR (when expectedParentId is set) its parent no longer
+    // matches. Fall through to phase 3 either way.
   }
 
   // Phase 3 — create. Required fields (vendor + type) must be present
@@ -222,6 +253,22 @@ export async function upsertParsedBambuFilament(
       // The winning row was already deleted; bail out with the
       // original error rather than spinning.
       return failureFromCaught(createErr, "Failed to create filament");
+    }
+    if (opts?.expectedParentId !== undefined) {
+      const racingParentIdStr = racing.parentId ? String(racing.parentId) : null;
+      if (racingParentIdStr !== opts.expectedParentId) {
+        // The row that won the create race belongs to a different parent
+        // than the caller expected — applying `parsed` (a payload baselined
+        // against the EXPECTED parent) here would silently write a diff
+        // computed against the wrong baseline onto it. Refuse with a
+        // distinct error instead of merging blind.
+        return {
+          ok: false,
+          status: 409,
+          error:
+            "Collision: an existing filament of this name belongs to a different parent than expected",
+        };
+      }
     }
     const racePayload = await prepareBambuUpdate(
       parsed,

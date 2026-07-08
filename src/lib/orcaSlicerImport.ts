@@ -169,6 +169,29 @@ const CALIBRATION_CONTEXT_KEYS = [
 ];
 
 /**
+ * `CALIBRATION_KEYS` minus `filament_max_volumetric_speed`, used ONLY to
+ * decide whether the calibration atomic group is kept in `diffOrcaRaw`.
+ *
+ * `filament_max_volumetric_speed` is a `CALIBRATION_KEYS` member (it feeds
+ * a `calibrations[]` hint on the Bambu/Orca apply side) but it ALSO lands
+ * on the top-level `maxVolumetricSpeed` field, which is why the parser
+ * deliberately excludes it from `hasAnyHint` (see the Codex P3 comment on
+ * PR #387 round 6 in bambuStudioImport.ts) — a max-vol-only profile
+ * resolves cleanly through the top-level field with no printer/nozzle
+ * context needed. If max-vol were left in the atomic-trigger set here, a
+ * variant whose ONLY real override is max-vol would force-keep every
+ * other parent-equal calibration key (flow ratio, pressure advance, fan
+ * speeds), fabricating a pinned `calibrations[]` row and severing the
+ * variant's calibration inheritance for no reason. Excluding it here lets
+ * it fall through to ordinary per-key diffing, which is correct since
+ * `PRUNABLE_RAW_KEYS` already handles its parent-equality re-inheritance
+ * on the top-level field.
+ */
+const CALIBRATION_ATOMIC_KEYS = new Set(
+  [...CALIBRATION_KEYS].filter((k) => k !== "filament_max_volumetric_speed"),
+);
+
+/**
  * Raw keys whose DB homes are per-key inheritable AND covered by the
  * variant-aware parent-equality pruning in `buildStructuredUpdate`
  * (src/lib/bambuStudioApply.ts): the GH #403 inheritable scalars plus the
@@ -188,6 +211,22 @@ const CALIBRATION_CONTEXT_KEYS = [
  * key: it's excluded from `hasAnyHint`, so riding it alone never
  * fabricates a calibrations[] row — it only feeds the top-level field's
  * pruning.)
+ *
+ * KNOWN GAP: `hot_plate_temp` / `hot_plate_temp_initial_layer` are NOT
+ * listed here even though `temperatures.bed` / `temperatures.bedFirstLayer`
+ * DO get the same per-key parent-equality pruning in `buildStructuredUpdate`
+ * (bambuStudioApply.ts). `hot_plate_temp` is ALSO a `BED_PLATE_KEY` feeding
+ * the atomic `bedTypeTemps[]` "Hot Plate" entry, which has NO apply-side
+ * parent-equality pruning — adding it here would make `variantUpdateRaw`
+ * re-attach a lone parent-equal `hot_plate_temp` on a re-import, which
+ * `parseBambuStudioProfile` turns into a `bedTypeTemps` entry that the
+ * applier unconditionally $sets, PINNING it instead of restoring
+ * inheritance. So a variant whose `hot_plate_temp` diverges and later
+ * reconverges to the parent's value stays stuck on its stale
+ * `temperatures.bed` override — the top-level bed divergence-clear this
+ * module enables for nozzle temps is currently unreachable for the bed
+ * temp. Fixing it needs apply-side pruning for `bedTypeTemps[]` (out of
+ * scope here); this is a documented trade-off, not an oversight.
  */
 export const PRUNABLE_RAW_KEYS: readonly string[] = [
   // → the GH #403 scalar pruning (setIfNotInherited)
@@ -460,8 +499,8 @@ export function diffOrcaRaw(
   flatParent: Record<string, unknown>,
 ): Record<string, unknown> {
   const childKeys = Object.keys(flatChild);
-  const plateKeys = childKeys.filter((k) => k in BED_PLATE_KEYS);
-  const calibrationKeys = childKeys.filter((k) => CALIBRATION_KEYS.has(k));
+  const plateKeys = childKeys.filter((k) => Object.prototype.hasOwnProperty.call(BED_PLATE_KEYS, k));
+  const calibrationKeys = childKeys.filter((k) => CALIBRATION_ATOMIC_KEYS.has(k));
 
   const anyPlateDiffers = plateKeys.some(
     (k) => !rawValuesEqual(flatChild[k], flatParent[k]),
@@ -474,9 +513,9 @@ export function diffOrcaRaw(
   for (const key of childKeys) {
     const keep =
       DIFF_ALWAYS_KEEP.has(key) ||
-      (key in BED_PLATE_KEYS
+      (Object.prototype.hasOwnProperty.call(BED_PLATE_KEYS, key)
         ? anyPlateDiffers
-        : CALIBRATION_KEYS.has(key)
+        : CALIBRATION_ATOMIC_KEYS.has(key)
           ? anyCalibrationDiffers
           : !rawValuesEqual(flatChild[key], flatParent[key]));
     if (keep) out[key] = flatChild[key];

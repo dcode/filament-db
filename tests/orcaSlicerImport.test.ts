@@ -1,4 +1,6 @@
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import {
   indexOrcaProfiles,
   isConcreteOrcaProfile,
@@ -11,6 +13,7 @@ import {
   diffOrcaRaw,
   planOrcaImport,
   variantUpdateRaw,
+  PRUNABLE_RAW_KEYS,
   type OrcaProfileNode,
 } from "@/lib/orcaSlicerImport";
 
@@ -402,6 +405,64 @@ describe("diffOrcaRaw", () => {
     const diff = diffOrcaRaw(flatChild, flatParent);
     expect(diff.fan_max_speed).toBeUndefined();
   });
+
+  it("does NOT force-keep the calibration group when max-vol is the ONLY differing calibration key (P2 review round 4)", () => {
+    // filament_max_volumetric_speed is a CALIBRATION_KEYS member but also
+    // lands on the top-level maxVolumetricSpeed field and is excluded from
+    // hasAnyHint (bambuStudioImport.ts). A variant whose only real override
+    // is max-vol must NOT fabricate a pinned calibrations[] row by dragging
+    // every other parent-equal calibration key along.
+    const maxVolOnly = {
+      ...VENDOR,
+      filament_max_volumetric_speed: ["15"],
+    };
+    const flat = flattenOrcaProfile(
+      "Polymaker PolyLite PLA @System",
+      index(TEMPLATE, GENERIC, maxVolOnly),
+    );
+    const diff = diffOrcaRaw(flat, flatParent);
+    expect(diff.filament_max_volumetric_speed).toEqual(["15"]);
+    // Parent-equal calibration keys must stay dropped — no atomic group.
+    expect(diff.fan_max_speed).toBeUndefined();
+    expect(diff.printer_settings_id).toBeUndefined();
+  });
+
+  it("still force-keeps the calibration group when max-vol differs ALONGSIDE a real calibration key", () => {
+    const both = {
+      ...VENDOR,
+      filament_max_volumetric_speed: ["15"],
+      pressure_advance: ["0.035"],
+    };
+    const flat = flattenOrcaProfile(
+      "Polymaker PolyLite PLA @System",
+      index(TEMPLATE, GENERIC, both),
+    );
+    const diff = diffOrcaRaw(flat, flatParent);
+    expect(diff.filament_max_volumetric_speed).toEqual(["15"]);
+    expect(diff.pressure_advance).toEqual(["0.035"]);
+    // fan_max_speed is parent-equal but rides along because a genuine
+    // calibration key (pressure_advance) differs.
+    expect(diff.fan_max_speed).toEqual(["100"]);
+  });
+
+  it("does not misclassify a prototype-named preset key into the bed-plate atomic group", () => {
+    // `k in BED_PLATE_KEYS` would return true for "constructor" /
+    // "toString" / etc. via Object.prototype — hardening regression test.
+    const withPrototypeKey = {
+      ...VENDOR,
+      constructor: ["some-value"],
+    };
+    const flat = flattenOrcaProfile(
+      "Polymaker PolyLite PLA @System",
+      index(TEMPLATE, GENERIC, withPrototypeKey),
+    );
+    // Real bed-plate keys are parent-equal and must stay dropped — a
+    // misclassified "constructor" key would flip anyPlateDiffers true and
+    // force-keep them.
+    const diff = diffOrcaRaw(flat, flatParent);
+    expect(diff.hot_plate_temp).toBeUndefined();
+    expect(diff.cool_plate_temp).toBeUndefined();
+  });
 });
 
 describe("planOrcaImport", () => {
@@ -598,5 +659,53 @@ describe("variantUpdateRaw", () => {
     const before = JSON.stringify(entry.diffRaw);
     variantUpdateRaw(entry);
     expect(JSON.stringify(entry.diffRaw)).toBe(before);
+  });
+});
+
+describe("PRUNABLE_RAW_KEYS parity (P3 review round 4)", () => {
+  // PRUNABLE_RAW_KEYS is a hand-written raw-key mirror of the inheritable
+  // scalars `buildStructuredUpdate` (bambuStudioApply.ts) parent-equality
+  // prunes via `setIfNotInherited`. If a future scalar is added there and
+  // this list isn't updated to match, `variantUpdateRaw` silently stops
+  // re-attaching the now-parent-equal key and the GH #403 $unset that
+  // resumes inheritance never fires — with all other tests green. This
+  // test reads the actual source and fails loudly on drift instead.
+  //
+  // Deliberately excluded (documented, not oversights):
+  //   - `type` / `vendor` — schema-REQUIRED fields; buildStructuredUpdate's
+  //     REQUIRED_FIELDS set never $unsets them, so they're not "prunable".
+  //   - `diameter` — DIFF_ALWAYS_KEEP always carries it on the diff itself
+  //     (a variant created without it gets Mongoose's wrong 1.75 default),
+  //     so it never needs the separate prunable-rider mechanism.
+  const FIELD_TO_RAW_KEY: Record<string, string> = {
+    density: "filament_density",
+    cost: "filament_cost",
+    maxVolumetricSpeed: "filament_max_volumetric_speed",
+    shrinkageXY: "filament_shrink",
+    shrinkageZ: "filament_shrinkage_compensation_z",
+  };
+  const KNOWN_NON_PRUNABLE = new Set(["type", "vendor", "diameter"]);
+
+  it("PRUNABLE_RAW_KEYS covers every optional inheritable scalar setIfNotInherited() prunes", () => {
+    const applySource = readFileSync(
+      resolve(__dirname, "../src/lib/bambuStudioApply.ts"),
+      "utf8",
+    );
+    const calls = [...applySource.matchAll(/setIfNotInherited\(\s*"(\w+)"/g)].map(
+      (m) => m[1],
+    );
+    expect(calls.length).toBeGreaterThan(0);
+    const unmapped = calls.filter(
+      (field) => !KNOWN_NON_PRUNABLE.has(field) && !(field in FIELD_TO_RAW_KEY),
+    );
+    // A field appearing here means a new setIfNotInherited() call was added
+    // to bambuStudioApply.ts without updating FIELD_TO_RAW_KEY (this test)
+    // AND, most likely, PRUNABLE_RAW_KEYS itself.
+    expect(unmapped).toEqual([]);
+    for (const field of calls) {
+      if (KNOWN_NON_PRUNABLE.has(field)) continue;
+      const rawKey = FIELD_TO_RAW_KEY[field];
+      expect(PRUNABLE_RAW_KEYS).toContain(rawKey);
+    }
   });
 });

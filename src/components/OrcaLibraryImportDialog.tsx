@@ -133,6 +133,8 @@ export default function OrcaLibraryImportDialog({ onClose, onImported }: Props) 
     if (allFiles.length === 0) {
       setByName(new Map());
       setScanInfo({ found: 0, skipped: 0 });
+      setSelected(new Set());
+      setResults(null);
       return;
     }
     setScanning(true);
