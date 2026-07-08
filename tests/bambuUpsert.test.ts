@@ -80,6 +80,34 @@ describe("upsertParsedBambuFilament (three-phase upsert lib)", () => {
     expect(await Filament.countDocuments({ name: "QA Upsert PLA", _deletedAt: null })).toBe(1);
   });
 
+  it("blocks the phase-2 resurrect when the trashed row's parent doesn't match expectedParentId", async () => {
+    const realParentId = new mongoose.Types.ObjectId().toString();
+    const trashed = await Filament.create({
+      name: "QA Upsert PLA",
+      vendor: "Old",
+      type: "PLA",
+      parentId: realParentId,
+    });
+    await Filament.updateOne({ _id: trashed._id }, { $set: { _deletedAt: new Date() } });
+
+    const differentParentId = new mongoose.Types.ObjectId().toString();
+    // No mocking — the resurrect atomic's own filter (parentId: opts.expectedParentId)
+    // genuinely fails to match the trashed row's real parentId, proving the
+    // guard blocks it for real rather than by a stubbed-null return.
+    const result = await upsert(parsed(), { expectedParentId: differentParentId });
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.created).toBe(true); // a NEW row, not the resurrect
+
+    // The original trashed row was never touched — still trashed, still
+    // carrying its real (unexpected) parent.
+    const stillTrashed = await Filament.findById(trashed._id);
+    expect(stillTrashed!._deletedAt).not.toBeNull();
+    expect(String(stillTrashed!.parentId)).toBe(realParentId);
+
+    // The new create is the only active row of this name.
+    expect(await Filament.countDocuments({ name: "QA Upsert PLA", _deletedAt: null })).toBe(1);
+  });
+
   it("maps a validator rejection from the resurrect write to a 400 result", async () => {
     const trashed = await Filament.create({ name: "QA Upsert PLA", vendor: "Old", type: "PLA" });
     await Filament.updateOne({ _id: trashed._id }, { $set: { _deletedAt: new Date() } });

@@ -135,6 +135,9 @@ export default function OrcaLibraryImportDialog({ onClose, onImported }: Props) 
       setScanInfo({ found: 0, skipped: 0 });
       setSelected(new Set());
       setResults(null);
+      setSearch("");
+      setVendorFilter("");
+      setMaterialFilter("");
       return;
     }
     setScanning(true);
@@ -174,6 +177,14 @@ export default function OrcaLibraryImportDialog({ onClose, onImported }: Props) 
       });
       setSelected(new Set());
       setResults(null);
+      // A stale filter from the previous folder's scan can silently hide
+      // every row of a new scan (or leave the <select> showing blank
+      // because the old value isn't in the new option list) — reset all
+      // three alongside selected/results so a fresh scan always starts
+      // fully unfiltered.
+      setSearch("");
+      setVendorFilter("");
+      setMaterialFilter("");
     } finally {
       setScanning(false);
     }

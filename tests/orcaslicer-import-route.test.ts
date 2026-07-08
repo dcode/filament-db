@@ -867,6 +867,49 @@ describe("POST /api/filaments/orcaslicer (bulk library import)", () => {
     }
   });
 
+  it("counts a race-recovered variant merge toward `variants`, not `updated`", async () => {
+    // Root already exists so only VENDOR's own create races.
+    const rootOnly = await post({ selected: [GENERIC.name], profiles: ALL });
+    expect(rootOnly.status).toBe(200);
+    const parent = await Filament.findOne({ name: GENERIC.name });
+
+    vi.resetModules();
+    Filament = (await import("@/models/Filament")).default;
+    const { POST } = await import("@/app/api/filaments/orcaslicer/route");
+
+    const realCreate = Filament.create.bind(Filament);
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    const createSpy = vi
+      .spyOn(Filament, "create")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementationOnce(async (doc: any) => {
+        // A concurrent import creates the SAME brand-new variant under the
+        // SAME parent right as we attempt our own create — the winner
+        // lands first, so ours collides and has to merge via the E11000
+        // race-recovery path (created: false).
+        await realCreate({ ...doc, vendor: "Racing Winner" });
+        throw e11000;
+      });
+
+    try {
+      const res = await POST(jsonReq({ selected: [VENDOR.name], profiles: ALL }));
+      const body = await res.json();
+      expect(res.status).toBe(200);
+      expect(body.created).toBe(0); // GENERIC already existed; VENDOR merged, not created
+      expect(body.updated).toBe(2); // GENERIC (unchanged update) + VENDOR (race merge)
+      // The merge is still a legitimate variant write — must not be
+      // miscounted as a plain `updated` row instead of `variants`.
+      expect(body.variants).toBe(1);
+
+      const variant = await Filament.findOne({ name: VENDOR.name });
+      expect(String(variant.parentId)).toBe(String(parent._id));
+      // Our own diff won the merge (overrode the racing winner's placeholder vendor).
+      expect(variant.vendor).toBe("Polymaker");
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
   it("a profile with a missing base errors individually; siblings still import", async () => {
     const orphan = {
       name: "Orphan PLA",

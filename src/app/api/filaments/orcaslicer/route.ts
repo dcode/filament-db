@@ -245,11 +245,6 @@ export async function POST(request: NextRequest) {
         let rawPayload = entry.flattenedRaw;
         let createParentId: string | null = null;
         let intendsVariant = false;
-        // Set only by the same-parent-variant-update branch below — an
-        // update/resurrect there always counts toward `variants`, unlike
-        // the fresh-create branch which only counts when the write actually
-        // created (see the `variants++` guard below).
-        let sameParentVariantUpdate = false;
         // Set by every branch below — asserts the branch's parent
         // expectation atomically at write time via
         // upsertParsedBambuFilament's expectedParentId option: `null` means
@@ -340,7 +335,6 @@ export async function POST(request: NextRequest) {
             // pinned.
             rawPayload = variantUpdateRaw(entry);
             intendsVariant = true;
-            sameParentVariantUpdate = true;
             // P3 on PR #985 (review round 4): if the row is purged between
             // this advisory findCollision() and the atomic upsert below,
             // phase 1/2 both miss and phase 3 falls through to a CREATE —
@@ -348,9 +342,7 @@ export async function POST(request: NextRequest) {
             // Setting it here (even though this branch expects an UPDATE)
             // means a race-triggered fallback create still links to the
             // parent instead of landing as an orphaned, diff-only root
-            // missing every inherited field. `sameParentVariantUpdate`
-            // (not `createParentId === null`) is what keeps the `variants`
-            // counter below correct for the common non-race update path.
+            // missing every inherited field.
             createParentId = parentDocId;
             // We just directly observed
             // `existing.parentId === parentDocId`, so assert that fact
@@ -410,9 +402,16 @@ export async function POST(request: NextRequest) {
 
         if (result.created) created++;
         else updated++;
-        // A resurrect keeps the trashed row's old parent state, so only a
-        // fresh create or a confirmed same-parent update counts as a variant.
-        if (intendsVariant && (result.created || createParentId === null || sameParentVariantUpdate)) {
+        // Any successful write for a variant-intent entry counts toward
+        // `variants` — by this point (past the `!result.ok` gate above) a
+        // parent-expectation mismatch would already have failed closed, so
+        // `intendsVariant` alone is sufficient. This covers fresh creates,
+        // same-parent updates/resurrects, AND E11000 race-recovery merges
+        // (which return `created: false` — a concurrent import racing the
+        // same new variant into existence is just as legitimate a variant
+        // write as a non-racing one, and must not be miscounted as an
+        // `updated` row instead).
+        if (intendsVariant) {
           variants++;
         }
         names.push(result.doc.name);
