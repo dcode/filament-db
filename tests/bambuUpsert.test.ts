@@ -250,6 +250,53 @@ describe("upsertParsedBambuFilament (three-phase upsert lib)", () => {
     expect(result).toEqual({ ok: false, status: 400, error: "cost must be positive" });
   });
 
+  it("blocks the race-recovery merge itself when a second race re-parents the winner between the pre-check and the write", async () => {
+    const expectedParentId = new mongoose.Types.ObjectId().toString();
+    const otherParentId = new mongoose.Types.ObjectId().toString();
+    let racingId = "";
+
+    const realCreate = Filament.create.bind(Filament);
+    const e11000 = Object.assign(new Error("E11000 duplicate key"), { code: 11000 });
+    vi.spyOn(Filament, "create").mockImplementationOnce(async () => {
+      // The racing winner is created under the SAME parent the caller
+      // expects, so the pre-check (racingParentIdStr !== expectedParentId)
+      // passes.
+      const winner = await realCreate({
+        name: "QA Upsert PLA",
+        vendor: "Winner",
+        type: "PLA",
+        parentId: expectedParentId,
+      });
+      racingId = String(winner._id);
+      throw e11000;
+    });
+
+    const realFindOneAndUpdate = Filament.findOneAndUpdate.bind(Filament);
+    vi.spyOn(Filament, "findOneAndUpdate")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .mockImplementation(async (filter: any, ...rest: any[]) => {
+        if (filter && String(filter._id) === racingId) {
+          // A SECOND race lands between the pre-check (already passed
+          // above, since parentId matched at that point) and this merge
+          // write itself: re-parent the winner again.
+          await Filament.updateOne({ _id: racingId }, { $set: { parentId: otherParentId } });
+        }
+        return realFindOneAndUpdate(filter, ...rest);
+      });
+
+    const result = await upsert(parsed(), { expectedParentId });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(409);
+      expect(result.error).toMatch(/different parent than expected/);
+    }
+    // The winner's content must be untouched by our diff — the merge
+    // filter's own parentId condition rejected the write for real.
+    const winner = await Filament.findById(racingId);
+    expect(winner!.vendor).toBe("Winner");
+    expect(String(winner!.parentId)).toBe(otherParentId);
+  });
+
   it("clears a stale variant override via $unset when the import equals the parent (GH #473)", async () => {
     const parent = await Filament.create({
       name: "QA Parent PLA",

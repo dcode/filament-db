@@ -278,12 +278,29 @@ export async function upsertParsedBambuFilament(
     if (racePayloadFailure) return racePayloadFailure;
     delete (racePayload.update as Record<string, unknown>).spools;
     try {
+      // Re-assert expectedParentId in the merge's OWN atomic filter, not
+      // just the pre-check above — otherwise a second reparent landing
+      // between that check and this write would still let the merge apply
+      // a payload baselined against the (no-longer-current) expected
+      // parent, defeating the fail-closed guarantee the check exists for.
+      const mergeFilter: Record<string, unknown> = { _id: racing._id, _deletedAt: null };
+      if (opts?.expectedParentId !== undefined) {
+        mergeFilter.parentId = opts.expectedParentId;
+      }
       const merged = await Filament.findOneAndUpdate(
-        { _id: racing._id, _deletedAt: null },
+        mergeFilter,
         composeMongoUpdate(racePayload),
         { runValidators: true, context: "query", returnDocument: "after" },
       );
       if (!merged) {
+        if (opts?.expectedParentId !== undefined) {
+          return {
+            ok: false,
+            status: 409,
+            error:
+              "Collision: an existing filament of this name belongs to a different parent than expected",
+          };
+        }
         return failureFromCaught(createErr, "Failed to create filament");
       }
       return { ok: true, created: false, doc: merged, payload: racePayload };
