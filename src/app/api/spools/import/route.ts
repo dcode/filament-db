@@ -3,10 +3,27 @@ import dbConnect from "@/lib/mongodb";
 import Filament, { generateInstanceId, isSpoolInstanceIdTaken } from "@/models/Filament";
 import Location from "@/models/Location";
 import { parseCsv } from "@/lib/parseCsv";
-import { getErrorMessage, errorResponse } from "@/lib/apiErrorHandler";
+import {
+  getErrorMessage,
+  errorResponse,
+  checkContentLength,
+  checkFileSize,
+  MAX_UPLOAD_SIZE,
+} from "@/lib/apiErrorHandler";
 import { assertSameOriginRequest } from "@/lib/requestGuard";
 import { unsanitizeCsvCell } from "@/lib/csvWriter";
 import { isValidIsoDateString, validateSpoolInstanceId, MAX_SPOOL_TEXT_LENGTH } from "@/lib/validateSpoolBody";
+
+/**
+ * Slack added to the 10 MB cap for the multipart Content-Length preflight, to
+ * cover the MIME envelope (boundary lines + per-part headers + CRLFs) so a
+ * legitimate ~10 MB file isn't rejected for its framing bytes. The route reads
+ * only the `file` field, so a real upload's overhead is a few hundred bytes;
+ * 64 KB is generous headroom while still far below the multi-MB abuse this
+ * guards against (GH #991). `checkFileSize` enforces the exact 10 MB on the
+ * file part itself.
+ */
+const MULTIPART_OVERHEAD_ALLOWANCE = 64 * 1024;
 
 /**
  * POST /api/spools/import — bulk-create OR upsert spools from CSV.
@@ -50,15 +67,43 @@ export async function POST(request: NextRequest) {
 
   let csvText: string;
 
-  const contentType = (request.headers.get("content-type") || "").toLowerCase();
+  // Branch off the media-type ESSENCE (type/subtype), with parameters stripped.
+  // A substring match on the raw Content-Type let a request like
+  // `application/json; x="multipart/form-data"` read as multipart and skip BOTH
+  // size guards while still entering the JSON branch (Codex P2). Deciding the
+  // branch AND the guard gating from the exact essence closes that bypass;
+  // legitimate `charset=`/`boundary=` parameters are ignored either way.
+  const mediaType = (request.headers.get("content-type") || "")
+    .split(";")[0]
+    .trim()
+    .toLowerCase();
+  const isJson = mediaType === "application/json";
+  const isMultipart = mediaType === "multipart/form-data";
+
+  // GH #991: bound the request body BEFORE buffering it, so a large upload
+  // can't drive the server to buffer + parse far more than this small
+  // paste/spreadsheet workflow needs. `next.config.ts` raises
+  // `proxyClientMaxBodySize` to 52 MB for snapshot restores, so without this
+  // guard this endpoint inherits that budget even on the default
+  // unauthenticated local/LAN API. Mirrors the sibling import routes
+  // (prusaslicer, bambustudio, import-csv).
+  //
+  // Content-Length preflight for EVERY shape — kept OUTSIDE the try/catch below
+  // so a genuine 413 isn't downgraded into the 400 "Failed to read request
+  // body" path. The multipart branch gets a small envelope-overhead allowance
+  // (boundaries + part headers) so a legitimate ~10 MB file isn't tripped by
+  // its MIME framing, while a huge total body — a big file OR a small file plus
+  // tens of MB of extra fields — is still rejected before `formData()` buffers
+  // it (Codex P2: `checkFileSize` alone runs only AFTER the whole envelope is
+  // parsed and measures only the `file` part). `checkFileSize` below then
+  // enforces the exact 10 MB bound on the file part itself.
+  const preflight = isMultipart
+    ? checkContentLength(request, MAX_UPLOAD_SIZE + MULTIPART_OVERHEAD_ALLOWANCE)
+    : checkContentLength(request);
+  if (preflight) return preflight;
+
   try {
-    if (contentType.includes("application/json")) {
-      const body = await request.json();
-      if (typeof body?.csv !== "string") {
-        return errorResponse("Body must be { csv: string } for JSON requests", 400);
-      }
-      csvText = body.csv;
-    } else if (contentType.includes("multipart/form-data")) {
+    if (isMultipart) {
       // GH #339: the in-app importer (SpoolCsvImportDialog) reads the file
       // client-side and POSTs it as raw text/csv, but every other import
       // route in the app takes a multipart upload. Without this branch a
@@ -70,9 +115,36 @@ export async function POST(request: NextRequest) {
       if (!(file instanceof File)) {
         return errorResponse("multipart upload must include a 'file' field", 400);
       }
+      // GH #991: exact cap on File.size BEFORE file.text() materialises the
+      // whole body into memory (matches /api/filaments/bambustudio). The
+      // Content-Length preflight above already rejected an oversized TOTAL body;
+      // this bounds the file part itself (e.g. a chunked request with no
+      // Content-Length that slipped past the preflight).
+      const sizeError = checkFileSize(file);
+      if (sizeError) return sizeError;
       csvText = await file.text();
     } else {
-      csvText = await request.text();
+      // Raw text/csv AND JSON: read the raw body and byte-check the WHOLE
+      // buffered payload BEFORE any JSON.parse. This is the hard cap for a
+      // missing/lying Content-Length (chunked/headerless) that slips past the
+      // preflight and — for JSON — it bounds the full envelope, not just the
+      // decoded `csv` field, so a huge sibling JSON field can't sneak an
+      // oversized body through (Codex P2). Byte length, not String.length
+      // (UTF-16 units): a non-ASCII UTF-8 body can exceed 10 MB of bytes while
+      // under the char count (Codex P2 on PR #685).
+      const raw = await request.text();
+      if (Buffer.byteLength(raw, "utf8") > MAX_UPLOAD_SIZE) {
+        return errorResponse("Request body too large. Maximum is 10 MB.", 413);
+      }
+      if (isJson) {
+        const body = JSON.parse(raw);
+        if (typeof body?.csv !== "string") {
+          return errorResponse("Body must be { csv: string } for JSON requests", 400);
+        }
+        csvText = body.csv;
+      } else {
+        csvText = raw;
+      }
     }
   } catch {
     return errorResponse("Failed to read request body", 400);
